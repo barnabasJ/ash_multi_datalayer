@@ -1,0 +1,350 @@
+# `ash_multi_datalayer`
+
+## What This Is
+
+`ash_multi_datalayer` lets you put multiple data stores behind a single Ash
+resource. The most common use is caching: keep a hot copy of your Postgres data
+in ETS and serve reads from there without writing per-action cache code. The
+same library also covers other layered patterns — cold-storage tiering,
+migration mirroring, polyglot persistence — because the DSL is generic ordered
+layers, not cache-specific.
+
+You opt in by changing one line (`data_layer:`) and adding one DSL block to your
+resource. No changes to your actions.
+
+## Prerequisites
+
+Before you start, make sure you have:
+
+- Ash `~> 3.0` and AshPostgres `~> 2.0` in your project.
+- A working Postgres-backed Ash resource you want to layer.
+- `config :ash_multi_datalayer, :assume_single_node, true` in
+  `config/config.exs`. v1 is single-node only; this line acknowledges the
+  limitation. If your app runs on multiple nodes, this library is not yet the
+  right fit — see the
+  [single-node ADR](../design/20260417-single-node-v1-adr.md).
+
+## Quick Start
+
+Switch a resource to use `AshMultiDatalayer.DataLayer` as a drop-in for
+`AshPostgres.DataLayer`, then flip it into cache-through mode:
+
+1. Add `{:ash_multi_datalayer, "~> 0.1"}` to `mix.exs` and run `mix deps.get`.
+2. Add `AshMultiDatalayer.Supervisor` to your application's supervision tree
+   (same file as your other supervisors):
+
+   ```elixir
+   children = [
+     # ... your existing children
+     AshMultiDatalayer.Supervisor
+   ]
+   ```
+
+3. Change the resource's `data_layer:` and add the DSL block:
+
+   ```elixir
+   use Ash.Resource,
+     domain: MyApp.Domain,
+     data_layer: AshMultiDatalayer.DataLayer    # was: AshPostgres.DataLayer
+
+   multi_data_layer do
+     layer :l1, Ash.DataLayer.Ets
+     layer :l2, AshPostgres.DataLayer
+
+     read_order  [:l1, :l2]     # try l1 first, fall through to l2
+     write_order [:l2, :l1]     # write l2 first, then l1
+     backfill?   true
+   end
+
+   ets do
+     private? true
+   end
+
+   postgres do
+     table "tweets"    # unchanged from before
+     repo  MyApp.Repo
+   end
+   ```
+
+That's it. Reads now consult the ETS cache first and fall through to Postgres on
+a miss (backfilling the cache). Writes go to Postgres first, then to ETS. No
+per-action code changes.
+
+## How to Use It
+
+### How to switch an existing resource to the multi-datalayer
+
+1. Change `data_layer: AshPostgres.DataLayer` to
+   `data_layer: AshMultiDatalayer.DataLayer`.
+2. Add the `multi_data_layer do ... end` block.
+3. Keep your existing `postgres do ... end` block verbatim.
+4. Run `mix compile` — if verifiers complain, fix the reported issue (most
+   often: missing `:assume_single_node` ack or `field_policies`
+   incompatibility).
+5. Run `mix ash_postgres.generate_migrations` — it should behave exactly as
+   before the switch.
+6. Run your existing tests — nothing should change yet (because `read_order`
+   defaults to fall-through but the cache is empty on first boot).
+
+### How to pick a layering pattern
+
+The DSL is `read_order` + `write_order` + `backfill?`. Common patterns:
+
+| Goal                               | `read_order` | `write_order` | `backfill?` |
+| ---------------------------------- | ------------ | ------------- | ----------- |
+| Read-through cache (most common)   | `[:l1, :l2]` | `[:l2, :l1]`  | `true`      |
+| Primary-only reads (kill-switch-y) | `[:l2]`      | `[:l2, :l1]`  | —           |
+| Dual-write mirror                  | `[:l1]`      | `[:l1, :l2]`  | `false`     |
+| Read the cache, ignore primary     | `[:l1]`      | `[:l1]`       | `false`     |
+
+`:l1` and `:l2` are just names you picked. Use different names if it reads
+better for your use case (e.g. `:fast` / `:slow`).
+
+### How to disable the cache at runtime without a deploy
+
+When something goes wrong in production, flip the kill-switch:
+
+1. In `iex` attached to the running node:
+
+   ```elixir
+   AshMultiDatalayer.disable!(MyApp.Post)
+   ```
+
+2. Or via a Mix task:
+
+   ```bash
+   mix ash_multi_datalayer.disable MyApp.Post
+   ```
+
+All reads and writes for that resource now route only to the last layer in the
+relevant `*_order` list, skipping the cache and ledger entirely. Re-enable with
+`AshMultiDatalayer.enable!/1`.
+
+### How to see what's in the cache
+
+```elixir
+# Dump all ledger entries for a resource (optionally filtered by tenant)
+AshMultiDatalayer.Debug.dump_ledger(MyApp.Post)
+
+# Explain why a specific query hit or missed the cache
+AshMultiDatalayer.Debug.explain_covers?(
+  MyApp.Post,
+  Ash.Query.for_read(MyApp.Post, :read) |> Ash.Query.filter(active == true)
+)
+```
+
+`explain_covers?/2` returns a trace that tells you, for each ledger entry,
+whether it could have covered the query and (if not) why. Use this when your
+cache hit rate is lower than expected.
+
+### How to wire telemetry into your dashboard
+
+```elixir
+:telemetry.attach_many(
+  "my-app-ash-mdl",
+  [
+    [:ash_multi_datalayer, :read, :hit],
+    [:ash_multi_datalayer, :read, :miss],
+    [:ash_multi_datalayer, :read, :backfill],
+    [:ash_multi_datalayer, :read, :divergence_detected],
+    [:ash_multi_datalayer, :write, :applied],
+    [:ash_multi_datalayer, :write, :failed_at_layer],
+    [:ash_multi_datalayer, :ledger, :invalidated],
+    [:ash_multi_datalayer, :ledger, :evicted],
+    [:ash_multi_datalayer, :ledger, :full]
+  ],
+  &MyApp.Telemetry.handle_ash_mdl/4,
+  %{}
+)
+```
+
+Every event carries metadata
+`%{resource, tenant, filter_fingerprint, read_order, write_order}` and
+measurements `%{duration_us, ledger_size}`. See the
+[technical deep-dive](../technical/ash-multi-datalayer.md) for the full schema.
+
+### How to tune ledger cap and divergence sampler per resource
+
+```elixir
+multi_data_layer do
+  # ...
+  ledger_max_entries 20_000   # more memory for hot tables
+  divergence_sampler 0.05     # 5% shadow-reads for higher-risk tables
+end
+```
+
+Defaults are 10 000 entries and 1 %. Raise the cap when you hit
+`[:ledger, :full]` telemetry; raise the sampler rate when divergence is
+operationally important.
+
+## Visual Walkthrough
+
+```mermaid
+sequenceDiagram
+  actor User
+  participant App as Your action
+  participant MDL as AshMultiDatalayer
+  participant ETS as Layer :l1 (ETS)
+  participant PG  as Layer :l2 (Postgres)
+
+  User->>App: Ash.read(MyApp.Post, filter: ...)
+  App->>MDL: run_query
+  MDL->>MDL: covers?(filter) via ledger + solver
+  alt covered
+    MDL->>ETS: run_query
+    ETS-->>MDL: rows
+  else not covered
+    MDL->>PG: run_query
+    PG-->>MDL: rows
+    MDL->>ETS: upsert rows (backfill)
+    MDL->>MDL: record filter in ledger
+  end
+  MDL-->>App: rows
+  App-->>User: rows
+```
+
+Reads try the cache, fall through to Postgres on a miss, and backfill so the
+next read for the same (or a covered) filter hits the cache.
+
+## Common Questions
+
+### Does this replace my existing Postgres-side caching?
+
+No — `ash_multi_datalayer` layers ETS (in-process) in front of AshPostgres.
+Postgres-side caching (materialised views, `pg_cron` refresh) is orthogonal and
+can coexist with this library.
+
+### What happens if `:l1` (ETS) goes down?
+
+ETS is in-process; "going down" means the owning process crashed. The supervisor
+restarts the `Coverage.TableOwner`, which creates a fresh table. The cache is
+empty; reads fall through to `:l2` and warm it back up. No data is lost because
+the cache is never the source of truth.
+
+### Does the cache survive a deploy?
+
+No. ETS tables don't survive BEAM restarts. Every deploy means a cold cache
+storm until it warms back up. Warmup helpers are a potential follow-up; for now,
+plan your rollouts accordingly.
+
+### Can I use this with multiple nodes?
+
+Not in v1. See the [single-node ADR](../design/20260417-single-node-v1-adr.md).
+Multi-node coherence is a v2 design problem.
+
+### Can I use this with `field_policies`?
+
+Not with a multi-layer `read_order`. The solver reasons about row-level filters,
+not actor-level field redaction; serving a cached row that was populated by a
+broader (higher-privilege) read would bypass field redaction for a
+lower-privilege reader. A compile-time verifier blocks the combination. If you
+need both, use `read_order [:l2]` (no cache on reads); writes to the cache are
+still safe.
+
+### What about write-behind?
+
+Not in v1. See the
+[no-write-behind ADR](../design/20260417-no-write-behind-in-v1-adr.md). If you
+want asynchronous primary writes, wire Oban in your action directly.
+
+## Troubleshooting
+
+### Compile error: "ash_multi_datalayer v1 is single-node-only"
+
+**Fix**: Add to `config/config.exs`:
+
+```elixir
+config :ash_multi_datalayer, :assume_single_node, true
+```
+
+**Why it happens**: The `RejectMultiNode` verifier warns unless you acknowledge
+the single-node limitation. This avoids silently shipping a broken multi-node
+config. If you actually are multi-node, don't set this — the library isn't right
+for you yet.
+
+### Compile error: "uses `field_policies` with read_order [...]"
+
+**Fix**: Either drop `field_policies` from the resource, or set
+`read_order [:l2]` (single-layer reads, cache bypass).
+
+**Why it happens**: A cached row populated by a higher-privilege read would
+bypass field redaction for a lower-privilege reader. The library refuses the
+combination.
+
+### Cache hit rate is 0 % or very low
+
+**Fix**:
+
+1. `AshMultiDatalayer.Debug.dump_ledger(MyApp.Post)` — does the ledger have
+   entries?
+2. `AshMultiDatalayer.Debug.explain_covers?(MyApp.Post, query)` — does it trace
+   to `:solver_unsupported` for the filter shapes you use most?
+3. Check `[:ash_multi_datalayer, :ledger, :invalidated]` telemetry counts — if
+   writes are dropping entries aggressively, row-aware invalidation might still
+   be clearing a lot for your workload.
+
+**Why it happens**: Either your filters include predicates the v1 solver can't
+reason about (fragments, custom functions, relationship filters, array
+operators), or writes are hitting ledger entries. The solver is intentionally
+conservative — unsupported shapes always miss.
+
+### `[:ash_multi_datalayer, :ledger, :full]` firing
+
+**Fix**:
+
+1. Raise `ledger_max_entries` for the affected resource.
+2. Audit upstream: is an unauthenticated endpoint accepting user-supplied filter
+   shapes? Validate or rate-limit at the action layer.
+
+**Why it happens**: Every novel filter shape creates a ledger entry. LRU evicts
+the oldest, so no crash, but eviction rate this high signals either genuine
+workload growth or a buggy client churning filters.
+
+### Divergence detected
+
+**Fix**:
+
+1. Note the `filter_fingerprint` and `pk_delta` in telemetry metadata.
+2. `AshMultiDatalayer.disable!(MyApp.Post)` to stop the bleeding.
+3. Reproduce locally: load that filter, dump ledger, compare against primary.
+
+**Why it happens**: Either the solver claimed coverage it didn't have (solver
+bug — file an issue with the fingerprint), or invalidation missed an entry
+(invalidation bug — same). Either way, the sampler did its job: you know
+_before_ a user reports it.
+
+## Tips and Best Practices
+
+- **Start with `read_order [:l2]` + `write_order [:l2]`.** Behavioural no-op —
+  proves the wiring and migration tooling works. Flip to cache-through after a
+  day of running that way.
+- **Turn on the divergence sampler from day one.** 1 % is cheap and catches
+  solver bugs before users do.
+- **Set a ledger cap you can afford.** 10 000 entries × two layers × per-tenant
+  can add up; budget before enabling on a tenant-sharded table.
+- **Don't cache resources with `field_policies`.** The library refuses at
+  compile time; listen to it.
+- **Watch the invalidation rate.** If writes drop > 50 % of ledger entries on
+  average, your workload's filter shapes are too broad — narrow them or accept
+  that cache hit rate will suffer.
+- **Kill-switch is production-grade.** Use it when things go wrong; it's
+  designed for it.
+
+## What's Next
+
+- [Runbook](../runbooks/ash-multi-datalayer.md) — operational procedures.
+- [Technical deep-dive](../technical/ash-multi-datalayer.md) — how it works
+  under the hood.
+- [Testing strategy](../testing/ash-multi-datalayer.md).
+
+## Technical Details
+
+For developers who want to understand how this works:
+
+- [PRD](../design/ash-multi-datalayer-prd.md)
+- [RFC](../design/ash-multi-datalayer-rfc.md)
+- ADRs in [`docs/design/`](../design/).
+
+---
+
+**Last Updated**: 2026-04-17
