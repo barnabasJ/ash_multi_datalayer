@@ -140,9 +140,14 @@ defmodule AshMultiDatalayer.DataLayer do
     ]
   end
 
+  require Logger
+
+  alias AshMultiDatalayer.Backfill
+  alias AshMultiDatalayer.Coverage
   alias AshMultiDatalayer.DataLayer.Info
   alias AshMultiDatalayer.Delegate
   alias AshMultiDatalayer.KillSwitch
+  alias AshMultiDatalayer.Telemetry
 
   # Interim capability answer: the intersection of all declared layers.
   # Refined per read_order/write_order in the capability-negotiation phase.
@@ -221,11 +226,90 @@ defmodule AshMultiDatalayer.DataLayer do
       match?([_], read_layers) ->
         Delegate.run_on_layer(query, hd(read_layers))
 
+      not servable_from_coverage?(query) ->
+        # Aggregates/calculations/locks are computed by the source of truth
+        # and are never cache-eligible.
+        source_read(query, resource, read_layers, :not_cacheable)
+
       true ->
-        # Coverage-aware routing lands in the coverage phase; until then a
-        # multi-layer read_order behaves like its source of truth.
-        Delegate.run_on_layer(query, List.last(read_layers))
+        coverage_read(query, resource, read_layers)
     end
+  end
+
+  # Limited/offset/distinct probes can still be SERVED by recorded unlimited
+  # coverage (the cache layer holds the complete matching set and applies
+  # sort/limit/offset itself); aggregate/calc/lock queries cannot.
+  defp servable_from_coverage?(%Query{} = query) do
+    query.aggregates == [] and query.calculations == [] and is_nil(query.lock)
+  end
+
+  defp coverage_read(%Query{} = query, resource, read_layers) do
+    started = System.monotonic_time()
+
+    case Coverage.covers?(resource, query.tenant, query) do
+      {:ok, _entry} ->
+        with {:ok, records} <- Delegate.run_on_layer(query, hd(read_layers)) do
+          emit_read(:hit, query, resource, started)
+          {:ok, records}
+        end
+
+      {:miss, reason} ->
+        source_read(query, resource, read_layers, reason)
+    end
+  end
+
+  defp source_read(%Query{} = query, resource, read_layers, miss_reason) do
+    started = System.monotonic_time()
+
+    with {:ok, records} <- Delegate.run_on_layer(query, List.last(read_layers)) do
+      emit_read(:miss, query, resource, started, %{reason: miss_reason})
+      maybe_backfill(query, resource, read_layers, records)
+      {:ok, records}
+    end
+  end
+
+  defp maybe_backfill(%Query{} = query, resource, read_layers, records) do
+    earlier_layers = Enum.drop(read_layers, -1)
+
+    if Coverage.recordable?(query) and earlier_layers != [] do
+      started = System.monotonic_time()
+
+      opts = [
+        tenant: query.tenant,
+        domain: query.domain,
+        fields: Enum.to_list(Coverage.needed_fields(query, resource))
+      ]
+
+      case Backfill.upsert_records(earlier_layers, resource, records, opts) do
+        :ok ->
+          Coverage.record(resource, query.tenant, query)
+          emit_read(:backfill, query, resource, started, %{records: length(records)})
+
+        {:error, layer, reason} ->
+          # No coverage is recorded for a partial backfill — the next read
+          # falls through again. A cache-population failure is never an
+          # operation failure.
+          Logger.warning(
+            "ash_multi_datalayer backfill into #{inspect(layer)} failed for " <>
+              "#{inspect(resource)}: #{inspect(reason)}"
+          )
+      end
+    end
+
+    :ok
+  end
+
+  defp emit_read(kind, query, resource, started, extra \\ %{}) do
+    Telemetry.read(
+      kind,
+      resource,
+      query,
+      %{
+        duration_us: Telemetry.duration_us(started),
+        ledger_size: Coverage.size(resource, query.tenant)
+      },
+      extra
+    )
   end
 
   @impl true
