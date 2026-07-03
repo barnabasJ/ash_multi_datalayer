@@ -47,8 +47,9 @@ defmodule AshMultiDatalayer.Delegate do
   end
 
   # Steps with no value to apply are always skipped; steps whose callback the
-  # layer doesn't export are skipped only when the value is empty-equivalent,
-  # and an error otherwise.
+  # layer doesn't export are skipped only when the value is empty-equivalent
+  # or the step is a pure optimisation (select: a layer that can't push it
+  # returns full rows and Ash narrows them) — and an error otherwise.
   defp step(layer, callback, [layer_query, value, resource]) do
     cond do
       empty_value?(callback, value) ->
@@ -56,6 +57,9 @@ defmodule AshMultiDatalayer.Delegate do
 
       callback?(layer, callback, 3) ->
         apply(layer, callback, [layer_query, value, resource])
+
+      callback == :select ->
+        {:ok, layer_query}
 
       true ->
         {:error,

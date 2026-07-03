@@ -21,8 +21,12 @@ defmodule AshMultiDatalayer.CapabilitiesTest do
       end
     end
 
-    test "select pushdown follows the read layers (Ets doesn't advertise it)" do
-      refute DataLayer.can?(TestPost, :select)
+    test "select pushdown is decided by the source of truth alone" do
+      # Ets can't push selects, but stripping query.select would break layers
+      # (like AshRemote) that derive their fetched fields from it — the
+      # source of truth decides, and select-less cache layers just return
+      # full rows for Ash to narrow.
+      assert DataLayer.can?(TestPost, :select)
       assert DataLayer.can?(SingleLayerPost, :select)
     end
   end

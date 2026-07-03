@@ -4,6 +4,10 @@ import Config
 # resolved lazily at call time so one build works across environments.
 config :ash_remote, base_url: System.get_env("TODO_SERVER_URL", "http://127.0.0.1:4020")
 
+# The client layers an ETS cache over the remote data layer via
+# ash_multi_datalayer. v1 is single-node-only; this acknowledges it.
+config :ash_multi_datalayer, :assume_single_node, true
+
 # Log every RPC the client makes (URL, resource/action, outcome, duration,
 # request/response bodies) — Ecto-style visibility into the wire traffic.
 # Off under test only to keep test output readable.

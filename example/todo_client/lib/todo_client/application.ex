@@ -6,6 +6,7 @@ defmodule TodoClient.Application do
   def start(_type, _args) do
     children = [
       {Phoenix.PubSub, name: TodoClient.PubSub},
+      AshMultiDatalayer.Supervisor,
       TodoClient.Endpoint
     ]
 

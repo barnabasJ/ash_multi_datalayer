@@ -1,8 +1,16 @@
 defmodule TodoClient.Remote.TodoList do
   use Ash.Resource,
     domain: TodoClient.Remote.Domain,
-    data_layer: AshRemote.DataLayer,
+    data_layer: AshMultiDatalayer.DataLayer,
     extensions: [AshRemote.Resource]
+
+  multi_data_layer do
+    layer(:cache, Ash.DataLayer.Ets)
+    layer(:remote, AshRemote.DataLayer)
+
+    read_order([:cache, :remote])
+    write_order([:remote, :cache])
+  end
 
   remote do
     source("TodoServer.TodoList")

@@ -183,6 +183,18 @@ defmodule AshMultiDatalayer.DataLayer do
     layers_can?(Info.layer_modules(resource), resource, :multitenancy)
   end
 
+  # Select pushdown is decided by the source of truth alone: layers that
+  # can't push selects (Ets) simply return full rows and Ash narrows them,
+  # but answering false here would strip query.select entirely — and layers
+  # like AshRemote build their wire field list from it (no select = no
+  # attributes fetched).
+  def can?(resource, :select) do
+    case List.last(Info.read_layer_modules(resource)) do
+      nil -> false
+      layer -> layer.can?(resource, :select)
+    end
+  end
+
   def can?(resource, feature) when feature in @write_features do
     layers_can?(Info.write_layer_modules(resource), resource, feature)
   end
