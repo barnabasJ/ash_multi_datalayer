@@ -263,6 +263,7 @@ defmodule AshMultiDatalayer.DataLayer do
       {:ok, _entry} ->
         with {:ok, records} <- Delegate.run_on_layer(query, hd(read_layers)) do
           emit_read(:hit, query, resource, started)
+          AshMultiDatalayer.Divergence.maybe_sample(query, resource, records)
           {:ok, records}
         end
 

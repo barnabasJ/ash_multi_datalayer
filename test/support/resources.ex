@@ -63,6 +63,8 @@ defmodule AshMultiDatalayer.Test.Resources do
       resource AshMultiDatalayer.Test.Resources.SingleLayerPost
       resource AshMultiDatalayer.Test.Resources.MirrorPost
       resource AshMultiDatalayer.Test.Resources.FailingPost
+      resource AshMultiDatalayer.Test.Resources.CappedPost
+      resource AshMultiDatalayer.Test.Resources.SampledPost
     end
   end
 
@@ -144,6 +146,74 @@ defmodule AshMultiDatalayer.Test.Resources do
 
       read_order([:l1, :l2])
       write_order([:l2, :l1])
+    end
+
+    postgres do
+      table "mdl_posts"
+      repo(AshMultiDatalayer.TestRepo)
+    end
+
+    attributes do
+      uuid_primary_key :id
+      attribute :name, :string, public?: true
+      attribute :age, :integer, public?: true
+      attribute :score, :decimal, public?: true
+      attribute :published_at, :date, public?: true
+    end
+
+    actions do
+      defaults [:read, :destroy, create: :*, update: :*]
+    end
+  end
+
+  defmodule CappedPost do
+    @moduledoc false
+    use Ash.Resource,
+      domain: Domain,
+      data_layer: AshMultiDatalayer.DataLayer,
+      extensions: [AshPostgres.DataLayer]
+
+    multi_data_layer do
+      layer(:l1, Ash.DataLayer.Ets)
+      layer(:l2, AshMultiDatalayer.Test.CountingPostgres)
+
+      read_order([:l1, :l2])
+      write_order([:l2, :l1])
+      ledger_max_entries(3)
+    end
+
+    postgres do
+      table "mdl_posts"
+      repo(AshMultiDatalayer.TestRepo)
+    end
+
+    attributes do
+      uuid_primary_key :id
+      attribute :name, :string, public?: true
+      attribute :age, :integer, public?: true
+      attribute :score, :decimal, public?: true
+      attribute :published_at, :date, public?: true
+    end
+
+    actions do
+      defaults [:read, :destroy, create: :*, update: :*]
+    end
+  end
+
+  defmodule SampledPost do
+    @moduledoc false
+    use Ash.Resource,
+      domain: Domain,
+      data_layer: AshMultiDatalayer.DataLayer,
+      extensions: [AshPostgres.DataLayer]
+
+    multi_data_layer do
+      layer(:l1, Ash.DataLayer.Ets)
+      layer(:l2, AshMultiDatalayer.Test.CountingPostgres)
+
+      read_order([:l1, :l2])
+      write_order([:l2, :l1])
+      divergence_sampler(1.0)
     end
 
     postgres do

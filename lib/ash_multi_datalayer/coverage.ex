@@ -12,7 +12,9 @@ defmodule AshMultiDatalayer.Coverage do
   require Logger
 
   alias AshMultiDatalayer.Coverage.{Entry, Implication, Normaliser, TableOwner}
+  alias AshMultiDatalayer.DataLayer.Info
   alias AshMultiDatalayer.DataLayer.Query
+  alias AshMultiDatalayer.Telemetry
 
   @global_tenant :__global__
 
@@ -159,23 +161,54 @@ defmodule AshMultiDatalayer.Coverage do
          :ok <- ensure_table(resource) do
       fingerprint = dedupe_key(normalised)
 
-      if Enum.any?(entries(resource, tenant), &(&1.fingerprint == fingerprint)) do
-        :ok
-      else
-        entry = %Entry{
-          id: make_ref(),
-          tenant: tenant_key(tenant),
-          filter: query.filter,
-          normalised: normalised,
-          fingerprint: fingerprint,
-          loaded_fields: needed_fields(query, resource),
-          loaded_at: System.monotonic_time()
-        }
+      cond do
+        Enum.any?(entries(resource, tenant), &(&1.fingerprint == fingerprint)) ->
+          :ok
 
-        insert(resource, tenant, entry)
+        enforce_cap(resource, tenant) == :full ->
+          :skipped
+
+        true ->
+          entry = %Entry{
+            id: make_ref(),
+            tenant: tenant_key(tenant),
+            filter: query.filter,
+            normalised: normalised,
+            fingerprint: fingerprint,
+            loaded_fields: needed_fields(query, resource),
+            loaded_at: System.monotonic_time()
+          }
+
+          insert(resource, tenant, entry)
       end
     else
       _ -> :skipped
+    end
+  end
+
+  # Hard per-resource-per-tenant cap: at the cap, evict the least-recently
+  # used entry (hits refresh `loaded_at`). If eviction is impossible, emit
+  # `:full` and treat the new filter as not recorded.
+  defp enforce_cap(resource, tenant) do
+    cap = Info.ledger_max_entries(resource)
+
+    if size(resource, tenant) >= cap do
+      case resource |> entries(tenant) |> Enum.min_by(& &1.loaded_at, fn -> nil end) do
+        nil ->
+          Telemetry.ledger(:full, resource, tenant, %{ledger_size: size(resource, tenant)})
+          :full
+
+        oldest ->
+          drop(resource, tenant, oldest.id)
+
+          Telemetry.ledger(:evicted, resource, tenant, %{
+            ledger_size: size(resource, tenant)
+          })
+
+          :ok
+      end
+    else
+      :ok
     end
   end
 
