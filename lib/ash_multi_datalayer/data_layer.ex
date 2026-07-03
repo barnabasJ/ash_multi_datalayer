@@ -155,14 +155,81 @@ defmodule AshMultiDatalayer.DataLayer do
   alias AshMultiDatalayer.KillSwitch
   alias AshMultiDatalayer.Telemetry
 
-  # Interim capability answer: the intersection of all declared layers.
-  # Refined per read_order/write_order in the capability-negotiation phase.
+  # --- capabilities --------------------------------------------------------
+  #
+  # Read features answer from the intersection of read_order layers, write
+  # features from write_order layers, multitenancy from ALL layers (the
+  # ledger partitions coverage by tenant, but every layer must isolate its
+  # data). Joins, combinations, and the bulk/atomic query paths are always
+  # false: they would execute inside a single layer (or bypass the write
+  # dispatcher entirely), breaking routing and invalidation — Ash falls back
+  # to per-record operations, which flow through us.
+
+  @write_features [:create, :update, :destroy, :upsert, :transact]
+
   @impl true
+  def can?(_resource, {:join, _}), do: false
+  def can?(_resource, {:lateral_join, _}), do: false
+  def can?(_resource, :combine), do: false
+  def can?(_resource, {:combine, _}), do: false
+  def can?(_resource, :update_query), do: false
+  def can?(_resource, :destroy_query), do: false
+  def can?(_resource, {:atomic, _}), do: false
+  def can?(_resource, :async_engine), do: false
+
+  def can?(resource, :multitenancy) do
+    layers_can?(Info.layer_modules(resource), resource, :multitenancy)
+  end
+
+  def can?(resource, feature) when feature in @write_features do
+    layers_can?(Info.write_layer_modules(resource), resource, feature)
+  end
+
   def can?(resource, feature) do
-    case Info.layer_modules(resource) do
-      [] -> false
-      modules -> Enum.all?(modules, & &1.can?(resource, feature))
+    layers_can?(Info.read_layer_modules(resource), resource, feature)
+  end
+
+  defp layers_can?([], _resource, _feature), do: false
+
+  defp layers_can?(layers, resource, feature) do
+    Enum.all?(layers, & &1.can?(resource, feature))
+  end
+
+  # Transactions only exist when the write path is a single transactional
+  # layer (can?(:transact) is the write_order intersection); delegate.
+  @impl true
+  def transaction(resource, fun, timeout, reason) do
+    layer = hd(Info.write_layer_modules(resource))
+
+    if callback?(layer, :transaction, 4) do
+      layer.transaction(resource, fun, timeout, reason)
+    else
+      {:ok, fun.()}
     end
+  end
+
+  @impl true
+  def rollback(resource, term) do
+    layer = hd(Info.write_layer_modules(resource))
+
+    if callback?(layer, :rollback, 2) do
+      layer.rollback(resource, term)
+    else
+      throw({:rollback, term})
+    end
+  end
+
+  @impl true
+  def in_transaction?(resource) do
+    layer = hd(Info.write_layer_modules(resource))
+    callback?(layer, :in_transaction?, 1) and layer.in_transaction?(resource)
+  end
+
+  @impl true
+  def prefer_transaction?(_resource), do: false
+
+  defp callback?(layer, name, arity) do
+    Code.ensure_loaded?(layer) and function_exported?(layer, name, arity)
   end
 
   @impl true
