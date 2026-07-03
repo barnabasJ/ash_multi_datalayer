@@ -74,15 +74,21 @@ For single-layer `read_order`, skip 2–5; go directly to the named layer.
 
 Given `write_order = [:l2, :l1]`:
 
-1. **Kill-switch check.** If disabled, write only to the last layer.
-2. **Apply in order.** Call `:l2` first. Fail-fast on `:l2` failure — the
-   operation aborts, `:l1` is not touched.
-3. **Succeed at `:l1`.** Call `:l1`. Failure is logged + telemetried but does
-   not fail the operation (`:l2` already committed; the divergence is bounded by
-   the next read's fall-through + backfill).
-4. **Row-aware invalidation.** For every ledger entry, evaluate its filter
+1. **Kill-switch check.** If disabled, write only to the **first** layer in
+   `write_order` (`:l2`, the source of truth — writing the *last* layer would
+   hit only the cache and lose the write) and still run step 3.
+2. **Authoritative write.** Call `:l2` first. Fail-fast on `:l2` failure — the
+   operation aborts; `:l1` and the ledger are not touched.
+3. **Row-aware invalidation.** For every ledger entry, evaluate its filter
    against `row_before` and `row_after` via `Ash.Filter.Runtime.do_match/2`.
-   Drop matching entries; keep the rest.
+   Drop matching entries; keep the rest. This runs **before** any `:l1` write
+   (FR3.6) so a failure in step 4 can never leave stale coverage behind.
+4. **Propagate to `:l1`.** Upsert the record `:l2` **returned** — never re-run
+   the caller's changeset; `:l2`-computed fields (defaults, IDs, timestamps,
+   server-side changes) exist only on the returned record (FR3.5). Failure is
+   logged + telemetried but does not fail the operation: step 3 already dropped
+   the covering entries, so the next matching read falls through to `:l2` — a
+   cache miss, never a stale hit.
 
 ### Guarantees and Invariants
 

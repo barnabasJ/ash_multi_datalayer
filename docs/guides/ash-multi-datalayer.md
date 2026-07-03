@@ -116,9 +116,11 @@ When something goes wrong in production, flip the kill-switch:
    mix ash_multi_datalayer.disable MyApp.Post
    ```
 
-All reads and writes for that resource now route only to the last layer in the
-relevant `*_order` list, skipping the cache and ledger entirely. Re-enable with
-`AshMultiDatalayer.enable!/1`.
+All reads for that resource now route only to the last layer in `read_order`,
+and writes only to the first layer in `write_order` — both the source of truth
+— skipping the cache layer entirely. Ledger invalidation still runs on writes
+while disabled, so re-enabling can't serve coverage recorded before the switch
+was flipped. Re-enable with `AshMultiDatalayer.enable!/1`.
 
 ### How to see what's in the cache
 
@@ -347,4 +349,4 @@ For developers who want to understand how this works:
 
 ---
 
-**Last Updated**: 2026-04-17
+**Last Updated**: 2026-07-03

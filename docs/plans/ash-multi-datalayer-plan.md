@@ -130,13 +130,19 @@ sequenceDiagram
   fall-through beyond ordinary "not covered" → later layer.
 - **Layer returns error in `write_order`**: if it's the first layer, return the
   error; if subsequent, log + telemetry + succeed (source of truth already
-  committed).
+  committed — safe because ledger invalidation runs *before* subsequent-layer
+  upserts per FR3.6, so the failure degrades to coverage misses, never stale
+  reads). Subsequent layers always receive the first layer's **returned
+  record** as an upsert, never a re-execution of the changeset (FR3.5).
 - **Solver receives unsupported filter shape**: `implies?` → `false`, `covers?`
   returns `:none`, read falls through.
 - **Ledger cap reached**: evict LRU; if eviction fails (shouldn't happen), emit
   `:full` telemetry and treat the new filter as "not covered."
-- **Kill-switch engaged**: skip coverage + ledger; route per `*_order`'s last
-  layer.
+- **Kill-switch engaged**: skip subsumption + cache-layer upserts; reads route
+  to `read_order`'s **last** layer, writes route to `write_order`'s **first**
+  layer (both are the source of truth — routing writes to the *last* layer of
+  `write_order [:l2, :l1]` would hit only the cache and lose the write). Ledger
+  invalidation still runs on writes while disabled (FR6.2).
 
 ## Technical Design
 
@@ -515,4 +521,4 @@ Full strategy: [testing doc](../testing/ash-multi-datalayer.md).
 
 ---
 
-**Last Updated**: 2026-04-17
+**Last Updated**: 2026-07-03

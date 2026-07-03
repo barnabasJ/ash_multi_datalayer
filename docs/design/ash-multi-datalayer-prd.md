@@ -1,7 +1,7 @@
 # `ash_multi_datalayer` PRD
 
 **Status**: Accepted (scope B after multi-perspective RFC review) **Created**:
-2026-04-17 **Author**: Barnabas Jovanovics **Last Updated**: 2026-04-17
+2026-04-17 **Author**: Barnabas Jovanovics **Last Updated**: 2026-07-03
 
 ## Problem Hypothesis
 
@@ -215,9 +215,25 @@ flowchart TD
 - **FR3.3**: Row-aware invalidation is implemented via
   `Ash.Filter.Runtime.do_match/2`; unsupported predicates drop the entry
   conservatively.
-- **FR3.4**: A failure on a non-first layer in `write_order` is logged
-  - telemetry'd but does not fail the operation (source of truth has already
-    committed).
+- **FR3.4**: A failure on a non-first layer in `write_order` is logged +
+  telemetry'd but does not fail the operation (source of truth has already
+  committed). This is safe only because of FR3.6's ordering: the failed layer's
+  coverage was already invalidated, so the failure degrades to coverage misses,
+  never stale reads.
+- **FR3.5**: Layers after the first in `write_order` receive the **record
+  returned by the authoritative (first) layer** as a primary-key upsert — never
+  a re-execution of the original changeset. Fields computed by the
+  authoritative layer (defaults, generated IDs, timestamps, server-side
+  changes — e.g. when the first layer is a remote backend such as
+  `AshRemote.DataLayer`) exist only on the returned record.
+- **FR3.6**: Per-write ordering: authoritative layer commits → ledger
+  invalidation (FR3.2) → upserts into the remaining layers. Invalidation is
+  unconditional once the authoritative layer has committed. **Invariant**: when
+  a write operation returns, every layer earlier in `read_order` than the
+  authoritative layer either already reflects the returned record or holds no
+  ledger coverage claiming to cover it. Asynchrony is only discussable for
+  layers *later* in `read_order` (see the no-write-behind ADR's constraints on
+  any future `:write_behind` RFC).
 
 #### FR4: Ledger cap + LRU eviction `[Must]`
 
@@ -241,9 +257,12 @@ flowchart TD
 
 - **FR6.1**: `AshMultiDatalayer.disable!(resource)` and `enable!(resource)`
   toggle a `:persistent_term`-backed flag.
-- **FR6.2**: The flag is consulted on every read/write. When disabled,
-  operations route only to the last layer in the relevant `*_order`, skipping
-  subsumption and ledger entirely.
+- **FR6.2**: The flag is consulted on every read/write. When disabled, reads
+  route only to the **last** layer in `read_order` (the source of truth) and
+  writes route only to the **first** layer in `write_order` (the authoritative
+  layer), skipping subsumption and cache-layer upserts entirely. Ledger
+  invalidation (FR3.2) still runs on writes while disabled, so re-enabling
+  cannot serve coverage that predates the disabled window.
 - **FR6.3**: Mix task `mix ash_multi_datalayer.disable RESOURCE` for non-iex
   access.
 
@@ -408,7 +427,9 @@ New library; rollout is a Hex release.
 | 2026-04-17 | **Single-node v1**; verifier forces explicit ack                                      | Multi-node coherence for write-behind was the architect's blocking concern; write-behind is already cut, but stale cache on peer nodes persists. | Barnabas Jovanovics |
 | 2026-04-17 | **`field_policies` + fall-through reads rejected** by verifier                        | Cache-populated rows would bypass per-actor field redaction (security review blocking finding).                                                  | Barnabas Jovanovics |
 | 2026-04-17 | Ledger cap + LRU eviction, divergence sampler, kill-switch, rich telemetry ship in v1 | Operator review: all four are "refuse to ship without" items.                                                                                    | Barnabas Jovanovics |
+| 2026-07-03 | **Write results propagate synchronously to read-earlier layers; invalidate-before-upsert ordering** (FR3.5, FR3.6) | Composition with an authoritative remote backend (`ash_remote`): only the returned record carries server-computed fields, and a failed cache upsert after the authoritative commit must degrade to a coverage miss, never a stale read. Also constrains any future `:write_behind` RFC. | Barnabas Jovanovics |
+| 2026-07-03 | Kill-switch write routing corrected: writes go to the **first** layer in `write_order` (FR6.2)      | The previous "last layer in the relevant `*_order`" wording would route disabled-mode writes to the cache layer only, silently losing the write.  | Barnabas Jovanovics |
 
 ---
 
-**Last Updated**: 2026-04-17
+**Last Updated**: 2026-07-03

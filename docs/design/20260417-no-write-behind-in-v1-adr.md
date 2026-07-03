@@ -39,6 +39,19 @@ latency problems.**
 compile-time verifier for Oban-in-path. Writes in v1 route via `write_order`
 synchronously; asynchronous options are not an API surface.
 
+### Constraints on the future `:write_behind` RFC
+
+Any design that reintroduces asynchronous writes must preserve the write
+propagation invariant (PRD FR3.5/FR3.6): **layers earlier in `read_order` than
+the layer that took the authoritative write are updated synchronously, in the
+same operation, with the record that layer returned** — otherwise the very next
+read is a guaranteed stale hit. Asynchrony is only discussable for layers
+*later* in `read_order`, and even there the RFC must address two problems the
+invariant does not cover: a read that coverage-misses falls through to a
+not-yet-flushed layer and reads stale from below, and a crash before the flush
+loses the write (durability). These are the reasons write-behind was cut, not
+incidental details.
+
 ## Consequences
 
 ### Positive
@@ -64,7 +77,9 @@ synchronously; asynchronous options are not an API surface.
 - Document the escape hatch: "wrap your `AshPostgres.DataLayer`-writing action
   in an Oban job yourself" with a complete example.
 - Keep the internal `write_order` abstraction generic so a future
-  `:write_behind` layer slot is additive, not a rewrite.
+  `:write_behind` layer slot is additive, not a rewrite. The "Constraints on
+  the future `:write_behind` RFC" section above pins the correctness bar that
+  slot must meet.
 
 ## Alternatives Considered
 
@@ -105,4 +120,4 @@ synchronously; asynchronous options are not an API surface.
 
 ---
 
-**Last Updated**: 2026-04-17
+**Last Updated**: 2026-07-03

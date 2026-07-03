@@ -119,6 +119,8 @@ Mapped to phases in [the plan](../../plans/ash-multi-datalayer-plan.md).
 
 ## Representative task files
 
-Tasks 01, 04, 12, 17, 22 are included as fully-detailed examples (in this
-directory). The remaining task files will be expanded as their phases start; the
-content above is detailed enough to begin work.
+Tasks 01, 04, 12, 17, 19, 22 are included as fully-detailed files (in this
+directory); 19 was expanded early (2026-07-03) because it carries the
+write-propagation invariant (PRD FR3.5/FR3.6). The remaining task files will be
+expanded as their phases start; the content above is detailed enough to begin
+work.
