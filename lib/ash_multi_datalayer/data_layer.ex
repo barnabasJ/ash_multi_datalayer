@@ -119,10 +119,30 @@ defmodule AshMultiDatalayer.DataLayer do
 
   defmodule Query do
     @moduledoc false
-    defstruct [:resource, :domain]
+    # Accumulates everything Ash's canonical query build hands a data layer,
+    # so it can be replayed verbatim onto an underlying layer (see
+    # AshMultiDatalayer.Delegate).
+    defstruct [
+      :resource,
+      :domain,
+      :filter,
+      :limit,
+      :tenant,
+      :select,
+      :lock,
+      sort: [],
+      distinct: [],
+      distinct_sort: nil,
+      context: %{},
+      calculations: [],
+      aggregates: [],
+      offset: 0
+    ]
   end
 
   alias AshMultiDatalayer.DataLayer.Info
+  alias AshMultiDatalayer.Delegate
+  alias AshMultiDatalayer.KillSwitch
 
   # Interim capability answer: the intersection of all declared layers.
   # Refined per read_order/write_order in the capability-negotiation phase.
@@ -137,6 +157,84 @@ defmodule AshMultiDatalayer.DataLayer do
   @impl true
   def resource_to_query(resource, domain) do
     %Query{resource: resource, domain: domain}
+  end
+
+  # --- query building: accumulate into the Query struct -----------------
+
+  @impl true
+  def filter(%Query{} = query, filter, _resource) do
+    if query.filter do
+      {:ok, %{query | filter: Ash.Filter.add_to_filter!(query.filter, filter)}}
+    else
+      {:ok, %{query | filter: filter}}
+    end
+  end
+
+  @impl true
+  def sort(%Query{} = query, sort, _resource), do: {:ok, %{query | sort: sort}}
+
+  @impl true
+  def distinct_sort(%Query{} = query, sort, _resource),
+    do: {:ok, %{query | distinct_sort: sort}}
+
+  @impl true
+  def distinct(%Query{} = query, distinct, _resource),
+    do: {:ok, %{query | distinct: distinct}}
+
+  @impl true
+  def limit(%Query{} = query, limit, _resource), do: {:ok, %{query | limit: limit}}
+
+  @impl true
+  def offset(%Query{} = query, offset, _resource), do: {:ok, %{query | offset: offset}}
+
+  @impl true
+  def select(%Query{} = query, select, _resource), do: {:ok, %{query | select: select}}
+
+  @impl true
+  def lock(%Query{} = query, lock_type, _resource), do: {:ok, %{query | lock: lock_type}}
+
+  @impl true
+  def set_tenant(_resource, %Query{} = query, tenant), do: {:ok, %{query | tenant: tenant}}
+
+  @impl true
+  def set_context(_resource, %Query{} = query, context),
+    do: {:ok, %{query | context: context}}
+
+  @impl true
+  def add_aggregate(%Query{} = query, aggregate, _resource),
+    do: {:ok, %{query | aggregates: query.aggregates ++ [aggregate]}}
+
+  @impl true
+  def add_calculation(%Query{} = query, calculation, expression, _resource),
+    do: {:ok, %{query | calculations: query.calculations ++ [{calculation, expression}]}}
+
+  # --- reads -------------------------------------------------------------
+
+  @impl true
+  def run_query(%Query{} = query, resource) do
+    read_layers = Info.read_layer_modules(resource)
+
+    cond do
+      not KillSwitch.enabled?(resource) ->
+        Delegate.run_on_layer(query, List.last(read_layers))
+
+      match?([_], read_layers) ->
+        Delegate.run_on_layer(query, hd(read_layers))
+
+      true ->
+        # Coverage-aware routing lands in the coverage phase; until then a
+        # multi-layer read_order behaves like its source of truth.
+        Delegate.run_on_layer(query, List.last(read_layers))
+    end
+  end
+
+  @impl true
+  def run_aggregate_query(%Query{} = query, aggregates, resource) do
+    layer = List.last(Info.read_layer_modules(resource))
+
+    with {:ok, layer_query} <- Delegate.to_layer_query(query, layer) do
+      Ash.DataLayer.run_aggregate_query(layer, layer_query, aggregates, resource)
+    end
   end
 
   @doc false
