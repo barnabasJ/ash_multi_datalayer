@@ -29,6 +29,7 @@ defmodule AshMultiDatalayer.DataCase do
     CountingLayer.reset!()
     reset_resource!(AshMultiDatalayer.Test.Resources.TestPost)
     reset_resource!(AshMultiDatalayer.Test.Resources.SingleLayerPost)
+    reset_resource!(AshMultiDatalayer.Test.Resources.FailingPost)
 
     :ok
   end

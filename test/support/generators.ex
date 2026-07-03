@@ -84,8 +84,10 @@ defmodule AshMultiDatalayer.Test.Generators do
   use. `{:ok, boolean}` or `:unknown`.
   """
   def matches?(row, %Ash.Filter{} = filter) do
+    # Ash keeps records on TRUTHY results, not `== true` — mirror that.
     case Ash.Filter.Runtime.do_match(row, filter) do
-      {:ok, truthy} -> {:ok, truthy == true}
+      {:ok, falsy} when falsy in [false, nil] -> {:ok, false}
+      {:ok, _truthy} -> {:ok, true}
       :unknown -> :unknown
       {:error, _} -> :unknown
     end

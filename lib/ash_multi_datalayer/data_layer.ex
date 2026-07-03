@@ -164,6 +164,19 @@ defmodule AshMultiDatalayer.DataLayer do
     %Query{resource: resource, domain: domain}
   end
 
+  # The resource's Ecto schema source (e.g. the Postgres table for inserts)
+  # comes from the data layer; delegate to the source of truth.
+  @impl true
+  def source(resource) do
+    layer = List.last(Info.read_layer_modules(resource))
+
+    if Code.ensure_loaded?(layer) and function_exported?(layer, :source, 1) do
+      layer.source(resource)
+    else
+      ""
+    end
+  end
+
   # --- query building: accumulate into the Query struct -----------------
 
   @impl true
@@ -320,6 +333,22 @@ defmodule AshMultiDatalayer.DataLayer do
       Ash.DataLayer.run_aggregate_query(layer, layer_query, aggregates, resource)
     end
   end
+
+  # --- writes ------------------------------------------------------------
+
+  @impl true
+  def create(resource, changeset), do: AshMultiDatalayer.WriteDispatch.create(resource, changeset)
+
+  @impl true
+  def update(resource, changeset), do: AshMultiDatalayer.WriteDispatch.update(resource, changeset)
+
+  @impl true
+  def destroy(resource, changeset),
+    do: AshMultiDatalayer.WriteDispatch.destroy(resource, changeset)
+
+  @impl true
+  def upsert(resource, changeset, keys, identity \\ nil),
+    do: AshMultiDatalayer.WriteDispatch.upsert(resource, changeset, keys, identity)
 
   @doc false
   # Invoked by `mix ash.codegen` for resources using this extension: generate

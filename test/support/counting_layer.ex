@@ -26,10 +26,12 @@ defmodule AshMultiDatalayer.Test.CountingLayer do
 
   defmacro __using__(opts) do
     wraps = Macro.expand(Keyword.fetch!(opts, :wraps), __CALLER__)
+    except = Keyword.get(opts, :except, [])
     Code.ensure_compiled!(wraps)
 
     defs =
       for {name, arity} <- Ash.DataLayer.behaviour_info(:callbacks),
+          name not in except,
           function_exported?(wraps, name, arity) do
         args = Macro.generate_arguments(arity, __MODULE__)
 
