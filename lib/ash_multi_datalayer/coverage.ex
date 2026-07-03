@@ -52,7 +52,7 @@ defmodule AshMultiDatalayer.Coverage do
   end
 
   @doc "Inserts a ledger entry (keyed by `entry.id`) for a resource+tenant."
-  @spec insert(module(), term(), %{id: term()}) :: :ok
+  @spec insert(module(), term(), %{:id => term(), optional(any()) => any()}) :: :ok
   def insert(resource, tenant, entry) do
     table = TableOwner.table_name(resource)
     true = :ets.insert(table, {{tenant_key(tenant), entry.id}, entry})

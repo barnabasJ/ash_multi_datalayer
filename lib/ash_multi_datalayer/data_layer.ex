@@ -144,6 +144,8 @@ defmodule AshMultiDatalayer.DataLayer do
       aggregates: [],
       offset: 0
     ]
+
+    @type t :: %__MODULE__{}
   end
 
   require Logger
@@ -339,7 +341,7 @@ defmodule AshMultiDatalayer.DataLayer do
     case Coverage.covers?(resource, query.tenant, query) do
       {:ok, _entry} ->
         with {:ok, records} <- Delegate.run_on_layer(query, hd(read_layers)) do
-          emit_read(:hit, query, resource, started)
+          emit_read(:hit, query, resource, started, %{})
           AshMultiDatalayer.Divergence.maybe_sample(query, resource, records)
           {:ok, records}
         end
@@ -390,7 +392,7 @@ defmodule AshMultiDatalayer.DataLayer do
     :ok
   end
 
-  defp emit_read(kind, query, resource, started, extra \\ %{}) do
+  defp emit_read(kind, query, resource, started, extra) do
     Telemetry.read(
       kind,
       resource,
