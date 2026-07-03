@@ -1,8 +1,7 @@
 defmodule AshMultiDatalayerTest do
-  use ExUnit.Case
-  doctest AshMultiDatalayer
+  use ExUnit.Case, async: true
 
-  test "greets the world" do
-    assert AshMultiDatalayer.hello() == :world
+  test "stub data layer advertises no capabilities yet" do
+    refute AshMultiDatalayer.DataLayer.can?(nil, :read)
   end
 end
