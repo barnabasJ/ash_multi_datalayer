@@ -65,6 +65,7 @@ defmodule AshMultiDatalayer.Test.Resources do
       resource AshMultiDatalayer.Test.Resources.FailingPost
       resource AshMultiDatalayer.Test.Resources.CappedPost
       resource AshMultiDatalayer.Test.Resources.SampledPost
+      resource AshMultiDatalayer.Test.Resources.TestAuthor
     end
   end
 
@@ -94,6 +95,60 @@ defmodule AshMultiDatalayer.Test.Resources do
       attribute :age, :integer, public?: true
       attribute :score, :decimal, public?: true
       attribute :published_at, :date, public?: true
+    end
+
+    relationships do
+      belongs_to :author, AshMultiDatalayer.Test.Resources.TestAuthor,
+        public?: true,
+        attribute_writable?: true
+    end
+
+    calculations do
+      calculate :adult?, :boolean, expr(age >= 18) do
+        public? true
+      end
+    end
+
+    actions do
+      defaults [:read, :destroy, create: :*, update: :*]
+    end
+  end
+
+  defmodule TestAuthor do
+    @moduledoc false
+    use Ash.Resource,
+      domain: Domain,
+      data_layer: AshMultiDatalayer.DataLayer,
+      extensions: [AshPostgres.DataLayer]
+
+    multi_data_layer do
+      layer(:l1, Ash.DataLayer.Ets)
+      layer(:l2, AshMultiDatalayer.Test.CountingPostgres)
+
+      read_order([:l1, :l2])
+      write_order([:l2, :l1])
+    end
+
+    postgres do
+      table "mdl_authors"
+      repo(AshMultiDatalayer.TestRepo)
+    end
+
+    attributes do
+      uuid_primary_key :id
+      attribute :name, :string, public?: true
+    end
+
+    relationships do
+      has_many :posts, AshMultiDatalayer.Test.Resources.TestPost,
+        public?: true,
+        destination_attribute: :author_id
+    end
+
+    aggregates do
+      count :post_count, :posts do
+        public? true
+      end
     end
 
     actions do

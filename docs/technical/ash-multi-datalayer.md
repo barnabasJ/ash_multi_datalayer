@@ -122,9 +122,27 @@ Given `write_order = [:l2, :l1]`:
 - **Limited/offset probes ARE served by recorded coverage**: a `limit`/`offset`
   query whose filter is implied by a recorded *unlimited* entry is a hit — the
   cache layer applies sort/limit/offset itself.
-- **Aggregate / calculation / lock reads bypass coverage entirely**: they can
-  neither be proven covered nor recorded; they fall through with miss reason
-  `:not_cacheable`.
+- **Lock reads bypass coverage entirely** (miss reason `:not_cacheable`).
+- **Calculation-loading reads use computed-value merge reads** (ADR
+  20260703-computed-value-merge-reads): covered rows are served by the cache
+  layer, and ONE value query (`pk in [...]`, PK + calculations only) against
+  the last read layer supplies the computed values, merged by primary key.
+  Hits carry `computed_values: :merged`; a cached row with no source
+  counterpart abandons the merge (miss reason `:stale_cache`, full
+  fall-through); a failing value query fails the read. Requires a
+  single-attribute primary key (else `:not_cacheable` fall-through).
+  Computed values are never cached. Rows fetched by calculation-carrying
+  misses are backfilled/recorded normally.
+- **Resource (relationship) aggregates are loudly unsupported**:
+  `can?({:aggregate, _})` is `false`, so Ash raises `AggregatesNotSupported`
+  at query build. SQL layers build the related subquery via the destination
+  resource's *data layer* — this library — which yields our query struct
+  instead of SQL, so the aggregate would otherwise come back silently
+  `NotLoaded` (the failure shape this library categorically refuses).
+  Self-aggregation via `Ash.count/2` etc. (`run_aggregate_query`) works.
+  Fixing this requires an upstream seam (ash_sql building related subqueries
+  through a pluggable resolution instead of the destination's persisted data
+  layer).
 - **Field coverage**: `Entry.loaded_fields` is the query's select **∪ the
   primary key**; `covers?` requires the probe's fields ⊆ `loaded_fields`
   (otherwise miss reason `:fields_insufficient`).

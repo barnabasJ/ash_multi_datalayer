@@ -217,9 +217,28 @@ Some queries are served normally but never recorded into the coverage ledger or
 backfilled, because a truncated or computed result cannot prove complete
 coverage of its filter:
 
-- queries with `limit`, `offset > 0`, `distinct`, `distinct_sort`, or `lock`;
-- reads with aggregates or calculations — these bypass coverage entirely and
-  miss with reason `:not_cacheable`.
+- queries with `limit`, `offset > 0`, `distinct`, `distinct_sort`, or `lock`
+  (locks additionally bypass coverage entirely, missing with reason
+  `:not_cacheable`).
+
+Reads that **load calculations** get a *computed-value merge read* (see the
+20260703 ADR): when the row filter is covered, the rows are served from the
+cache and ONE narrow query (`primary_key in [...]`, selecting only the PK plus
+the calculations) fetches the computed values from the source of truth and
+merges them in — hits carry `computed_values: :merged` metadata. Computed
+values are never cached; they are fetched fresh on every read that loads them.
+If a cached row has no source counterpart (an out-of-band delete), the merge
+is abandoned and the whole query falls through fresh (miss reason
+`:stale_cache`). The rows fetched by a calculation-carrying miss are
+backfilled and recorded like any other read.
+
+**Resource (relationship) aggregates are loudly unsupported** on multi-layer
+resources: SQL layers build the related subquery via the destination
+resource's data layer — which is this library — so the aggregate would be
+silently `NotLoaded`. `can?({:aggregate, _})` is `false`, making Ash raise at
+query build instead. Self-aggregation (`Ash.count/2` etc.) works and routes to
+the source of truth; remote-style aggregates (e.g. ash_remote's, which arrive
+as calculations) are unaffected.
 
 Limited/offset probes **are** still served from previously recorded unlimited
 coverage — the cache layer applies sort/limit/offset itself. Field coverage is

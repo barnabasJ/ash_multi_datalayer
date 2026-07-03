@@ -80,13 +80,15 @@ defmodule AshMultiDatalayer.Coverage do
   end
 
   @doc """
-  Whether a query's coverage may be recorded (and its results backfilled).
+  Whether a query's row coverage may be recorded (and its rows backfilled).
 
-  Truncated or computed result sets can't prove complete coverage of a
-  filter: queries with `limit`, a non-zero `offset`, `distinct`,
-  `distinct_sort`, a `lock`, aggregates, or calculations are never recorded
-  — recording one would later serve incomplete results as a cache hit.
-  Sort does not affect set membership and is fine.
+  Truncated result sets can't prove complete coverage of a filter: queries
+  with `limit`, a non-zero `offset`, `distinct`, `distinct_sort`, or a
+  `lock` are never recorded — recording one would later serve incomplete
+  results as a cache hit. Sort does not affect set membership and is fine.
+  Calculations/aggregates don't affect recordability: the *rows* fetched
+  alongside them are complete for the filter (the computed values themselves
+  are never recorded — see the computed-value merge-reads ADR).
   """
   @spec recordable?(Query.t() | struct()) :: boolean()
   def recordable?(%Query{} = query) do
@@ -94,9 +96,7 @@ defmodule AshMultiDatalayer.Coverage do
       query.offset in [nil, 0] and
       query.distinct in [nil, []] and
       query.distinct_sort in [nil, []] and
-      is_nil(query.lock) and
-      query.aggregates == [] and
-      query.calculations == []
+      is_nil(query.lock)
   end
 
   @doc """

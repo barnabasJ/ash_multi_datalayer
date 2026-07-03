@@ -42,7 +42,7 @@ defmodule AshMultiDatalayer.DebugTest do
     assert {:miss, :solver_unsupported} = decision
   end
 
-  test "TestSupport.reset! clears ledger, cache, and kill-switch" do
+  test "TestSupport.reset! clears the library's state: ledger and kill-switch" do
     TestPost
     |> Ash.Changeset.for_create(:create, %{name: "foo", age: 20})
     |> Ash.create!()

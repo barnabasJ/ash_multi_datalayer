@@ -37,13 +37,13 @@ defmodule AshMultiDatalayer.DataCase do
   end
 
   @doc """
-  Clears every piece of layered state for a resource: the ETS cache tables,
-  the coverage ledger, and the kill-switch.
+  Clears every piece of layered state for a resource: the library's ledger +
+  kill-switch via TestSupport, plus the Ets cache tables (layer-specific
+  cleanup is the caller's job — the library is data-layer agnostic).
   """
   def reset_resource!(resource) do
+    AshMultiDatalayer.TestSupport.reset!(resource)
     Ash.DataLayer.Ets.stop(resource)
-    AshMultiDatalayer.Coverage.reset(resource)
-    AshMultiDatalayer.enable!(resource)
     :ok
   end
 end

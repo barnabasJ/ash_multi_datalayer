@@ -4,27 +4,26 @@ defmodule AshMultiDatalayer.TestSupport do
 
       setup do
         AshMultiDatalayer.TestSupport.reset!(MyApp.Post)
+        # Clear your cache layers' own storage too, e.g. for Ets layers:
+        Ash.DataLayer.Ets.stop(MyApp.Post)
         :ok
       end
 
-  `reset!/1` clears every piece of node-local layered state for a resource:
-  the coverage ledger, the kill-switch, and any `Ash.DataLayer.Ets` layer
-  tables — so each test starts cold and enabled.
+  `reset!/1` clears the state **this library owns** for a resource — the
+  coverage ledger and the kill-switch. The underlying layers' storage is
+  theirs to manage: the library is data-layer agnostic and there is no
+  generic "wipe" in the `Ash.DataLayer` behaviour, so clear cache layers
+  with their own APIs (as above for `Ash.DataLayer.Ets`).
   """
 
   alias AshMultiDatalayer.Coverage
   alias AshMultiDatalayer.KillSwitch
 
-  @doc "Clears ledger, kill-switch, and ETS layer tables for a resource."
+  @doc "Clears the coverage ledger and kill-switch for a resource."
   @spec reset!(module()) :: :ok
   def reset!(resource) do
     Coverage.reset(resource)
     KillSwitch.enable!(resource)
-
-    # Ets tables are keyed by the resource module, so this also covers
-    # wrapper layers that delegate to Ash.DataLayer.Ets. Idempotent.
-    Ash.DataLayer.Ets.stop(resource)
-
     :ok
   end
 end

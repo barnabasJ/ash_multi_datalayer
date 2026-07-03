@@ -43,8 +43,12 @@ defmodule TodoClient.MdlCase do
     Enum.each(Ash.read!(TodoServer.TodoList), &Ash.destroy!/1)
     Enum.each(Ash.read!(TodoServer.User), &Ash.destroy!/1)
 
-    # Client layered state: cache tables, coverage ledgers, kill-switches.
-    Enum.each(@client_resources, &AshMultiDatalayer.TestSupport.reset!/1)
+    # Client layered state: coverage ledgers + kill-switches (library), and
+    # the Ets cache tables (layer-specific cleanup is the app's job).
+    Enum.each(@client_resources, fn resource ->
+      AshMultiDatalayer.TestSupport.reset!(resource)
+      Ash.DataLayer.Ets.stop(resource)
+    end)
 
     CountingRouter.reset!()
 

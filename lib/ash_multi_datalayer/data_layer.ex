@@ -172,6 +172,17 @@ defmodule AshMultiDatalayer.DataLayer do
   @impl true
   def can?(_resource, {:join, _}), do: false
   def can?(_resource, {:lateral_join, _}), do: false
+
+  # Resource (relationship) aggregates are LOUDLY unsupported: SQL layers
+  # build the related subquery via the destination resource's data layer —
+  # which is this module, yielding our query struct instead of SQL — so the
+  # aggregate would be silently dropped (NotLoaded), the one failure shape
+  # this library refuses. Answering false makes Ash raise
+  # AggregatesNotSupported at query build instead. Self-aggregation
+  # (Ash.count/…) still works via run_aggregate_query; remote-style
+  # aggregates arrive as calculations and are unaffected.
+  def can?(_resource, {:aggregate, _}), do: false
+  def can?(_resource, {:aggregate_relationship, _}), do: false
   def can?(_resource, :combine), do: false
   def can?(_resource, {:combine, _}), do: false
   def can?(_resource, :update_query), do: false
@@ -322,6 +333,7 @@ defmodule AshMultiDatalayer.DataLayer do
   @impl true
   def run_query(%Query{} = query, resource) do
     read_layers = Info.read_layer_modules(resource)
+    computed? = query.aggregates != [] or query.calculations != []
 
     cond do
       not KillSwitch.enabled?(resource) ->
@@ -330,21 +342,20 @@ defmodule AshMultiDatalayer.DataLayer do
       match?([_], read_layers) ->
         Delegate.run_on_layer(query, hd(read_layers))
 
-      not servable_from_coverage?(query) ->
-        # Aggregates/calculations/locks are computed by the source of truth
-        # and are never cache-eligible.
+      not is_nil(query.lock) ->
         source_read(query, resource, read_layers, :not_cacheable)
+
+      computed? and not AshMultiDatalayer.ValueMerge.mergeable?(resource) ->
+        # Computed values are the source of truth's job; without a mergeable
+        # primary key the whole query falls through.
+        source_read(query, resource, read_layers, :not_cacheable)
+
+      computed? ->
+        merged_read(query, resource, read_layers)
 
       true ->
         coverage_read(query, resource, read_layers)
     end
-  end
-
-  # Limited/offset/distinct probes can still be SERVED by recorded unlimited
-  # coverage (the cache layer holds the complete matching set and applies
-  # sort/limit/offset itself); aggregate/calc/lock queries cannot.
-  defp servable_from_coverage?(%Query{} = query) do
-    query.aggregates == [] and query.calculations == [] and is_nil(query.lock)
   end
 
   defp coverage_read(%Query{} = query, resource, read_layers) do
@@ -360,6 +371,35 @@ defmodule AshMultiDatalayer.DataLayer do
 
       {:miss, reason} ->
         source_read(query, resource, read_layers, reason)
+    end
+  end
+
+  # Computed-value merge read: rows from covered cache, one narrow value
+  # query for the calculations/aggregates, merged by primary key. See the
+  # 20260703-computed-value-merge-reads ADR.
+  defp merged_read(%Query{} = query, resource, read_layers) do
+    started = System.monotonic_time()
+    row_query = AshMultiDatalayer.ValueMerge.row_query(query)
+
+    with {:ok, _entry} <- Coverage.covers?(resource, query.tenant, row_query),
+         {:ok, rows} <- Delegate.run_on_layer(row_query, hd(read_layers)) do
+      case AshMultiDatalayer.ValueMerge.merge(query, rows, resource, List.last(read_layers)) do
+        {:ok, merged} ->
+          emit_read(:hit, query, resource, started, %{computed_values: :merged})
+          AshMultiDatalayer.Divergence.maybe_sample(query, resource, merged)
+          {:ok, merged}
+
+        :stale_cache ->
+          # A cached row has no source counterpart (out-of-band delete):
+          # abandon the merge, serve everything fresh.
+          source_read(query, resource, read_layers, :stale_cache)
+
+        {:error, error} ->
+          {:error, error}
+      end
+    else
+      {:miss, reason} -> source_read(query, resource, read_layers, reason)
+      {:error, error} -> {:error, error}
     end
   end
 
