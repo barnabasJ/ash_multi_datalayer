@@ -9,4 +9,17 @@ defmodule AshMultiDatalayer do
   See `AshMultiDatalayer.DataLayer` for the resource DSL, and the guides for
   layering recipes, operations, and telemetry.
   """
+
+  @doc """
+  Disables layered behaviour for a resource at runtime: reads route to the
+  last layer in `read_order`, writes to the first layer in `write_order`
+  (both the source of truth), skipping cache layers and coverage entirely.
+  """
+  defdelegate disable!(resource), to: AshMultiDatalayer.KillSwitch
+
+  @doc "Re-enables layered behaviour for a resource. See `disable!/1`."
+  defdelegate enable!(resource), to: AshMultiDatalayer.KillSwitch
+
+  @doc "Whether layered behaviour is currently enabled for the resource."
+  defdelegate enabled?(resource), to: AshMultiDatalayer.KillSwitch
 end
