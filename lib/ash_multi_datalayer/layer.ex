@@ -3,7 +3,7 @@ defmodule AshMultiDatalayer.Layer do
   A named underlying data layer declared in a `multi_data_layer` section.
   """
 
-  defstruct [:name, :module]
+  defstruct [:name, :module, __spark_metadata__: nil]
 
   @type t :: %__MODULE__{name: atom(), module: module()}
 end

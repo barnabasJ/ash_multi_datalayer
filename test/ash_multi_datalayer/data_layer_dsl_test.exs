@@ -103,6 +103,13 @@ defmodule AshMultiDatalayer.DataLayerDslTest do
     end
   end
 
+  test "can? answers from the declared layers" do
+    # Ets supports reads/creates; nothing supports :transact through Ets.
+    assert AshMultiDatalayer.DataLayer.can?(Post, :read)
+    assert AshMultiDatalayer.DataLayer.can?(Post, :create)
+    refute AshMultiDatalayer.DataLayer.can?(Post, :transact)
+  end
+
   test "unknown entities inside the section fail helpfully" do
     # Spark surfaces unknown DSL calls as a CompileError naming the call.
     assert_raise CompileError, fn ->

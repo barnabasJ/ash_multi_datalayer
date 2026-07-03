@@ -40,6 +40,7 @@ defmodule AshMultiDatalayer.MixProject do
       {:crux, "0.1.3", override: true},
       # No :only restriction — ash 3.29+ depends on stream_data in all envs.
       {:stream_data, "~> 1.0"},
+      {:sourceror, "~> 1.7", only: [:dev, :test]},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
     ]
