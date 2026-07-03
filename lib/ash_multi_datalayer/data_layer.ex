@@ -115,7 +115,13 @@ defmodule AshMultiDatalayer.DataLayer do
 
   use Spark.Dsl.Extension,
     sections: [@multi_data_layer],
-    verifiers: []
+    verifiers: [
+      AshMultiDatalayer.Verifiers.ValidateLayers,
+      AshMultiDatalayer.Verifiers.ValidateMultitenancy,
+      AshMultiDatalayer.Verifiers.RejectFieldPolicies,
+      AshMultiDatalayer.Verifiers.RejectMultiNode,
+      AshMultiDatalayer.Verifiers.ValidateSolverSupportedPredicates
+    ]
 
   defmodule Query do
     @moduledoc false
@@ -165,16 +171,20 @@ defmodule AshMultiDatalayer.DataLayer do
   end
 
   # The resource's Ecto schema source (e.g. the Postgres table for inserts)
-  # comes from the data layer; delegate to the source of truth.
+  # comes from the data layer; delegate to the source of truth. Called during
+  # resource compilation, BEFORE verifiers — so it must tolerate invalid
+  # layer configuration (the verifier reports it properly afterwards).
   @impl true
   def source(resource) do
     layer = List.last(Info.read_layer_modules(resource))
 
-    if Code.ensure_loaded?(layer) and function_exported?(layer, :source, 1) do
+    if layer && Code.ensure_loaded?(layer) && function_exported?(layer, :source, 1) do
       layer.source(resource)
     else
       ""
     end
+  rescue
+    _ -> ""
   end
 
   # --- query building: accumulate into the Query struct -----------------
