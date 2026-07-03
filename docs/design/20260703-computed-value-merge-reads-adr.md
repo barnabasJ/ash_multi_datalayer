@@ -162,6 +162,24 @@ row-aware — it would be TTL-or-wrong, which v1 explicitly avoids.
   value queries (the calc/aggregate freshness canary in the example's T0/T5
   must stay green — values fresh on every read).
 
+## Future work (related splits, out of scope here)
+
+**Partial row serving** ("cache holds a subset; fetch only the remainder")
+is a different split and stays out: a remainder filter `Q ∧ ¬C` requires
+negation, and under Ash's runtime nil semantics `x` and `not x` can BOTH be
+non-matches for nil operands — a naive remainder silently drops nil rows
+(same failure class as a stale read). If ever pursued, the sound
+construction is known: nil-guarded complements (`¬(age > 18)` →
+`age <= 18 or is_nil(age)`; plain complements allowed for
+`allow_nil? false` attributes), the existing 32-disjunct cap against CNF→DNF
+blowup, and a dedicated *completeness* property suite
+(`match(Q) ⇒ match(Q∧C) ∨ match(remainder)` vs `Ash.Filter.Runtime` over
+nil-heavy rows). The snapshot caveat (cache rows at T₁ + fetched rows at T₂
+in one result) applies regardless. The **OR-decomposable special case**
+(query is a union; covered disjuncts from cache, uncovered fetched verbatim,
+PK-dedupe, unsorted/unlimited only) needs no negation at all and would be
+the first candidate.
+
 ## Links
 
 - [Interval-subsumption ADR](./20260417-interval-based-subsumption-adr.md) —
