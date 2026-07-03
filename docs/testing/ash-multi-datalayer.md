@@ -1,6 +1,6 @@
 # `ash_multi_datalayer` — Test Strategy
 
-**Status**: Draft **Created**: 2026-04-17 **Last Updated**: 2026-04-17
+**Status**: Draft **Created**: 2026-04-17 **Last Updated**: 2026-07-03
 
 ## Overview
 
@@ -20,7 +20,7 @@ most bugs live at the seams.
 | Layer       | Definition (this project)                                                 | Scope                                                                                                       | Status  |
 | ----------- | ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | ------- |
 | Unit        | In-process pure-function or GenServer-isolated tests; no DB.              | `Coverage.Implication`, `Coverage.Invalidation`, `Info`, verifiers, kill-switch, telemetry fingerprints     | Planned |
-| Integration | Real Postgres (via `ash_postgres` TestRepo), real ETS, compiled resources | `run_query/2`, write dispatch, `mix ash_postgres.generate_migrations`, ledger + cache + primary interaction | Planned |
+| Integration | Real Postgres (via `ash_postgres` TestRepo), real ETS, compiled resources | `run_query/2`, write dispatch, `mix ash_multi_datalayer.generate_migrations`, ledger + cache + primary interaction | Planned |
 | Property    | StreamData-generated cases, cross-checked against a reference evaluator   | Solver implication; row-aware invalidation                                                                  | Planned |
 | Manual      | `iex -S mix` smoke in the author's own host project                       | Pre-release dogfood                                                                                         | Planned |
 
@@ -36,7 +36,7 @@ surface beyond Ash itself.
 | ---------------------------------------------------- | -------------------- | -------------------- | ----------------------------- | -------------------------------------------------------- |
 | `Coverage.Implication` (solver)                      | High                 | High (stale reads)   | Unit + Property + Integration | Highest-priority area. Property suite is mandatory.      |
 | `Coverage.Invalidation` (row-matcher)                | High                 | High (stale reads)   | Unit + Property + Integration | Same rigor as the solver; inverse problem.               |
-| `RegisterUnderlyingExtensions` + migration generator | High                 | High (compile break) | Integration                   | Architect's blocking concern; one dedicated test.        |
+| `AshMultiDatalayer.Migration` shadow modules + migration generator | High                 | High (compile break) | Integration                   | Architect's blocking concern; one dedicated test.        |
 | Verifiers (5 of them)                                | Medium               | Medium (UX)          | Unit                          | Each needs both an accept case and a reject case.        |
 | Kill-switch                                          | Low                  | Medium (ops)         | Unit + Integration            | Small surface; integration confirms runtime bypass path. |
 | Telemetry event shape                                | Low                  | Medium (ops)         | Unit                          | Each event captured in a test; schema verified.          |
@@ -49,7 +49,7 @@ surface beyond Ash itself.
 | PRD Acceptance Criterion                                                                     | Test Type   | Test Location                                                          | Status  |
 | -------------------------------------------------------------------------------------------- | ----------- | ---------------------------------------------------------------------- | ------- |
 | Switching `data_layer:` + adding the DSL block compiles with no other changes                | Integration | `test/integration/drop_in_replacement_test.exs`                        | Planned |
-| `mix ash_postgres.generate_migrations` works on a multi-datalayer resource                   | Integration | `test/integration/generate_migrations_test.exs`                        | Planned |
+| `mix ash_multi_datalayer.generate_migrations` works on a multi-datalayer resource            | Integration | `test/integration/generate_migrations_test.exs`                        | Planned |
 | Subsumption recognises `name == "foo"` implies `name == "foo" and age > 18`                  | Integration | `test/integration/subsumption_test.exs`                                | Planned |
 | Solver cross-check against brute-force evaluator — 10 k cases, zero counterexamples          | Property    | `test/ash_multi_datalayer/coverage/implication_property_test.exs`      | Planned |
 | Row-aware invalidation keeps unrelated ledger entries on writes                              | Integration | `test/integration/row_aware_invalidation_test.exs`                     | Planned |
@@ -115,8 +115,13 @@ end
 Each verifier needs:
 
 - [ ] Happy-path resource compiles.
-- [ ] Failing-path resource fails to compile with the expected error text (use
-      `assert_raise` on `Ash.Error.Dsl.DslError`).
+- [ ] Failing-path assertion on the expected error text. **Not** via
+      `assert_raise`: in spark 2.7 the whole verifier pass is wrapped in a
+      catch that converts `DslError`s to compiler warnings/diagnostics (which
+      fail builds under `--warnings-as-errors`) — verifier failures do not
+      hard-raise at runtime. Instead, tests call the verifier directly on the
+      resource's `spark_dsl_config` and use Spark's test collector to capture
+      the diagnostics.
 
 ### Kill-switch
 
@@ -160,12 +165,21 @@ and `write_order [:l2]`, behaves identically.
 
 **File**: `test/integration/generate_migrations_test.exs`
 
-**What it covers**: Architect's blocking concern — transitive extension install
-must not break AshPostgres tooling.
+**What it covers**: Architect's blocking concern — migration tooling must keep
+working on multi-datalayer resources. As discovered during implementation, the
+stock `mix ash_postgres.generate_migrations` discovers resources via hard
+equality (`Ash.DataLayer.data_layer(resource) == AshPostgres.DataLayer`,
+`migration_generator.ex:38`) and **silently skips** multi-datalayer resources;
+the library ships `AshMultiDatalayer.Migration` (runtime shadow modules) plus
+`mix ash_multi_datalayer.generate_migrations` and a `codegen/1` hook for
+`mix ash.codegen`. An upstream `ash_postgres` PR to make discovery pluggable is
+planned.
 
-- [ ] `mix ash_postgres.generate_migrations` on a multi-datalayer resource
-      produces migrations equivalent to the same resource using
-      `AshPostgres.DataLayer` directly.
+- [ ] `mix ash_multi_datalayer.generate_migrations` on a multi-datalayer
+      resource produces migrations **byte-identical** to those of a twin
+      resource using `AshPostgres.DataLayer` directly.
+- [ ] Relationship FKs survive: shadow modules rewrite relationship source
+      **and** destination to shadows.
 
 ### Coverage + backfill
 
@@ -385,4 +399,4 @@ mix coveralls.html
 
 ---
 
-**Last Updated**: 2026-04-17
+**Last Updated**: 2026-07-03

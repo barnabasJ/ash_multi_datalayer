@@ -1,8 +1,8 @@
 # `ash_multi_datalayer` — Runbook
 
-**Owner**: Barnabas Jovanovics **Last verified**: 2026-04-17 (plan stage — no
-production deployment yet) **On-call escalation**: Project maintainer / GitHub
-issues
+**Owner**: Barnabas Jovanovics **Last verified**: 2026-07-03 (v1 implemented —
+no production deployment yet) **On-call escalation**: Project maintainer /
+GitHub issues
 
 ## Overview
 
@@ -99,7 +99,15 @@ AshMultiDatalayer.enabled?(MyApp.Post)    # => false
 Ash.read!(MyApp.Post)                     # served entirely by :l2
 ```
 
-**Rollback**: `AshMultiDatalayer.enable!(MyApp.Post)`.
+While disabled: reads route to the **last** layer of `read_order`, writes route
+to the **first** layer of `write_order` (both the source of truth), and ledger
+invalidation still runs on writes — so re-enabling cannot serve coverage
+recorded before the switch was flipped.
+
+**Rollback**: `AshMultiDatalayer.enable!(MyApp.Post)` or
+`mix ash_multi_datalayer.enable MyApp.Post`. (The shipped Mix tasks are
+`ash_multi_datalayer.disable`, `ash_multi_datalayer.enable`, and
+`ash_multi_datalayer.inspect`.)
 
 ### Inspect the coverage ledger
 
@@ -237,6 +245,10 @@ the action boundary.
 
 **Severity**: P1 — this is the "the cache is wrong" alarm.
 
+Note: the divergence sampler defaults to `0.0` (off). This alert only exists
+for resources that have opted in via `divergence_sampler` — silence from a
+resource with the sampler off is not evidence of health.
+
 **Likely cause**: solver bug (cache claimed coverage it shouldn't have) or
 invalidation bug (a write should have dropped this entry).
 
@@ -297,7 +309,9 @@ AshMultiDatalayer.Coverage.invalidate(MyApp.Post, nil)
 
 ```elixir
 :ets.info(:"Elixir.MyApp.Post.AshMultiDatalayer.Coverage")
-:ets.info(AshMultiDatalayer.DataLayer.Info.cache_layer(MyApp.Post) |> ...)
+# The earlier read layer (the cache in a cache-through config) is
+# hd(AshMultiDatalayer.DataLayer.Info.read_order(MyApp.Post)); if it is
+# Ash.DataLayer.Ets, inspect that layer's own table too.
 ```
 
 Check `size` and `memory` (words).
@@ -397,4 +411,4 @@ deploy.
 
 ---
 
-**Last verified**: 2026-04-17
+**Last verified**: 2026-07-03

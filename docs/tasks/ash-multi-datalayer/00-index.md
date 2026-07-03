@@ -6,13 +6,16 @@ decomposed below.
 
 Mapped to phases in [the plan](../../plans/ash-multi-datalayer-plan.md).
 
+**Status (2026-07-03)**: all phases are implemented. The `ash_remote` example
+(`example/`) serves as task 32's dogfood. Task 33 (Hex release) remains open.
+
 ## Phase 1 — Deps + stub
 
 | #   | Task                                                                | Size | Depends on |
 | --- | ------------------------------------------------------------------- | ---- | ---------- |
 | 01  | [Scaffold deps in `mix.exs`](./01-scaffold-deps.md)                 | S    | —          |
 | 02  | [Supervisor skeleton](./02-supervisor-skeleton.md)                  | S    | 01         |
-| 03  | [Stub `AshMultiDatalayer.DataLayer` module](./03-stub-datalayer.md) | S    | 01         |
+| 03  | [Stub `AshMultiDatalayer.DataLayer` module](./03-stub-datalayer.md) — `@behaviour Ash.DataLayer` + `use Spark.Dsl.Extension` (there is no `use Ash.DataLayer`) | S    | 01         |
 
 ## Phase 2 — DSL + Info + transformer
 
@@ -20,8 +23,8 @@ Mapped to phases in [the plan](../../plans/ash-multi-datalayer-plan.md).
 | --- | -------------------------------------------------------------------------------------------- | ---- | ---------- |
 | 04  | [`multi_data_layer` DSL section + `Layer` entity](./04-dsl-section.md)                       | M    | 03         |
 | 05  | [`AshMultiDatalayer.DataLayer.Info` introspection module](./05-info-module.md)               | M    | 04         |
-| 06  | [`RegisterUnderlyingExtensions` transformer](./06-transformer.md)                            | M    | 04         |
-| 07  | [Integration test: `mix ash_postgres.generate_migrations`](./07-generate-migrations-test.md) | M    | 06         |
+| 06  | [`ValidateLayers` extension-presence check](./06-transformer.md) — the planned `RegisterUnderlyingExtensions` transformer is infeasible (Spark resolves extensions at `use` time); resources list required underlying extensions explicitly and the verifier errors when one is missing | M    | 04         |
+| 07  | [`AshMultiDatalayer.Migration` + `mix ash_multi_datalayer.generate_migrations`](./07-generate-migrations-test.md) — stock `mix ash_postgres.generate_migrations` discovers via `Ash.DataLayer.data_layer(resource) == AshPostgres.DataLayer` (`migration_generator.ex:38`) and silently skips multi-datalayer resources; shipped runtime shadow modules (introspection-delegating, reporting AshPostgres, rewriting relationship source and destination so FKs survive) + `codegen/1` for `mix ash.codegen`; integration-proven byte-identical to a plain-postgres twin; upstream ash_postgres PR planned to make discovery pluggable | M    | 06         |
 
 ## Phase 3 — Coverage infra + kill-switch
 

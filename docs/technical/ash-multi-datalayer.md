@@ -1,6 +1,7 @@
 # `ash_multi_datalayer` — Technical Deep-Dive
 
-**Last verified**: 2026-04-17 (plan-stage; no code yet) **Scope**: Architecture,
+**Last verified**: 2026-07-03 (v1 implemented; updated to match the shipped
+code) **Scope**: Architecture,
 runtime behaviour, data model, and key decisions for v1 of the library. Does NOT
 cover: v2 ideas (`:write_behind`, multi-node coherence, N>2 layers).
 **Prerequisites**: Familiarity with Ash 3.x resources, the `Ash.DataLayer`
@@ -61,9 +62,12 @@ Given `read_order = [:l1, :l2]`:
    the incoming filter. Return the first covering entry or `:none`.
 3. **Hit path.** Matched entry → execute the query against `:l1` directly. `:l1`
    applies its own sort/limit/offset.
-4. **Miss path.** No covering entry → execute against `:l2`; if `backfill?` is
-   true, upsert results into `:l1` and record the materialised filter in the
-   ledger.
+4. **Miss path.** No covering entry → execute against `:l2`; upsert results
+   into `:l1` and record the materialised filter in the ledger. Backfilling is
+   always on for multi-layer `read_order` (the `backfill?` option was removed
+   2026-07-03; single-layer configs skip coverage entirely, so there was
+   nothing left for it to control). Queries the coverage model cannot prove
+   complete (see [Edge Cases](#edge-cases)) are served but never recorded.
 5. **Divergence sample.** With probability `divergence_sampler`, even on a hit,
    re-issue the query against `:l2` and compare PK sets. Emit
    `[:ash_multi_datalayer, :read, :divergence_detected]` on mismatch.
@@ -79,10 +83,15 @@ Given `write_order = [:l2, :l1]`:
    hit only the cache and lose the write) and still run step 3.
 2. **Authoritative write.** Call `:l2` first. Fail-fast on `:l2` failure — the
    operation aborts; `:l1` and the ledger are not touched.
-3. **Row-aware invalidation.** For every ledger entry, evaluate its filter
-   against `row_before` and `row_after` via `Ash.Filter.Runtime.do_match/2`.
-   Drop matching entries; keep the rest. This runs **before** any `:l1` write
-   (FR3.6) so a failure in step 4 can never leave stale coverage behind.
+3. **Row-aware invalidation.** For every ledger entry, evaluate its raw
+   `Ash.Filter` against `row_before` and `row_after` via
+   `Ash.Filter.Runtime.do_match/6` (see [Row-aware
+   invalidation](#row-aware-invalidation)). Drop matching entries; keep the
+   rest. This runs **before** any `:l1` write (FR3.6) so a failure in step 4
+   can never leave stale coverage behind. **Upserts** are the exception: there
+   is no reliable before-image (the datalayer cannot know which existing row —
+   if any — the upsert replaced), so an upsert drops the **entire tenant
+   partition** of the ledger — the only provably safe option.
 4. **Propagate to `:l1`.** Upsert the record `:l2` **returned** — never re-run
    the caller's changeset; `:l2`-computed fields (defaults, IDs, timestamps,
    server-side changes) exist only on the returned record (FR3.5). Failure is
@@ -106,6 +115,21 @@ Given `write_order = [:l2, :l1]`:
 
 ### Edge Cases
 
+- **Truncated or computed reads are never recorded/backfilled**: a query with
+  `limit`, `offset > 0`, `distinct`, `distinct_sort`, or `lock` may return a
+  result that is correct but incomplete/derived, so it can never prove complete
+  coverage of its filter. It is served normally but leaves no ledger entry.
+- **Limited/offset probes ARE served by recorded coverage**: a `limit`/`offset`
+  query whose filter is implied by a recorded *unlimited* entry is a hit — the
+  cache layer applies sort/limit/offset itself.
+- **Aggregate / calculation / lock reads bypass coverage entirely**: they can
+  neither be proven covered nor recorded; they fall through with miss reason
+  `:not_cacheable`.
+- **Field coverage**: `Entry.loaded_fields` is the query's select **∪ the
+  primary key**; `covers?` requires the probe's fields ⊆ `loaded_fields`
+  (otherwise miss reason `:fields_insufficient`).
+- **Upsert writes**: no reliable before-image → the whole tenant partition of
+  the ledger is dropped (see the write path above).
 - **Unsupported predicate in incoming filter**: solver short-circuits to "not
   covered" → fall through to later layer (never claim a false hit).
 - **Unsupported predicate in stored ledger entry** (shouldn't happen; we
@@ -151,8 +175,7 @@ flowchart TD
     end
 
     subgraph Compile["Compile-time"]
-      Tr["RegisterUnderlyingExtensions transformer"]
-      V1["ValidateLayers"]
+      V1["ValidateLayers (incl. extension-presence check)"]
       V2["ValidateMultitenancy"]
       V3["RejectFieldPolicies"]
       V4["RejectMultiNode"]
@@ -162,8 +185,7 @@ flowchart TD
     Sup["Supervisor"]
   end
 
-  DSL --> Tr
-  Tr --> V1 --> V2 --> V3 --> V4 --> V5
+  DSL --> V1 --> V2 --> V3 --> V4 --> V5
   DL --> KS
   DL --> Ledger
   DL --> Tel
@@ -179,22 +201,32 @@ flowchart TD
 
 ### Component notes
 
-- **`DataLayer`** is both an `Ash.DataLayer` impl and a `Spark.Dsl.Extension`.
-  The `extensions/1` callback returns the underlying layers' DSL extensions,
-  brought in by `Tr`.
+- **`DataLayer`** is both an `Ash.DataLayer` impl (`@behaviour Ash.DataLayer`;
+  there is no `use Ash.DataLayer`) and a `Spark.Dsl.Extension`. Underlying
+  layers' DSL extensions are **not** installed automatically — the planned
+  `RegisterUnderlyingExtensions` transformer turned out to be infeasible
+  because Spark resolves extensions at `use` time, before any transformer can
+  run. Instead, a resource lists an underlying layer's extension explicitly
+  (`use Ash.Resource, data_layer: AshMultiDatalayer.DataLayer, extensions:
+  [AshPostgres.DataLayer]`) when — and only when — that layer's DSL section has
+  required options (AshPostgres: yes; `Ash.DataLayer.Ets` and
+  `AshRemote.DataLayer`: no — they work from defaults or bring their own
+  extension). The `ValidateLayers` verifier errors with a helpful message when
+  a required extension is missing.
 - **`Coverage.TableOwner`** owns a named ETS table
   `:"#{resource}.AshMultiDatalayer.Coverage"`, started by the supervisor. Owning
   the table via a dedicated GenServer (not the calling process) avoids surprise
   orphaning on code reload or test isolation.
 - **`Coverage.Implication`** normalises both filters to per-attribute interval
   DNF, then checks set containment disjunct-by-disjunct.
-- **`Coverage.Invalidation`** wraps `Ash.Filter.Runtime.do_match/2` to drop
-  ledger entries that match the changed row's before/after attribute values.
+- **`Coverage.Invalidation`** wraps `Ash.Filter.Runtime.do_match` (arity 2..6)
+  to drop ledger entries that match the changed row's before/after attribute
+  values.
 - **`kill_switch`** reads
   `:persistent_term.get({:ash_multi_datalayer, resource}, :enabled)` on every
   operation — nanosecond-scale.
-- **Verifiers** run at resource compile time; transformer runs after the
-  `multi_data_layer` section parses and before verifiers.
+- **Verifiers** run at resource compile time after the `multi_data_layer`
+  section parses. There is no transformer.
 
 ## Data Model
 
@@ -208,6 +240,8 @@ erDiagram
     reference id PK
     term tenant
     filter_ast filter
+    interval_dnf normalised
+    term fingerprint
     mapset_atom loaded_fields
     monotonic_integer loaded_at
   }
@@ -215,7 +249,6 @@ erDiagram
     module name PK
     atom_list read_order
     atom_list write_order
-    boolean backfill
     pos_integer ledger_max_entries
     float divergence_sampler
   }
@@ -223,10 +256,16 @@ erDiagram
 
 - `tenant` uses a `:__global__` sentinel for `nil` so untagged entries form a
   distinct partition.
-- `filter` is stored normalised (interval DNF) so `implies?` is cheap at query
-  time.
-- `loaded_fields` is a `MapSet` of attribute atoms; a ledger entry only covers
-  an incoming query whose selected fields are a subset.
+- An entry stores the filter in **both forms**: the raw `%Ash.Filter{}`
+  (`filter` — re-evaluated against changed rows for runtime invalidation
+  matching) **and** the normalised per-attribute interval DNF (`normalised` —
+  so `implies?` is cheap at query time, with no per-read re-normalisation).
+- `fingerprint` is the dedupe key: the canonicalised normalised form
+  **including literal values**. It is distinct from the PII-safe *telemetry*
+  fingerprint, which type-tags values away.
+- `loaded_fields` is a `MapSet` of attribute atoms — the query's select **∪
+  the primary key**; a ledger entry only covers an incoming query whose fields
+  are a subset of `loaded_fields`.
 
 ## Key Decisions
 
@@ -250,7 +289,7 @@ per call. **Rejected alternative**: SAT-style reduction over
 ### Row-aware invalidation in v1
 
 **Chosen**: drop only ledger entries whose filter matches the changed row
-(before or after), via `Ash.Filter.Runtime.do_match/2`. **Why**: "drop
+(before or after), via `Ash.Filter.Runtime.do_match/6`. **Why**: "drop
 everything on write" would make `:cache_first` strictly worse than a plain PK
 cache under any write load. **Rejected alternative**: drop-all + row-aware as a
 "fast follow-up." **ADR**:
@@ -290,17 +329,49 @@ at-least-once duplication risk; cross-node coherence broken. **ADR**:
 
 ## Implementation Notes
 
-### DSL + transformer
+### DSL + underlying extensions (transformer dropped)
 
 `AshMultiDatalayer.DataLayer` uses `Spark.Dsl.Extension` with one section
-(`multi_data_layer`) and one transformer (`RegisterUnderlyingExtensions`). The
-transformer's `Spark.Dsl.Transformer.transform/1` callback reads parsed `layer`
-entities, calls `Spark.Dsl.Extension.add_extensions/2` with each underlying
-layer's extension module. Verifiers run after.
+(`multi_data_layer`). The planned `RegisterUnderlyingExtensions` transformer
+was **not implementable**: Spark resolves a resource's extension list at `use`
+time, before any transformer runs, so a transformer cannot add extensions.
+Implemented replacement: resources declare underlying-layer extensions
+explicitly via `extensions:` only when a layer's DSL section has required
+options; the `ValidateLayers` verifier errors helpfully when one is missing.
+Verifiers run as usual.
 
 **Verified by**: `test/ash_multi_datalayer/data_layer_test.exs` (smoke),
 `test/integration/generate_migrations_test.exs` (the architect's blocking
 concern).
+
+### Migration generation (`AshMultiDatalayer.Migration`)
+
+The stock `mix ash_postgres.generate_migrations` discovers resources with a
+hard equality check —
+`Ash.DataLayer.data_layer(resource) == AshPostgres.DataLayer`
+(`migration_generator.ex:38`) — so it **silently skips** multi-datalayer
+resources. `AshMultiDatalayer.Migration` works around this by building runtime
+**shadow modules** for each multi-datalayer resource whose source of truth is
+AshPostgres: a shadow delegates Spark introspection to the real resource,
+reports `AshPostgres.DataLayer` as its data layer, and rewrites relationship
+**source and destination** to shadows so foreign keys survive. Shipped as
+`mix ash_multi_datalayer.generate_migrations`, plus a `codegen/1` entry point
+so `mix ash.codegen` works. Integration-proven byte-identical to a
+plain-postgres twin resource. An upstream `ash_postgres` PR to make resource
+discovery pluggable is planned.
+
+### Capability negotiation
+
+`can?/2` returns `false` for `{:join, _}`, `{:lateral_join, _}`, `:combine`,
+`:update_query`, `:destroy_query`, `{:atomic, _}`, and `:async_engine` —
+bulk/atomic query paths would bypass the write dispatcher (and its
+invalidation), so Ash falls back to per-record operations. `can?(:select)` is
+decided by the **last** read layer alone: stripping select breaks layers like
+`AshRemote` that derive fetched fields from it, while select-less cache layers
+simply return full rows for Ash to narrow — discovered via the `ash_remote`
+example. The data layer also implements `source/1` delegating to the source of
+truth; without it the resource's Ecto schema source is empty and e.g.
+AshPostgres INSERTs fail.
 
 ### Coverage ledger lifecycle
 
@@ -322,7 +393,19 @@ predicates set `:opaque` on the affected attribute; a disjunct with any
 
 `implies?/2` answers `∀ a∈A, ∃ b∈B : attrs_subset?(a, b)`. Each attribute's
 interval is checked via type-specific containment (`eq ⊆ range`,
-`range ⊆ range`, `in ⊆ in`, `is_nil ⊆ is_nil`, …).
+`range ⊆ range`, `in ⊆ in`, `is_nil ⊆ is_nil`, …). `attrs_subset?` iterates the
+**union** of both disjuncts' attribute keys — an attribute constrained only on
+the probe side must yield `false` (the original spec pseudocode iterated only
+the cached side and was unsound; caught during implementation).
+
+**Negation semantics** (implementation experience): Ash's runtime match
+semantics are neither classical nor Kleene-compositional — a comparison with a
+`nil` operand evaluates to `nil`, a bare `not` propagates `nil`, but `or`
+collapses `nil` to `false`. Classical operator duals and De Morgan rewriting
+under `Not` are therefore **unsound** here; the solver treats `Not` as opaque
+except directly over `is_nil`, the only always-boolean predicate. Both bugs
+(the unsound `attrs_subset?` and the unsound negation rewriting) were caught by
+the 10 000-case property suite cross-checking against `Ash.Filter.Runtime`.
 
 **Verified by**: `test/ash_multi_datalayer/coverage/implication_test.exs` (unit)
 and `test/ash_multi_datalayer/coverage/implication_property_test.exs`
@@ -331,9 +414,14 @@ and `test/ash_multi_datalayer/coverage/implication_property_test.exs`
 ### Row-aware invalidation
 
 `Coverage.Invalidation.on_write/5(resource, tenant, op, row_before, row_after)`
-iterates ledger entries, evaluates each filter via
-`Ash.Filter.Runtime.do_match/2` against `row_before` and `row_after`, and drops
-matching entries. `:unknown` from the evaluator drops conservatively.
+iterates ledger entries, evaluates each entry's raw `Ash.Filter` against
+`row_before` and `row_after`, and drops matching entries. The evaluator is
+`Ash.Filter.Runtime.do_match/6` — the full signature is
+`do_match(record, expr, parent \\ nil, resource \\ nil,
+unknown_on_unknown_refs? \\ false, conflicting_upsert_values \\ nil)` — called
+with `unknown_on_unknown_refs?: true` so unresolvable refs yield `:unknown` →
+conservative drop. Note Ash keeps records on **truthy** results, not
+`== true`; invalidation mirrors that.
 
 **Verified by**: `test/ash_multi_datalayer/coverage/invalidation_test.exs`
 (unit), `test/ash_multi_datalayer/coverage/invalidation_property_test.exs`
@@ -384,10 +472,8 @@ sequenceDiagram
   Cov-->>MDL: :none
   MDL->>L2: run_query
   L2-->>MDL: [rows]
-  opt backfill? == true
-    MDL->>L1: upsert([rows])
-    MDL->>Cov: record(filter, loaded_fields, tenant)
-  end
+  MDL->>L1: upsert([rows])
+  MDL->>Cov: record(filter, loaded_fields, tenant)
   MDL->>Tel: [:read, :miss, reason: :no_coverage_entry]
   MDL-->>Caller: [rows]
 ```
@@ -404,10 +490,10 @@ sequenceDiagram
 
   MDL->>L2: create/update/destroy
   L2-->>MDL: {:ok, record}
-  MDL->>L1: create/update/destroy (best-effort)
-  L1-->>MDL: :ok
   MDL->>Inv: on_write(resource, tenant, op, row_before, row_after)
   Inv-->>MDL: :ok
+  MDL->>L1: upsert of the RETURNED record (best-effort)
+  L1-->>MDL: :ok
   MDL->>Tel: [:write, :applied], dropped_count
 ```
 
@@ -418,9 +504,8 @@ sequenceDiagram
 | `layer :name, module`               | Declare an underlying layer                                  | —               | Resource `multi_data_layer` block |
 | `read_order :: [atom]`              | Layers consulted for reads, in order                         | —               | Resource `multi_data_layer` block |
 | `write_order :: [atom]`             | Layers written to, in order                                  | —               | Resource `multi_data_layer` block |
-| `backfill? :: boolean`              | Populate earlier layers from later-layer reads               | `true`          | Resource `multi_data_layer` block |
 | `ledger_max_entries :: pos_integer` | Cap on ledger entries per resource+tenant                    | `10_000`        | Resource `multi_data_layer` block |
-| `divergence_sampler :: float`       | Fraction of hit reads that shadow-re-run against later layer | `0.01`          | Resource `multi_data_layer` block |
+| `divergence_sampler :: float`       | Fraction of hit reads that shadow-re-run against later layer | `0.0` (opt-in)  | Resource `multi_data_layer` block |
 | `:assume_single_node`               | App-wide ack that deployment is single-node                  | `false` (warns) | `config :ash_multi_datalayer, …`  |
 | `:debug_filters`                    | Include raw filter values in telemetry                       | `false`         | `config :ash_multi_datalayer, …`  |
 
@@ -484,4 +569,4 @@ miss.
 
 ---
 
-**Last verified**: 2026-04-17
+**Last verified**: 2026-07-03

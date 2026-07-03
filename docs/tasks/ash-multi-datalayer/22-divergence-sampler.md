@@ -16,8 +16,8 @@ fingerprint and PK delta.
 - Automatic remediation on divergence (the sampler only detects; the operator
   responds via the runbook).
 - Sampling reads that miss coverage (no point; they're already hitting primary).
-- Deciding the default sampler rate — that's a separate benchmark task
-  (post-release).
+- Deciding the default sampler rate — resolved 2026-07-03 by user decision:
+  `0.0` (opt-in); no benchmark needed.
 
 ## Context
 
@@ -97,7 +97,10 @@ end
 
 - `divergence_sampler: 0.0` → never sample.
 - `divergence_sampler: 1.0` → always sample.
-- Default (set in the DSL schema): `0.01`.
+- Default (set in the DSL schema): `0.0` — **opt-in** (user decision
+  2026-07-03; sampling is a probabilistic canary, not a guarantee, and users
+  shouldn't be opted into extra lower-layer requests). Present it as a dev tool
+  / opt-in production tracing.
 
 ## Files to Create/Modify
 
@@ -149,7 +152,7 @@ mix test test/integration/divergence_sampler_test.exs
   remediation.
 - **Sampler errors are silent** — if the primary query fails, we log to
   telemetry `:read, :miss` (as normal) but don't treat it as divergence.
-- **Performance**: sampling doubles the cost of the sampled read path. At 1 %
-  default, overhead is ≤ 1 % — but some workloads may want to lower the default.
+- **Performance**: sampling doubles the cost of the sampled read path. The
+  default is `0.0` (off); at an opted-in 1 % rate, overhead is ≤ 1 %.
 - Filter fingerprint must be PII-safe (structural hash; no raw values). See the
   fingerprint helper in the telemetry module.

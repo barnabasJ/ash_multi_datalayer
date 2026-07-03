@@ -9,8 +9,9 @@ same library also covers other layered patterns — cold-storage tiering,
 migration mirroring, polyglot persistence — because the DSL is generic ordered
 layers, not cache-specific.
 
-You opt in by changing one line (`data_layer:`) and adding one DSL block to your
-resource. No changes to your actions.
+You opt in by changing the `data_layer:` line (plus an `extensions:` entry for
+layers that need configuring) and adding one DSL block to your resource. No
+changes to your actions.
 
 ## Prerequisites
 
@@ -45,7 +46,8 @@ Switch a resource to use `AshMultiDatalayer.DataLayer` as a drop-in for
    ```elixir
    use Ash.Resource,
      domain: MyApp.Domain,
-     data_layer: AshMultiDatalayer.DataLayer    # was: AshPostgres.DataLayer
+     data_layer: AshMultiDatalayer.DataLayer,   # was: AshPostgres.DataLayer
+     extensions: [AshPostgres.DataLayer]        # keeps the postgres section available
 
    multi_data_layer do
      layer :l1, Ash.DataLayer.Ets
@@ -53,11 +55,6 @@ Switch a resource to use `AshMultiDatalayer.DataLayer` as a drop-in for
 
      read_order  [:l1, :l2]     # try l1 first, fall through to l2
      write_order [:l2, :l1]     # write l2 first, then l1
-     backfill?   true
-   end
-
-   ets do
-     private? true
    end
 
    postgres do
@@ -66,36 +63,55 @@ Switch a resource to use `AshMultiDatalayer.DataLayer` as a drop-in for
    end
    ```
 
+   Note the `extensions: [AshPostgres.DataLayer]` line: the library cannot
+   install underlying DSL sections automatically (Spark resolves extensions at
+   `use` time), so you list a layer's extension yourself when its DSL section
+   has required options — AshPostgres does (`table`, `repo`). Layers whose
+   sections work from defaults (like `Ash.DataLayer.Ets`) need no entry; add
+   one only if you want to configure them. If you forget a required extension,
+   the `ValidateLayers` verifier tells you exactly what to add.
+
 That's it. Reads now consult the ETS cache first and fall through to Postgres on
-a miss (backfilling the cache). Writes go to Postgres first, then to ETS. No
-per-action code changes.
+a miss (backfilling the cache — backfill is always on for multi-layer
+`read_order`). Writes go to Postgres first, then to ETS. No per-action code
+changes.
 
 ## How to Use It
 
 ### How to switch an existing resource to the multi-datalayer
 
 1. Change `data_layer: AshPostgres.DataLayer` to
-   `data_layer: AshMultiDatalayer.DataLayer`.
+   `data_layer: AshMultiDatalayer.DataLayer`, and add
+   `extensions: [AshPostgres.DataLayer]` so the `postgres` section stays
+   available.
 2. Add the `multi_data_layer do ... end` block.
 3. Keep your existing `postgres do ... end` block verbatim.
 4. Run `mix compile` — if verifiers complain, fix the reported issue (most
-   often: missing `:assume_single_node` ack or `field_policies`
-   incompatibility).
-5. Run `mix ash_postgres.generate_migrations` — it should behave exactly as
-   before the switch.
+   often: missing `:assume_single_node` ack, a missing underlying extension, or
+   `field_policies` incompatibility).
+5. Run `mix ash_multi_datalayer.generate_migrations` (or `mix ash.codegen`,
+   which the library hooks into) — it produces the same migrations as before
+   the switch. Don't use the stock `mix ash_postgres.generate_migrations`
+   directly: it discovers resources by data-layer equality and silently skips
+   multi-datalayer resources.
 6. Run your existing tests — nothing should change yet (because `read_order`
    defaults to fall-through but the cache is empty on first boot).
 
 ### How to pick a layering pattern
 
-The DSL is `read_order` + `write_order` + `backfill?`. Common patterns:
+The DSL is `read_order` + `write_order`. Common patterns:
 
-| Goal                               | `read_order` | `write_order` | `backfill?` |
-| ---------------------------------- | ------------ | ------------- | ----------- |
-| Read-through cache (most common)   | `[:l1, :l2]` | `[:l2, :l1]`  | `true`      |
-| Primary-only reads (kill-switch-y) | `[:l2]`      | `[:l2, :l1]`  | —           |
-| Dual-write mirror                  | `[:l1]`      | `[:l1, :l2]`  | `false`     |
-| Read the cache, ignore primary     | `[:l1]`      | `[:l1]`       | `false`     |
+| Goal                               | `read_order` | `write_order` |
+| ---------------------------------- | ------------ | ------------- |
+| Read-through cache (most common)   | `[:l1, :l2]` | `[:l2, :l1]`  |
+| Primary-only reads (kill-switch-y) | `[:l2]`      | `[:l2, :l1]`  |
+| Dual-write mirror                  | `[:l1]`      | `[:l1, :l2]`  |
+| Read the cache, ignore primary     | `[:l1]`      | `[:l1]`       |
+
+There is no `backfill?` option (removed 2026-07-03): backfilling is always on
+for multi-layer `read_order` fall-throughs, and the non-caching patterns above
+that used `backfill? false` have a single-layer `read_order`, which skips
+coverage — and therefore backfill — entirely.
 
 `:l1` and `:l2` are just names you picked. Use different names if it reads
 better for your use case (e.g. `:fast` / `:slow`).
@@ -161,9 +177,23 @@ cache hit rate is lower than expected.
 ```
 
 Every event carries metadata
-`%{resource, tenant, filter_fingerprint, read_order, write_order}` and
-measurements `%{duration_us, ledger_size}`. See the
-[technical deep-dive](../technical/ash-multi-datalayer.md) for the full schema.
+`%{resource, tenant, filter_fingerprint, read_order, write_order}`.
+Measurements (and extra metadata) are per-event:
+
+| Event                          | Measurements                     | Extra metadata                                                                                      |
+| ------------------------------ | -------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `[:read, :hit]`                | `%{duration_us, ledger_size}`    | —                                                                                                    |
+| `[:read, :miss]`               | `%{duration_us, ledger_size}`    | `reason: :no_coverage_entry \| :solver_unsupported \| :fields_insufficient \| :not_cacheable \| :ledger_unavailable` |
+| `[:read, :backfill]`           | `%{duration_us, ledger_size}`    | `count` (rows backfilled)                                                                            |
+| `[:read, :divergence_detected]`| `%{cache_count, primary_count}`  | `pk_delta`                                                                                           |
+| `[:write, :applied]`           | `%{duration_us, ledger_size}`    | `operation`, `dropped_count`                                                                         |
+| `[:write, :failed_at_layer]`   | `%{}`                            | `operation`, `layer`, `reason`                                                                       |
+| `[:ledger, :invalidated]`      | `%{count, ledger_size}`          | —                                                                                                    |
+| `[:ledger, :evicted]`          | `%{ledger_size}`                 | —                                                                                                    |
+| `[:ledger, :full]`             | `%{ledger_size}`                 | —                                                                                                    |
+
+See the [technical deep-dive](../technical/ash-multi-datalayer.md) for the full
+schema.
 
 ### How to tune ledger cap and divergence sampler per resource
 
@@ -175,9 +205,28 @@ multi_data_layer do
 end
 ```
 
-Defaults are 10 000 entries and 1 %. Raise the cap when you hit
-`[:ledger, :full]` telemetry; raise the sampler rate when divergence is
-operationally important.
+Defaults are 10 000 entries and 0.0 — the sampler is **off by default** and
+opt-in. It is a probabilistic canary (a dev tool, or opt-in production
+tracing), not a guarantee, and it costs an extra lower-layer request per
+sampled read. Raise the cap when you hit `[:ledger, :full]` telemetry; turn the
+sampler on (e.g. `0.01`) when divergence detection is operationally important.
+
+### What gets cached (and what never does)
+
+Some queries are served normally but never recorded into the coverage ledger or
+backfilled, because a truncated or computed result cannot prove complete
+coverage of its filter:
+
+- queries with `limit`, `offset > 0`, `distinct`, `distinct_sort`, or `lock`;
+- reads with aggregates or calculations — these bypass coverage entirely and
+  miss with reason `:not_cacheable`.
+
+Limited/offset probes **are** still served from previously recorded unlimited
+coverage — the cache layer applies sort/limit/offset itself. Field coverage is
+tracked as the recorded query's select plus the primary key; a probe only hits
+when its fields are a subset of what was recorded. Finally, **upserts** have no
+reliable before-image, so an upsert drops the entire tenant partition of the
+ledger — the only provably safe option.
 
 ## Visual Walkthrough
 
@@ -320,8 +369,9 @@ _before_ a user reports it.
 - **Start with `read_order [:l2]` + `write_order [:l2]`.** Behavioural no-op —
   proves the wiring and migration tooling works. Flip to cache-through after a
   day of running that way.
-- **Turn on the divergence sampler from day one.** 1 % is cheap and catches
-  solver bugs before users do.
+- **Consider turning on the divergence sampler during rollout.** It is off by
+  default (0.0) because every sampled read costs an extra lower-layer request;
+  an opted-in 1 % is cheap and catches solver bugs before users do.
 - **Set a ledger cap you can afford.** 10 000 entries × two layers × per-tenant
   can add up; budget before enabling on a tenant-sharded table.
 - **Don't cache resources with `field_policies`.** The library refuses at

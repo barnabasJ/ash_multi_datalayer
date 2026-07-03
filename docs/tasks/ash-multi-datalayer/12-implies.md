@@ -59,15 +59,38 @@ end
 
 ### 2. Attribute-set containment
 
+> **Warning — the original pseudocode here was unsound** (caught during
+> implementation by the property suite): it iterated only the cached (LHS)
+> side's attributes, so an attribute constrained only on the probe (RHS) side
+> was silently ignored — `{name: foo}` would wrongly imply
+> `{name: foo, age > 18}`. The containment check must iterate the **union** of
+> both sides' attribute keys, and an attribute missing from the cached side
+> (i.e. unconstrained on the LHS) must yield `false`.
+
 ```elixir
 defp attrs_subset?(cached_disjunct, probe_disjunct) do
-  # A cached disjunct is a subset of a probe disjunct iff every attribute
-  # constraint in cached is at least as tight as the corresponding one
-  # in probe. Attributes absent from probe are implicitly unconstrained.
-  Enum.all?(cached_disjunct, fn {attr, cached_interval} ->
-    case Map.fetch(probe_disjunct, attr) do
-      {:ok, probe_interval} -> interval_subset?(cached_interval, probe_interval)
-      :error -> true  # probe doesn't constrain this attr; cached's constraint is fine
+  # A cached disjunct is a subset of a probe disjunct iff, for every
+  # attribute constrained on EITHER side:
+  #   - constrained on both: cached's interval is contained in probe's;
+  #   - constrained only on cached: fine (probe is unconstrained there);
+  #   - constrained only on probe: NOT a subset (cached is unconstrained
+  #     there, so cached admits rows probe rejects).
+  attrs =
+    MapSet.union(
+      MapSet.new(Map.keys(cached_disjunct)),
+      MapSet.new(Map.keys(probe_disjunct))
+    )
+
+  Enum.all?(attrs, fn attr ->
+    case {Map.fetch(cached_disjunct, attr), Map.fetch(probe_disjunct, attr)} do
+      {{:ok, cached_interval}, {:ok, probe_interval}} ->
+        interval_subset?(cached_interval, probe_interval)
+
+      {{:ok, _cached_interval}, :error} ->
+        true  # probe doesn't constrain this attr; cached's constraint is fine
+
+      {:error, {:ok, _probe_interval}} ->
+        false  # cached is unconstrained here; it cannot be a subset
     end
   end)
 end
@@ -147,5 +170,13 @@ mix dialyzer
 - Run the full file through `mix credo --strict` — this is the correctness core;
   it deserves extra scrutiny.
 - Do NOT short-circuit `implies?/2` with early wins that skip attributes; every
-  attribute constraint on the cached side must be checked. Missed attributes are
-  the subtlest soundness bugs.
+  attribute constraint on **either** side must be checked (see the warning on
+  `attrs_subset?/2` above). Missed attributes are the subtlest soundness bugs.
+- **Negation semantics** (implementation experience, 2026-07-03): Ash's runtime
+  match semantics are neither classical nor Kleene-compositional — a comparison
+  with a `nil` operand evaluates to `nil`, a bare `not` propagates `nil`, but
+  `or` collapses `nil` to `false`. Classical operator duals and De Morgan
+  rewriting under `Not` are therefore **unsound**; the implementation treats
+  `Not` as opaque except directly over `is_nil` (the only always-boolean
+  predicate). Both this and the `attrs_subset?/2` union bug were caught by the
+  10 000-case property suite cross-checking against `Ash.Filter.Runtime`.

@@ -124,6 +124,23 @@ the options.
 - A user-reported cache miss turns out to be SAT-would-say-covered → consider
   extending intervals or reconsider the solver decision.
 
+## Addendum: implementation experience with negation (2026-07-03)
+
+Ash's runtime match semantics (`Ash.Filter.Runtime`) turned out to be neither
+classical two-valued logic nor Kleene-compositional three-valued logic: a
+comparison with a `nil` operand evaluates to `nil`, a bare `not` propagates
+`nil`, but `or` collapses `nil` to `false`. Consequently, two "obvious"
+solver techniques are **unsound** against those semantics:
+
+1. Classical operator duals (e.g. treating `not (x < 5)` as `x >= 5`).
+2. De Morgan rewriting under `Not`.
+
+The implementation therefore treats `Not` as opaque except directly over
+`is_nil` — the only always-boolean predicate — where negation is safe. Both
+unsound variants were caught by the 10 000-case property suite cross-checking
+`implies?/2` against `Ash.Filter.Runtime`, which validates the ADR's decision
+to make the property suite mandatory.
+
 ## Links
 
 - [RFC](./ash-multi-datalayer-rfc.md) — architect recommendation.
@@ -131,4 +148,4 @@ the options.
 
 ---
 
-**Last Updated**: 2026-04-17
+**Last Updated**: 2026-07-03

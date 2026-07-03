@@ -7,7 +7,7 @@
 
 Implement row-aware ledger invalidation: given a ledger entry's filter and a
 row's before/after attribute values, decide whether the entry should be dropped.
-Use `Ash.Filter.Runtime.do_match/2` (the same evaluator primary datalayers use
+Use `Ash.Filter.Runtime.do_match/6` (the same evaluator primary datalayers use
 on reads).
 
 ## Out of Scope
@@ -60,22 +60,32 @@ end
 
 ### 2. Evaluator wrapper
 
+`do_match` is arity 2..6:
+
+```elixir
+Ash.Filter.Runtime.do_match(record, expr, parent \\ nil, resource \\ nil,
+  unknown_on_unknown_refs? \\ false, conflicting_upsert_values \\ nil)
+```
+
+The implementation calls it with `unknown_on_unknown_refs?: true` so
+unresolvable refs yield `:unknown` → conservative drop:
+
 ```elixir
 defp evaluate_or_unknown(_filter, nil), do: false
 
 defp evaluate_or_unknown(filter, row) do
-  case Ash.Filter.Runtime.do_match(row, filter) do
-    {:ok, true} -> true
-    {:ok, false} -> false
+  case Ash.Filter.Runtime.do_match(row, filter, nil, nil, true) do
+    {:ok, truthy} when truthy not in [false, nil] -> true
+    {:ok, _} -> false
     {:error, _reason} -> :unknown
     :unknown -> :unknown
   end
 end
 ```
 
-Exact return-shape of `do_match/2` depends on the Ash version pinned — confirm
-against `Ash.Filter.Runtime` source during implementation. Map any
-non-`true`/`false` result to `:unknown`.
+Note the truthiness check: Ash keeps records on **truthy** results, not on
+`== true` — invalidation mirrors that, otherwise an entry Ash would serve a row
+under could survive a write to that row.
 
 ### 3. Mass invalidation
 
@@ -119,7 +129,7 @@ After `on_write/5`, emit:
 
 ## Patterns to Follow
 
-- `Ash.Filter.Runtime.do_match/2` — existing runtime evaluator. Do not
+- `Ash.Filter.Runtime.do_match/6` — existing runtime evaluator. Do not
   reimplement filter evaluation.
 
 ## Acceptance Criteria

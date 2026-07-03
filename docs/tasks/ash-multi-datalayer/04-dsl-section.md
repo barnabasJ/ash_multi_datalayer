@@ -7,8 +7,9 @@
 
 Define the `multi_data_layer do ... end` DSL section using
 `Spark.Dsl.Extension`, with a nested `layer` entity and section-level options
-(`read_order`, `write_order`, `backfill?`, `ledger_max_entries`,
-`divergence_sampler`).
+(`read_order`, `write_order`, `ledger_max_entries`, `divergence_sampler`).
+(A `backfill?` option was originally specced here; it was removed 2026-07-03 —
+backfilling is always on for multi-layer `read_order`.)
 
 ## Out of Scope
 
@@ -76,11 +77,6 @@ In `lib/ash_multi_datalayer/data_layer.ex`:
       required: true,
       doc: "Order in which layers receive writes."
     ],
-    backfill?: [
-      type: :boolean,
-      default: true,
-      doc: "Populate earlier layers from later-layer read results."
-    ],
     ledger_max_entries: [
       type: :pos_integer,
       default: 10_000,
@@ -88,8 +84,10 @@ In `lib/ash_multi_datalayer/data_layer.ex`:
     ],
     divergence_sampler: [
       type: :float,
-      default: 0.01,
-      doc: "Fraction of coverage hits shadow-re-run against a later layer."
+      default: 0.0,
+      doc:
+        "Fraction of coverage hits shadow-re-run against a later layer. " <>
+          "Opt-in (defaults to off); a probabilistic canary, not a guarantee."
     ]
   ]
 }
@@ -99,8 +97,9 @@ use Spark.Dsl.Extension, sections: [@multi_data_layer]
 
 ### 3. Wire into `Ash.DataLayer`
 
-Ensure the module still declares `use Ash.DataLayer` from Task 03. The two `use`
-statements compose cleanly (see `AshPostgres.DataLayer`).
+Ensure the module still declares `@behaviour Ash.DataLayer` from Task 03 (there
+is no `use Ash.DataLayer`). `@behaviour Ash.DataLayer` and
+`use Spark.Dsl.Extension` compose cleanly (see `AshPostgres.DataLayer`).
 
 ## Files to Create/Modify
 

@@ -252,6 +252,10 @@ No persistent schema changes. Two pieces of in-memory state per resource:
 - The **coverage ledger ETS table**, owned by `AshMultiDatalayer.Coverage`,
   named `:"#{resource}.AshMultiDatalayer.Coverage"`. Each row is
   `{id :: reference(), filter :: Ash.Filter.t(), loaded_fields :: MapSet.t(atom), tenant :: term, loaded_at :: integer}`.
+  *(Implementation note, 2026-07-03: as shipped, each entry stores **both** the
+  raw `%Ash.Filter{}` — for runtime invalidation matching — and its normalised
+  interval DNF — for implication — plus a dedupe fingerprint; see the technical
+  doc's data model.)*
 
 For `:write_behind`, we leverage Oban's existing `oban_jobs` table. We add no
 new tables.
@@ -643,4 +647,4 @@ gating the rest of the `/feature-docs all` pipeline.
 
 ---
 
-**Last Updated**: 2026-04-17
+**Last Updated**: 2026-07-03

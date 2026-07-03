@@ -121,11 +121,15 @@ flowchart TD
   (with `layer :l1, Ash.DataLayer.Ets`, `layer :l2, AshPostgres.DataLayer`,
   `read_order [:l1, :l2]`, `write_order [:l2, :l1]`) plus the existing
   `postgres do ... end` block compiles and exhibits fall-through behaviour with
-  no other code changes.
+  no other code changes. (*As implemented*, one more line is needed:
+  `extensions: [AshPostgres.DataLayer]` on `use Ash.Resource`, because
+  underlying DSL sections cannot be auto-installed — see FR1.2.)
 - **Must**: Existing reads return the same rows as before the switch.
-- **Must**: `mix ash_postgres.generate_migrations` produces equivalent
-  migrations on the multi-datalayer resource as on the direct-
-  `AshPostgres.DataLayer` resource.
+- **Must**: Migration generation produces equivalent migrations on the
+  multi-datalayer resource as on the direct-`AshPostgres.DataLayer` resource.
+  *As implemented*: via `mix ash_multi_datalayer.generate_migrations`,
+  integration-proven byte-identical (the stock task skips multi-datalayer
+  resources; see FR1.4).
 - **Should**: Setting `read_order [:l2]` is a drop-to-primary kill- switch
   without removing the DSL block.
 - **Should**: `AshMultiDatalayer.disable!(resource)` bypasses the cache layer at
@@ -157,8 +161,10 @@ flowchart TD
 - **Must**: A configurable share of reads that hit the ledger are shadow-re-run
   against the later layer; mismatches fire telemetry with the filter fingerprint
   and PK delta.
-- **Must**: Sampler is configurable per resource; default enabled at 1 % in the
-  recommended config.
+- **Must**: Sampler is configurable per resource; default **0.0** (off,
+  opt-in) — changed 2026-07-03 from "default enabled at 1 %"; sampling is a
+  probabilistic canary, not a guarantee, and users shouldn't be opted into
+  extra lower-layer requests.
 - **Should**: Runbook documents the response to a divergence event.
 
 ### US4: Extend to non-caching layered storage later
@@ -182,15 +188,23 @@ flowchart TD
 #### FR1: DSL surface `[Must]`
 
 - **FR1.1**: A `multi_data_layer do ... end` section with `layer :name, module`,
-  `read_order :: [atom]`, `write_order :: [atom]`, `backfill? :: boolean`,
-  `ledger_max_entries :: pos_integer`, `divergence_sampler :: float` (0.0–1.0).
-- **FR1.2**: Adding the multi-datalayer to a resource brings each declared
-  underlying layer's DSL extension into scope.
+  `read_order :: [atom]`, `write_order :: [atom]`,
+  `ledger_max_entries :: pos_integer`, `divergence_sampler :: float` (0.0–1.0,
+  default 0.0). (A `backfill? :: boolean` option was originally specced;
+  removed 2026-07-03 — see the decision log.)
+- **FR1.2**: Each declared underlying layer's DSL section is usable on the
+  resource. *As implemented*: automatic extension install is infeasible (Spark
+  resolves extensions at `use` time), so the resource lists a layer's extension
+  under `extensions:` when its DSL section has required options; the
+  `ValidateLayers` verifier errors helpfully when one is missing.
 - **FR1.3**: Verifiers (compile-time): `ValidateLayers`, `ValidateMultitenancy`,
   `RejectFieldPolicies`, `RejectMultiNode` (warn/force-ack),
   `ValidateSolverSupportedPredicates` (warn).
-- **FR1.4**: `mix ash_postgres.generate_migrations` works on a multi-datalayer
-  resource.
+- **FR1.4**: Migration generation works on a multi-datalayer resource. *As
+  implemented*: via `mix ash_multi_datalayer.generate_migrations` (and
+  `codegen/1` for `mix ash.codegen`) — the stock
+  `mix ash_postgres.generate_migrations` discovers resources by data-layer
+  equality and silently skips multi-datalayer resources.
 
 #### FR2: Read pipeline with subsumption coverage `[Must]`
 
@@ -198,9 +212,10 @@ flowchart TD
   coverage ledger before any data-layer query.
 - **FR2.2**: On a coverage hit, run the incoming query against the hit layer and
   return its rows. Sort / limit / offset applied by that layer.
-- **FR2.3**: On a coverage miss, fall through to the next layer in `read_order`.
-  If `backfill?` is true, upsert results into earlier layers and record the
-  materialised filter in the ledger.
+- **FR2.3**: On a coverage miss, fall through to the next layer in `read_order`;
+  upsert results into earlier layers and record the materialised filter in the
+  ledger. Backfilling is always on for multi-layer `read_order` (the
+  `backfill?` toggle was removed 2026-07-03).
 - **FR2.4**: Coverage uses a **per-attribute interval representation** with
   set-containment subsumption over `eq`, `not_eq`, `in`, `lt`/`lte`/`gt`/`gte`,
   `is_nil`, conjunctions, disjunctions. Unsupported shapes short-circuit to "not
@@ -250,8 +265,9 @@ flowchart TD
   coverage ledger are additionally issued against the later layer.
 - **FR5.2**: Result PK sets are compared; mismatch fires `:divergence_detected`
   telemetry with filter fingerprint + PK delta.
-- **FR5.3**: Sampler default in the recommended config guide: 0.01. Configurable
-  per resource.
+- **FR5.3**: Sampler default: **0.0** (off; opt-in as a dev tool or opt-in
+  production tracing). Configurable per resource. (Changed 2026-07-03 from
+  0.01 — see the decision log.)
 
 #### FR6: Runtime kill-switch `[Must]`
 
@@ -269,8 +285,10 @@ flowchart TD
 #### FR7: Telemetry `[Must]`
 
 - **FR7.1**: Events listed in "Telemetry (v1)" of the plan. Every event carries
-  `%{resource, tenant, filter_fingerprint, read_order, write_order}` metadata
-  and `%{duration_us, ledger_size}` measurements.
+  `%{resource, tenant, filter_fingerprint, read_order, write_order}` metadata.
+  *As implemented*, measurements are per-event, not a blanket
+  `%{duration_us, ledger_size}` — see the guide's telemetry table for the
+  event-by-event contract.
 - **FR7.2**: Filter fingerprint is a structural hash with literal values
   replaced by type tags.
 - **FR7.3**: Raw filter contents gated behind a compile-time `:debug_filters`
@@ -352,10 +370,10 @@ win. Deferred to a follow-up RFC.
 
 | Question                                                                  | Owner               | Due        | Resolution                                                                 |
 | ------------------------------------------------------------------------- | ------------------- | ---------- | -------------------------------------------------------------------------- |
-| Default `ledger_max_entries`                                              | Barnabas Jovanovics | 2026-05-01 | Pending — 10 000 is a guess; benchmark a realistic workload before release |
-| Default `divergence_sampler` rate                                         | Barnabas Jovanovics | 2026-05-01 | Pending — 0.01 (1 %) is a guess; measure telemetry cost on a benchmark     |
-| Naming of `:l1`/`:l2` (or require user-picked atoms)                      | Barnabas Jovanovics | 2026-04-30 | Pending — `:l1`/`:l2` is docs convention; DSL accepts any atom             |
-| Telemetry prefix: `[:ash_multi_datalayer, …]` vs `[:ash, :data_layer, …]` | Barnabas Jovanovics | 2026-04-30 | Pending — defer until we confirm Ash's convention                          |
+| Default `ledger_max_entries`                                              | Barnabas Jovanovics | 2026-05-01 | Resolved 2026-07-03 — default stays 10 000; benchmark deferred             |
+| Default `divergence_sampler` rate                                         | Barnabas Jovanovics | 2026-05-01 | Resolved 2026-07-03 — 0.0 (opt-in) by decision; see decision log           |
+| Naming of `:l1`/`:l2` (or require user-picked atoms)                      | Barnabas Jovanovics | 2026-04-30 | Resolved — DSL accepts any atoms; `:l1`/`:l2` is docs convention, the example uses `:cache`/`:remote` |
+| Telemetry prefix: `[:ash_multi_datalayer, …]` vs `[:ash, :data_layer, …]` | Barnabas Jovanovics | 2026-04-30 | Resolved — settled as `[:ash_multi_datalayer, …]`                          |
 
 ## Success Criteria
 
@@ -429,6 +447,8 @@ New library; rollout is a Hex release.
 | 2026-04-17 | Ledger cap + LRU eviction, divergence sampler, kill-switch, rich telemetry ship in v1 | Operator review: all four are "refuse to ship without" items.                                                                                    | Barnabas Jovanovics |
 | 2026-07-03 | **Write results propagate synchronously to read-earlier layers; invalidate-before-upsert ordering** (FR3.5, FR3.6) | Composition with an authoritative remote backend (`ash_remote`): only the returned record carries server-computed fields, and a failed cache upsert after the authoritative commit must degrade to a coverage miss, never a stale read. Also constrains any future `:write_behind` RFC. | Barnabas Jovanovics |
 | 2026-07-03 | Kill-switch write routing corrected: writes go to the **first** layer in `write_order` (FR6.2)      | The previous "last layer in the relevant `*_order`" wording would route disabled-mode writes to the cache layer only, silently losing the write.  | Barnabas Jovanovics |
+| 2026-07-03 | **`backfill?` option removed** (FR1.1, FR2.3)                                          | Backfilling is always-on for multi-layer `read_order` fall-throughs; the non-caching recipes that used `backfill? false` are single-layer `read_order`, which skips coverage — and therefore backfill — anyway. The option had nothing left to control. | Barnabas Jovanovics |
+| 2026-07-03 | **`divergence_sampler` default changed 0.01 → 0.0 (opt-in)** (FR1.1, FR5.3, US3)       | Sampling is a probabilistic canary, not a guarantee — users shouldn't be opted into extra lower-layer requests. Presented as a dev tool / opt-in production tracing. | Barnabas Jovanovics |
 
 ---
 

@@ -3,7 +3,7 @@
 **Metadata:**
 
 - Type: plan
-- Status: active
+- Status: implemented (v1 complete, 2026-07-03)
 - Created: 2026-04-17
 - Topic: ash-multi-datalayer
 - PRD: [link](../design/ash-multi-datalayer-prd.md)
@@ -17,7 +17,7 @@
   coverage, row-aware invalidation, synchronous writes, and first-class operator
   tooling (ledger cap, divergence sampler, runtime kill-switch, rich telemetry).
 - **Complexity**: High — bespoke interval solver, per-resource ETS lifecycle,
-  transitive DSL extension install, multiple verifiers.
+  underlying-extension handling, multiple verifiers.
 - **Approach**: Build bottom-up in vertical slices. Each phase ends at a
   behaviour that can be exercised in `iex` and covered by an integration test.
 - **Key integration points**: Ash 3.x datalayer behaviour, Spark DSL extension
@@ -39,12 +39,12 @@
 
 ## Open Questions
 
-| Question                                               | Owner               | Must resolve before | Resolution                                      |
-| ------------------------------------------------------ | ------------------- | ------------------- | ----------------------------------------------- |
-| Default `ledger_max_entries` (plan assumes 10 000)     | Barnabas Jovanovics | Phase 8             | Pending — benchmark before release              |
-| Default `divergence_sampler` rate (plan assumes 0.01)  | Barnabas Jovanovics | Phase 9             | Pending — measure telemetry cost                |
-| Telemetry prefix `[:ash_multi_datalayer, …]` conflict? | Barnabas Jovanovics | Phase 11            | Pending — check Ash's own telemetry conventions |
-| Final DSL option name for solver predicate limit       | Barnabas Jovanovics | Phase 5             | Pending — internal knob for now                 |
+| Question                                               | Owner               | Must resolve before | Resolution                                                                              |
+| ------------------------------------------------------ | ------------------- | ------------------- | ---------------------------------------------------------------------------------------- |
+| Default `ledger_max_entries` (plan assumes 10 000)     | Barnabas Jovanovics | Phase 8             | Resolved 2026-07-03 — default stays 10 000; benchmark deferred                           |
+| Default `divergence_sampler` rate (plan assumes 0.01)  | Barnabas Jovanovics | Phase 9             | Resolved 2026-07-03 — default 0.0 (opt-in) by user decision; sampling is a canary, not a guarantee |
+| Telemetry prefix `[:ash_multi_datalayer, …]` conflict? | Barnabas Jovanovics | Phase 11            | Resolved — settled as `[:ash_multi_datalayer, …]`                                        |
+| Final DSL option name for solver predicate limit       | Barnabas Jovanovics | Phase 5             | Resolved — stayed an internal knob; no DSL option shipped                                |
 
 ## Feature Specification
 
@@ -114,10 +114,8 @@ sequenceDiagram
     Cov-->>MDL: :none
     MDL->>L2: run_query(Q)
     L2-->>MDL: rows
-    alt backfill? == true
-      MDL->>L1: upsert(rows)
-      MDL->>Cov: record(F, loaded_fields)
-    end
+    MDL->>L1: upsert(rows)
+    MDL->>Cov: record(F, loaded_fields)
     MDL->>Tel: [:read, :miss]
   end
   MDL-->>Action: rows
@@ -149,9 +147,16 @@ sequenceDiagram
 ### Single module doubles as DataLayer + Spark extension
 
 Following the `AshPostgres.DataLayer` pattern: `AshMultiDatalayer.DataLayer`
-uses both `Ash.DataLayer` and `Spark.Dsl.Extension`. A transformer
-(`RegisterUnderlyingExtensions`) injects the declared underlying layers' DSL
-extensions onto the resource.
+declares `@behaviour Ash.DataLayer` and `use Spark.Dsl.Extension` (there is no
+`use Ash.DataLayer`). The originally planned transformer
+(`RegisterUnderlyingExtensions`) proved **infeasible**: Spark resolves a
+resource's extensions at `use` time, so transformers cannot add them. As
+implemented, resources list an underlying layer's extension explicitly
+(`use Ash.Resource, data_layer: AshMultiDatalayer.DataLayer, extensions:
+[AshPostgres.DataLayer]`) only when that layer's DSL section has required
+options (AshPostgres: yes; Ets / AshRemote: no — they work from defaults or
+their own extension); the `ValidateLayers` verifier errors helpfully when a
+required extension is missing.
 
 ### Per-attribute interval subsumption
 
@@ -176,7 +181,7 @@ subsumption is decidable by construction.
 ### Internal (between phases)
 
 ```
-Phase 1 (deps + stub) → Phase 2 (DSL + info + transformer)
+Phase 1 (deps + stub) → Phase 2 (DSL + info + extension checks)
                              → Phase 3 (supervisor + coverage infra + kill-switch)
                                     → Phase 4 (read path, single-layer)
                                            → Phase 5 (implication solver)
@@ -208,7 +213,7 @@ attention.
 | Risk                                                                         | S   | P   | D   | RPN | Mitigation                                                                                     | Owner    |
 | ---------------------------------------------------------------------------- | --- | --- | --- | --- | ---------------------------------------------------------------------------------------------- | -------- |
 | Solver bug returns stale rows                                                | 5   | 2   | 5   | 50  | Property suite vs brute-force evaluator; conservative-on-unknown; divergence sampler in prod   | Barnabas |
-| `RegisterUnderlyingExtensions` breaks `mix ash_postgres.generate_migrations` | 4   | 3   | 3   | 36  | Integration test gating the transformer; prototype-early on a throwaway branch (architect rec) | Barnabas |
+| Underlying-extension handling breaks migration generation (was: `RegisterUnderlyingExtensions` transformer risk) | 4   | 3   | 3   | 36  | **Materialised, resolved differently**: the transformer was infeasible (Spark resolves extensions at `use` time) → explicit `extensions:` + `ValidateLayers` check; stock `mix ash_postgres.generate_migrations` skips multi-datalayer resources → `AshMultiDatalayer.Migration` shadow modules + `mix ash_multi_datalayer.generate_migrations`, integration-proven byte-identical to a plain-postgres twin | Barnabas |
 | Row-aware invalidation too slow on large ledgers                             | 3   | 3   | 2   | 18  | Benchmark gates `ledger_max_entries` default; telemetry surfaces slow invalidations            | Barnabas |
 | Ledger cap default too aggressive/too loose                                  | 2   | 4   | 3   | 24  | Benchmark; make per-resource-configurable                                                      | Barnabas |
 | Coverage ledger ETS supervision during code reload                           | 3   | 3   | 4   | 36  | `TableOwner` GenServer under supervision tree; explicit restart story in runbook               | Barnabas |
@@ -243,17 +248,22 @@ yet.
 
 **Go/No-Go for Next Phase**: Compiles, no warnings.
 
-### Phase 2: DSL + Info + `RegisterUnderlyingExtensions`
+### Phase 2: DSL + Info + underlying-extension handling
 
 **Objective**: Resources can declare `multi_data_layer do ... end` with `layer`,
-`read_order`, `write_order`, `backfill?`. Info module exposes parsed config.
-Transformer installs underlying-layer DSL extensions so `ets do ... end` and
-`postgres do ... end` work on the same resource.
+`read_order`, `write_order`. Info module exposes parsed config.
+Underlying-layer DSL sections work on the same resource — as implemented, via
+explicit `extensions:` on `use Ash.Resource` where a layer's DSL section has
+required options (the planned `RegisterUnderlyingExtensions` transformer was
+infeasible; see Technical Design), enforced by the `ValidateLayers` verifier.
 
-**Deliverables**: `Data Layer`, `Info`, `Layer` struct, transformer, unit tests,
-**integration test**: a test resource using `AshPostgres.DataLayer` via the
-multi-datalayer compiles and `mix ash_postgres.generate_migrations` produces
-expected output.
+**Deliverables**: `Data Layer`, `Info`, `Layer` struct, extension-presence
+check, unit tests, **integration test**: a test resource using
+`AshPostgres.DataLayer` via the multi-datalayer compiles and
+`mix ash_multi_datalayer.generate_migrations` (shadow-module-based; the stock
+`mix ash_postgres.generate_migrations` silently skips multi-datalayer
+resources) produces migrations byte-identical to a plain-postgres twin. An
+upstream `ash_postgres` PR to make resource discovery pluggable is planned.
 
 **Estimate**: 2–3 days.
 
@@ -265,8 +275,8 @@ expected output.
 
 **Rollback Strategy**: Revert the PR; the stub from Phase 1 stays.
 
-**Go/No-Go for Next Phase**: Transformer works on multi-datalayer resource +
-downstream Ash Postgres tooling.
+**Go/No-Go for Next Phase**: Underlying DSL sections usable on a
+multi-datalayer resource + downstream migration tooling works.
 
 ### Phase 3: Supervisor + Coverage.TableOwner + kill-switch
 
@@ -467,7 +477,8 @@ from `iex`.
 - [x] Monitoring telemetry events defined (plan §Telemetry; FR7 in PRD)
 - [x] Runbook drafted ([link](../runbooks/ash-multi-datalayer.md))
 - [x] Debug helpers planned (Phase 12)
-- [ ] Dogfood in the author's host project before Hex release
+- [x] Dogfood: the `ash_remote` example (`example/`) composes the library over
+      a remote backend end-to-end
 - [ ] Adopter tabletop walkthrough of the runbook before 0.1.0
 
 ## Quality and Testing Strategy
@@ -489,7 +500,9 @@ Full strategy: [testing doc](../testing/ash-multi-datalayer.md).
 
 - [ ] `iex -S mix` smoke: create, read (hit + miss paths), update, kill-switch
       toggle, `dump_ledger`, `explain_covers?`.
-- [ ] `mix ash_postgres.generate_migrations` on a multi-datalayer resource.
+- [ ] `mix ash_multi_datalayer.generate_migrations` (or `mix ash.codegen` via
+      `codegen/1`) on a multi-datalayer resource — the stock
+      `mix ash_postgres.generate_migrations` skips multi-datalayer resources.
 
 ## Success Criteria
 
