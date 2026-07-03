@@ -1,16 +1,25 @@
-# ash_remote example — todo server + LiveView client
+# ash_multi_datalayer example — a client-side ETS cache over ash_remote
 
-A two-project monorepo showing `ash_remote` end to end:
+ash_remote's todo example, with one twist: the client's generated resources
+run `AshMultiDatalayer.DataLayer` — an ETS cache layered over
+`AshRemote.DataLayer`. Filtered reads that hit the coverage ledger are served
+locally with **zero HTTP requests**; misses fall through to the server and
+warm the cache; writes go server-first and the returned record is propagated
+into the cache.
 
 ```
 example/
-  todo_server/   Ash backend. Declares its RPC-exposed surface with the
-                 `AshRemote.Rpc` DSL, mounts `AshRemote.Server.Router`, and
-                 publishes a JSON Ash.Info.Manifest at /manifest.json.
-  todo_client/   A LiveView app. Consumes the manifest, generates standalone Ash
-                 resources with `mix ash_remote.gen`, and manages todos from a
-                 LiveView using AshPhoenix.Form — every read/write is an RPC call
-                 to todo_server via AshRemote.DataLayer.
+  todo_server/   Ash backend (pure ash_remote — proof the layering is
+                 invisible to the server). Serves /rpc/run + /manifest.json
+                 on port 4020.
+  todo_client/   A LiveView app on port 4002. Generated resources declare:
+
+                   multi_data_layer do
+                     layer :cache, Ash.DataLayer.Ets
+                     layer :remote, AshRemote.DataLayer
+                     read_order [:cache, :remote]
+                     write_order [:remote, :cache]
+                   end
 ```
 
 ## The flow
@@ -18,12 +27,37 @@ example/
 ```
 todo_server ──/manifest.json──►  mix ash_remote.gen  ──►  TodoClient.Remote.{TodoList,Todo,User,Priority}
      ▲                                                              │
-     └──────── /rpc/run ◄──── AshRemote.DataLayer ◄──── TodoClient.Live (AshPhoenix.Form)
+     │                                    ┌── hit ──── ETS cache ◄──┤ AshMultiDatalayer.DataLayer
+     └──────── /rpc/run ◄──── miss / write┘                         │
+                                                          TodoClient.Live (AshPhoenix.Form)
 ```
 
-The LiveView calls `Ash.read!/1`, `AshPhoenix.Form.submit/2`, `Ash.update!/2`,
-`Ash.destroy!/1` on the **generated** resources exactly as if they were local —
-`AshRemote.DataLayer` turns each into an HTTP RPC call to `todo_server`.
+## The 60-second demo
+
+1. `./run.sh`, then open <http://localhost:4002>.
+2. Add a couple of todos, then use the **Browse** panel: flip between the
+   All / active / done tabs and the priority filter. The first click of each
+   combination is a miss (one RPC, watch the `debug_requests` log in the
+   terminal); every repeat — and every *narrower* filter of something already
+   loaded — is a wire-silent hit. The footer counts hits/misses/backfills/
+   invalidations live from the library's telemetry.
+3. Add or toggle a todo: the footer shows an invalidation (row-aware — only
+   coverage matching the changed row is dropped), the next browse read is one
+   RPC, and it's cached again after that.
+4. Click **cache ON** to flip the kill-switch: every browse click now logs an
+   RPC until you switch it back.
+
+The top list view (aggregates + the `overdue?` calculation) intentionally
+RPCs on every load — computed values are never served from the cache, so the
+counts are always the server's truth.
+
+The automated proof lives in
+`todo_client/test/todo_client/multi_datalayer_test.exs`: an RPC-counting
+router asserts wire silence exactly (the inverse of ash_remote's "the server
+WAS called" tests), covering identical-read hits, filter subsumption
+(eq/range/enum-set), write-through with server-computed defaults, row-aware
+invalidation, calc/aggregate fall-through, divergence detection of
+out-of-band server writes, and the kill-switch.
 
 ## What the domain showcases
 
@@ -89,11 +123,11 @@ use AshRemote.Server.Router, otp_app: :todo_server
 Two shells:
 
 ```sh
-# 1) the backend (http://localhost:4010, manifest at /manifest.json)
-cd example/todo_server && mix run --no-halt
+# 1) the backend (http://localhost:4020, manifest at /manifest.json)
+cd example/todo_server && mix run --no-halt   # port 4020
 
-# 2) the LiveView client — then open http://localhost:4001
-cd example/todo_client && mix run --no-halt
+# 2) the LiveView client — then open http://localhost:4002
+cd example/todo_client && mix run --no-halt   # port 4002
 ```
 
 ## Automated end-to-end test (no browser needed)
@@ -122,4 +156,4 @@ warning — add `--interactive` to `mix ash_remote.gen` to resolve each one
 interactively instead.
 
 > `ash` comes from Hex (`~> 3.29`, for `Ash.Info.Manifest`); `ash_remote` is a
-> relative path dep (`../..`).
+> relative path dep (`../../../ash_remote`); `ash_multi_datalayer` is the repo root (`../..`).

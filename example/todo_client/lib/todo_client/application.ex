@@ -7,6 +7,7 @@ defmodule TodoClient.Application do
     children = [
       {Phoenix.PubSub, name: TodoClient.PubSub},
       AshMultiDatalayer.Supervisor,
+      TodoClient.CacheStats,
       TodoClient.Endpoint
     ]
 
