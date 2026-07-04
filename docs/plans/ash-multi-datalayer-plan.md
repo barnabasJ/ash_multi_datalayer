@@ -9,7 +9,7 @@
 - PRD: [link](../design/ash-multi-datalayer-prd.md)
 - RFC: [link](../design/ash-multi-datalayer-rfc.md)
 - Approved design source:
-  `/home/joba/.claude/plans/the-idea-is-to-cozy-hinton.md`
+  `../design/ash-multi-datalayer-prd.md`
 
 ## Executive Summary
 

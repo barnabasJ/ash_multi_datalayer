@@ -429,7 +429,7 @@ New library; rollout is a Hex release.
 
 - [RFC](./ash-multi-datalayer-rfc.md) — with multi-perspective review.
 - Plan (source of truth):
-  `/home/joba/.claude/plans/the-idea-is-to- cozy-hinton.md`.
+  `../plans/ash-multi-datalayer-plan.md`.
 - ADRs, plan-doc, technical doc, tasks, guide, testing, runbook, changelog:
   generated alongside.
 

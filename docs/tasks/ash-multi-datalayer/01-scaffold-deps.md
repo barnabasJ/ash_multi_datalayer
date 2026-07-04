@@ -69,7 +69,7 @@ Confirm a clean compile.
 ## Verification
 
 ```bash
-cd /home/joba/sandbox/ash_multi_datalayer
+cd ../../..
 mix deps.get
 mix compile --warnings-as-errors
 iex -S mix -e "IO.inspect Ash.Resource"

@@ -165,7 +165,7 @@ standard metadata (`resource`, `tenant`, `write_order`) and
 ## Verification
 
 ```bash
-cd /home/joba/sandbox/ash_multi_datalayer
+cd ../../..
 mix test test/ash_multi_datalayer/write_dispatch_test.exs
 mix dialyzer
 ```

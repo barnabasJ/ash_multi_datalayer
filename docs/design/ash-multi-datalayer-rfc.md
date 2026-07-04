@@ -639,7 +639,7 @@ gating the rest of the `/feature-docs all` pipeline.
 ## References
 
 - [PRD](./ash-multi-datalayer-prd.md)
-- Approved plan: `/home/joba/.claude/plans/the-idea-is-to-cozy-hinton.md`
+- Approved plan: `../plans/ash-multi-datalayer-plan.md`
 - `Ash.DataLayer` behaviour: <https://hexdocs.pm/ash/Ash.DataLayer.html>
 - `Spark.Dsl.Extension`: <https://hexdocs.pm/spark/Spark.Dsl.Extension.html>
 - `Oban.Worker`: <https://hexdocs.pm/oban/Oban.Worker.html>

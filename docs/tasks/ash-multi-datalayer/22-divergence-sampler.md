@@ -141,7 +141,7 @@ end
 ## Verification
 
 ```bash
-cd /home/joba/sandbox/ash_multi_datalayer
+cd ../../..
 mix test test/integration/divergence_sampler_test.exs
 ```
 

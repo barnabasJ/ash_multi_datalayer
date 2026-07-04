@@ -152,7 +152,7 @@ After `on_write/5`, emit:
 ## Verification
 
 ```bash
-cd /home/joba/sandbox/ash_multi_datalayer
+cd ../../..
 mix test test/ash_multi_datalayer/coverage/invalidation_test.exs
 mix dialyzer
 ```

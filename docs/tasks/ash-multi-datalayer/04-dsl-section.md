@@ -136,7 +136,7 @@ is no `use Ash.DataLayer`). `@behaviour Ash.DataLayer` and
 ## Verification
 
 ```bash
-cd /home/joba/sandbox/ash_multi_datalayer
+cd ../../..
 mix compile --warnings-as-errors
 mix test test/ash_multi_datalayer/data_layer_dsl_test.exs
 ```

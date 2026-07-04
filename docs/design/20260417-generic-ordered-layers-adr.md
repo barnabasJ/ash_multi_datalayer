@@ -106,7 +106,7 @@ layered-storage patterns fit.
 
 - [RFC](./ash-multi-datalayer-rfc.md) — multi-perspective review.
 - [PRD](./ash-multi-datalayer-prd.md).
-- Plan: `/home/joba/.claude/plans/the-idea-is-to-cozy-hinton.md`.
+- Plan: `../plans/ash-multi-datalayer-plan.md`.
 
 ---
 

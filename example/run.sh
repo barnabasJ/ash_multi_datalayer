@@ -4,6 +4,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
+mkdir -p tmp
 SERVER_PORT="${SERVER_PORT:-4020}"
 WEB_PORT="${WEB_PORT:-4002}"
 export TODO_SERVER_URL="http://127.0.0.1:${SERVER_PORT}"
@@ -20,7 +21,7 @@ for app in todo_server todo_client; do
 done
 
 echo "▶ starting todo_server on :${SERVER_PORT}"
-( cd todo_server && PORT="$SERVER_PORT" mix run --no-halt >/tmp/todo_server.log 2>&1 ) &
+( cd todo_server && PORT="$SERVER_PORT" mix run --no-halt >../tmp/todo_server.log 2>&1 ) &
 SERVER_PID=$!
 
 cleanup() {
@@ -37,7 +38,7 @@ for _ in $(seq 1 120); do
 done
 if ! curl -sf "${TODO_SERVER_URL}/health" >/dev/null 2>&1; then
   echo "backend did not become healthy — last log lines:"
-  tail -20 /tmp/todo_server.log
+  tail -20 tmp/todo_server.log
   exit 1
 fi
 
