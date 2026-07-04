@@ -6,31 +6,26 @@ defmodule AshMultiDatalayer.CapabilityTest do
   alias AshMultiDatalayer.Capability
   alias AshMultiDatalayer.Test.Resources.TestPost
 
-  # A stand-in for ash_remote's `remote(...)`: resolvable on a real source
-  # layer, `:unknown` on the in-VM layers — the exact per-layer advertisement
-  # the probe keys on.
-  defmodule SourceOnly do
-    @moduledoc false
-    def expression(layer, _arguments) when layer in [Ash.DataLayer.Ets, Ash.DataLayer.Simple],
-      do: :unknown
+  # A stand-in for ash_remote's `remote(...)`: no in-VM value, so the cache
+  # layer can't compute it — exactly what a `:unknown` simple_expression means.
+  defp source_only(name),
+    do: %Ash.CustomExpression{arguments: [name], expression: name, simple_expression: :unknown}
 
-    def expression(_layer, [name | _]), do: {:ok, name}
-  end
-
-  defp source_only(name) do
-    %Ash.CustomExpression{module: SourceOnly, arguments: [name], expression: name}
-  end
+  # A custom expression the in-VM runtime can evaluate.
+  defp evaluable(name),
+    do: %Ash.CustomExpression{arguments: [name], expression: 1, simple_expression: {:ok, 1}}
 
   describe "custom_expressions/1" do
     test "finds none in a plain expression" do
       assert Capability.custom_expressions(expr(age >= 18)) == []
     end
 
-    test "finds a custom expression nested inside operators and lists" do
+    test "finds a custom expression nested inside operators" do
       custom = source_only("comment_count")
-      expr = expr(^custom > 5 and not is_nil(id))
+      expression = expr(^custom > 5 and not is_nil(id))
 
-      assert [%Ash.CustomExpression{module: SourceOnly}] = Capability.custom_expressions(expr)
+      assert [%Ash.CustomExpression{simple_expression: :unknown}] =
+               Capability.custom_expressions(expression)
     end
   end
 
@@ -39,19 +34,14 @@ defmodule AshMultiDatalayer.CapabilityTest do
       assert Capability.layer_can_evaluate?(Ash.DataLayer.Ets, TestPost, expr(age >= 18))
     end
 
-    test "a source-only custom expression is NOT evaluable by the cache layer" do
-      expr = expr(^source_only("comment_count") > 5)
-      refute Capability.layer_can_evaluate?(Ash.DataLayer.Ets, TestPost, expr)
+    test "a custom expression with an in-VM simple_expression is evaluable" do
+      expression = expr(^evaluable("x") > 5)
+      assert Capability.layer_can_evaluate?(Ash.DataLayer.Ets, TestPost, expression)
     end
 
-    test "a source-only custom expression IS evaluable by the source layer" do
-      expr = expr(^source_only("comment_count") > 5)
-
-      assert Capability.layer_can_evaluate?(
-               AshMultiDatalayer.Test.CountingPostgres,
-               TestPost,
-               expr
-             )
+    test "a source-only custom expression (:unknown) is NOT evaluable by the cache layer" do
+      expression = expr(^source_only("comment_count") > 5)
+      refute Capability.layer_can_evaluate?(Ash.DataLayer.Ets, TestPost, expression)
     end
   end
 end

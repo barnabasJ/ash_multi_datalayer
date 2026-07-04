@@ -7,18 +7,16 @@ defmodule AshMultiDatalayer.ValueMergeTest do
   alias AshMultiDatalayer.Test.Resources.{LocalEvalOffPost, TestPost}
   alias AshMultiDatalayer.ValueMerge
 
-  defmodule SourceOnly do
-    @moduledoc false
-    def expression(layer, _args) when layer in [Ash.DataLayer.Ets, Ash.DataLayer.Simple],
-      do: :unknown
-
-    def expression(_layer, [name | _]), do: {:ok, name}
-  end
-
   defp qcalc(name), do: %Ash.Query.Calculation{name: name}
 
   defp source_only_expr do
-    custom = %Ash.CustomExpression{module: SourceOnly, arguments: ["cc"], expression: "cc"}
+    # A source-only custom expression: no in-VM value (`:unknown`).
+    custom = %Ash.CustomExpression{
+      arguments: ["cc"],
+      expression: "cc",
+      simple_expression: :unknown
+    }
+
     expr(^custom > 5)
   end
 
