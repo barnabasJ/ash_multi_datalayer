@@ -36,7 +36,7 @@ defmodule TodoClient.MixProject do
     [
       {:ash, "~> 3.29"},
       {:ash_phoenix, "~> 2.3"},
-      {:ash_remote, path: "../../../ash_remote"},
+      {:ash_remote, github: "barnabasJ/ash_remote"},
       {:ash_multi_datalayer, path: "../.."},
       {:simple_sat, "~> 0.1"},
       {:req, "~> 0.5"},

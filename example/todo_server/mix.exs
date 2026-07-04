@@ -38,7 +38,7 @@ defmodule TodoServer.MixProject do
     [
       {:ash, "~> 3.29"},
       # ash_remote provides the server-side RPC router + manifest (the shared core).
-      {:ash_remote, path: "../../../ash_remote"},
+      {:ash_remote, github: "barnabasJ/ash_remote"},
       {:simple_sat, "~> 0.1"},
       {:plug, "~> 1.16"},
       {:bandit, "~> 1.5"},
