@@ -203,13 +203,15 @@ defmodule AshMultiDatalayer.DataLayer do
   def can?(_resource, {:lateral_join, _}), do: false
 
   # Resource (relationship) aggregates are LOUDLY unsupported: SQL layers
-  # build the related subquery via the destination resource's data layer —
-  # which is this module, yielding our query struct instead of SQL — so the
-  # aggregate would be silently dropped (NotLoaded), the one failure shape
-  # this library refuses. Answering false makes Ash raise
-  # AggregatesNotSupported at query build instead. Self-aggregation
-  # (Ash.count/…) still works via run_aggregate_query; remote-style
-  # aggregates arrive as calculations and are unaffected.
+  # build the related subquery via `Ash.Query.data_layer_query(related_query)`
+  # (ash_sql/aggregate.ex) expecting an %Ecto.Query{}, but the destination's
+  # data layer is this module, which returns our routing struct — so the
+  # aggregate would be silently dropped (NotLoaded), the one failure shape this
+  # library refuses. Answering false makes Ash raise AggregatesNotSupported at
+  # query build instead. Self-aggregation (Ash.count/…) still works via
+  # run_aggregate_query; remote-style aggregates arrive as calculations and are
+  # unaffected. Full rationale + the fold-based path to lift this:
+  # docs/design/20260704-relationship-aggregates-and-the-subquery-boundary-adr.md.
   def can?(_resource, {:aggregate, _}), do: false
   def can?(_resource, {:aggregate_relationship, _}), do: false
   def can?(_resource, :combine), do: false
