@@ -11,7 +11,7 @@ defmodule AshMultiDatalayer.Coverage do
 
   require Logger
 
-  alias AshMultiDatalayer.Coverage.{Entry, Implication, Normaliser, TableOwner}
+  alias AshMultiDatalayer.Coverage.{Complement, Entry, Implication, Normaliser, TableOwner}
   alias AshMultiDatalayer.DataLayer.Info
   alias AshMultiDatalayer.DataLayer.Query
   alias AshMultiDatalayer.Telemetry
@@ -123,6 +123,34 @@ defmodule AshMultiDatalayer.Coverage do
 
       {:error, :unavailable} ->
         {:miss, :ledger_unavailable}
+    end
+  end
+
+  @doc """
+  The current coverage region for a resource+tenant, as
+  `{coverage_filter, complement_filter}` (see
+  `AshMultiDatalayer.Coverage.Complement`), or `:none` when nothing is cached.
+
+  `C` is the union of every current ledger entry's normalised filter — a sound
+  under-approximation of what the earlier layers hold. Remainder reads serve
+  `Q ∧ C` from the cache and fetch only `Q ∧ ¬C` from the source.
+  """
+  @spec coverage_split(module(), term()) ::
+          {Complement.region(), Complement.region()} | :none
+  def coverage_split(resource, tenant) do
+    disjuncts =
+      resource
+      |> entries(tenant)
+      |> Enum.flat_map(& &1.normalised.disjuncts)
+      |> Enum.uniq()
+
+    case disjuncts do
+      [] ->
+        :none
+
+      _ ->
+        {Complement.coverage_filter(disjuncts, resource),
+         Complement.complement_filter(disjuncts, resource)}
     end
   end
 

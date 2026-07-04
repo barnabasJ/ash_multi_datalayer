@@ -429,8 +429,79 @@ defmodule AshMultiDatalayer.DataLayer do
         end
 
       {:miss, reason} ->
-        source_read(query, resource, read_layers, reason)
+        case remainder_plan(query, resource) do
+          {:ok, coverage, complement} ->
+            remainder_read(query, resource, read_layers, coverage, complement)
+
+          :none ->
+            source_read(query, resource, read_layers, reason)
+        end
     end
+  end
+
+  # A remainder read serves the covered part of Q (`Q ∧ C`) from the cache and
+  # fetches only the uncovered remainder (`Q ∧ ¬C`) from the source, merging by
+  # primary key. Applicable to a plain (recordable, unsorted, single-PK) read
+  # that overlaps existing coverage — sort/limit/offset can't be split across
+  # two reads soundly, so those fall through whole.
+  defp remainder_plan(%Query{} = query, resource) do
+    if remainder_applicable?(query, resource) do
+      case Coverage.coverage_split(resource, query.tenant) do
+        :none -> :none
+        {coverage, complement} -> {:ok, coverage, complement}
+      end
+    else
+      :none
+    end
+  end
+
+  defp remainder_applicable?(%Query{} = query, resource) do
+    Coverage.recordable?(query) and
+      query.sort in [nil, []] and
+      match?([_], Ash.Resource.Info.primary_key(resource))
+  end
+
+  defp remainder_read(%Query{} = query, resource, read_layers, coverage, complement) do
+    started = System.monotonic_time()
+    cache_layer = hd(read_layers)
+    source_layer = List.last(read_layers)
+
+    with {:ok, cache_rows} <- run_region(query, cache_layer, coverage),
+         {:ok, source_rows} <- run_region(query, source_layer, complement) do
+      merged = pk_merge(source_rows, cache_rows, resource)
+
+      emit_read(:partial, query, resource, started, %{
+        cached: length(cache_rows),
+        fetched: length(source_rows)
+      })
+
+      # The source rows are the previously-uncovered remainder; backfilling the
+      # full result and recording Q makes the next identical read a full hit.
+      maybe_backfill(query, resource, read_layers, merged)
+      AshMultiDatalayer.Divergence.maybe_sample(query, resource, merged)
+      {:ok, merged}
+    end
+  end
+
+  # Runs Q restricted to a coverage region on a layer. `:empty` yields no rows
+  # without touching the layer; `:universe` runs Q unrestricted.
+  defp run_region(_query, _layer, :empty), do: {:ok, []}
+
+  defp run_region(%Query{} = query, layer, :universe),
+    do: Delegate.run_on_layer(query, layer)
+
+  defp run_region(%Query{} = query, layer, {:ok, region}) do
+    Delegate.run_on_layer(%{query | filter: and_filter(query.filter, region)}, layer)
+  end
+
+  defp and_filter(nil, region), do: region
+  defp and_filter(base, region), do: Ash.Filter.add_to_filter!(base, region)
+
+  # PK-union, preferring the freshly-fetched source rows over cached ones.
+  defp pk_merge(preferred, others, resource) do
+    [pk] = Ash.Resource.Info.primary_key(resource)
+    seen = MapSet.new(preferred, &Map.fetch!(&1, pk))
+    preferred ++ Enum.reject(others, &MapSet.member?(seen, Map.fetch!(&1, pk)))
   end
 
   # Computed-value merge read: rows from covered cache, calcs computed on the
