@@ -4,7 +4,7 @@ defmodule AshMultiDatalayer.Integration.MergeReadsTest do
   require Ash.Query
 
   alias AshMultiDatalayer.Test.CountingPostgres
-  alias AshMultiDatalayer.Test.Resources.TestAuthor
+  alias AshMultiDatalayer.Test.Resources.{LocalEvalOffPost, TestAuthor}
 
   defp pg_reads, do: CountingLayer.count(CountingPostgres, :run_query)
 
@@ -43,12 +43,13 @@ defmodule AshMultiDatalayer.Integration.MergeReadsTest do
     {:ok, author: author}
   end
 
-  test "a calculation-loading read over covered rows merges values from the source" do
+  # --- local evaluation (default): the cache layer computes the calc ---------
+
+  test "a mirrored calc over covered rows is computed locally, with no source read" do
     # Warm row coverage.
     TestPost |> Ash.Query.filter(age > 0) |> Ash.read!()
     assert pg_reads() == 1
 
-    # Calc-loaded read: rows from cache, ONE value query for adult?.
     posts =
       TestPost
       |> Ash.Query.filter(age > 0)
@@ -57,26 +58,41 @@ defmodule AshMultiDatalayer.Integration.MergeReadsTest do
       |> Map.new(&{&1.name, &1.adult?})
 
     assert posts == %{"kid" => false, "grown" => true}
-    assert pg_reads() == 2
-    assert_receive {:mdl, [_, :read, :hit], _, %{computed_values: :merged}}
-
-    # Every computed-value read re-fetches values (never cached) - but only
-    # values: still one narrow query each.
-    TestPost |> Ash.Query.filter(age > 0) |> Ash.Query.load(:adult?) |> Ash.read!()
-    assert pg_reads() == 3
+    # No extra source read — the cache layer evaluated `adult?` from its rows.
+    assert pg_reads() == 1
+    assert_receive {:mdl, [_, :read, :hit], _, %{computed_values: :local}}
   end
 
-  test "relationship aggregates fail loudly instead of silently NotLoaded" do
-    # SQL layers build the related subquery via the DESTINATION resource's
-    # data layer (this library), which cannot yield SQL - the aggregate
-    # would silently come back NotLoaded. can?({:aggregate, _}) is false so
-    # this is a loud error at query build.
-    assert_raise Ash.Error.Invalid, ~r/aggregate/i, fn ->
-      TestAuthor
-      |> Ash.Query.filter(name == "ada")
-      |> Ash.Query.load(:post_count)
-      |> Ash.read!()
+  test "local values equal a cache-disabled read's values" do
+    query = TestPost |> Ash.Query.filter(age > 0) |> Ash.Query.load(:adult?)
+
+    Ash.read!(TestPost)
+    local = query |> Ash.read!() |> Enum.map(&{&1.id, &1.adult?}) |> Enum.sort()
+
+    AshMultiDatalayer.disable!(TestPost)
+
+    try do
+      direct = query |> Ash.read!() |> Enum.map(&{&1.id, &1.adult?}) |> Enum.sort()
+      assert local == direct
+    after
+      AshMultiDatalayer.enable!(TestPost)
     end
+  end
+
+  test "a limited local-calc read is served from coverage with no source read" do
+    TestPost |> Ash.Query.filter(age > 0) |> Ash.read!()
+    reads = pg_reads()
+
+    [post] =
+      TestPost
+      |> Ash.Query.filter(age > 0)
+      |> Ash.Query.sort(:age)
+      |> Ash.Query.limit(1)
+      |> Ash.Query.load(:adult?)
+      |> Ash.read!()
+
+    assert %{name: "kid", adult?: false} = post
+    assert pg_reads() == reads
   end
 
   test "a computed-carrying COLD read records row coverage for later plain reads" do
@@ -94,34 +110,36 @@ defmodule AshMultiDatalayer.Integration.MergeReadsTest do
     assert_receive {:mdl, [_, :read, :hit], _, _}
   end
 
-  test "merged values equal a cache-disabled read's values" do
-    query = TestPost |> Ash.Query.filter(age > 0) |> Ash.Query.load(:adult?)
+  # --- local evaluation off (override): fetched from the source --------------
 
-    # Warm, then merged read.
-    Ash.read!(TestPost)
-    merged = query |> Ash.read!() |> Enum.map(&{&1.id, &1.adult?}) |> Enum.sort()
+  test "with local evaluation off, a calc is fetched from the source in one narrow query" do
+    # LocalEvalOffPost shares mdl_posts (already seeded) but has its own cache.
+    LocalEvalOffPost |> Ash.Query.filter(age > 0) |> Ash.read!()
+    reads = pg_reads()
 
-    AshMultiDatalayer.disable!(TestPost)
+    posts =
+      LocalEvalOffPost
+      |> Ash.Query.filter(age > 0)
+      |> Ash.Query.load(:adult?)
+      |> Ash.read!()
+      |> Map.new(&{&1.name, &1.adult?})
 
-    try do
-      direct = query |> Ash.read!() |> Enum.map(&{&1.id, &1.adult?}) |> Enum.sort()
-      assert merged == direct
-    after
-      AshMultiDatalayer.enable!(TestPost)
-    end
+    assert posts == %{"kid" => false, "grown" => true}
+    assert pg_reads() == reads + 1
+    assert_receive {:mdl, [_, :read, :hit], _, %{computed_values: :merged}}
   end
 
-  test "an out-of-band delete abandons the merge and serves everything fresh" do
-    TestPost |> Ash.Query.filter(age > 0) |> Ash.read!()
+  test "with local evaluation off, an out-of-band delete abandons the merge" do
+    LocalEvalOffPost |> Ash.Query.filter(age > 0) |> Ash.read!()
 
     # Delete a row straight through Postgres (MirrorPost) - the cache and
     # ledger never hear about it.
     MirrorPost |> Ash.Query.filter(name == "kid") |> Ash.read!() |> hd() |> Ash.destroy!()
 
-    # The merged read notices the cached row has no source counterpart and
-    # falls through whole: fresh rows, fresh values, no half-merged result.
+    # The source value query notices the cached row has no counterpart and the
+    # read falls through whole: fresh rows, fresh values, no half-merged result.
     posts =
-      TestPost
+      LocalEvalOffPost
       |> Ash.Query.filter(age > 0)
       |> Ash.Query.load(:adult?)
       |> Ash.read!()
@@ -130,19 +148,14 @@ defmodule AshMultiDatalayer.Integration.MergeReadsTest do
     assert_receive {:mdl, [_, :read, :miss], _, %{reason: :stale_cache}}
   end
 
-  test "limited computed reads are served from coverage with a narrow value query" do
-    TestPost |> Ash.Query.filter(age > 0) |> Ash.read!()
-    reads = pg_reads()
+  # --- aggregates --------------------------------------------------------------
 
-    [post] =
-      TestPost
-      |> Ash.Query.filter(age > 0)
-      |> Ash.Query.sort(:age)
-      |> Ash.Query.limit(1)
-      |> Ash.Query.load(:adult?)
+  test "relationship aggregates fail loudly instead of silently NotLoaded" do
+    assert_raise Ash.Error.Invalid, ~r/aggregate/i, fn ->
+      TestAuthor
+      |> Ash.Query.filter(name == "ada")
+      |> Ash.Query.load(:post_count)
       |> Ash.read!()
-
-    assert %{name: "kid", adult?: false} = post
-    assert pg_reads() == reads + 1
+    end
   end
 end

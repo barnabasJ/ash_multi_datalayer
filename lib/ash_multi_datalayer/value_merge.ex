@@ -22,6 +22,8 @@ defmodule AshMultiDatalayer.ValueMerge do
       layer error)
   """
 
+  alias AshMultiDatalayer.Capability
+  alias AshMultiDatalayer.DataLayer.Info
   alias AshMultiDatalayer.DataLayer.Query
   alias AshMultiDatalayer.Delegate
 
@@ -36,6 +38,31 @@ defmodule AshMultiDatalayer.ValueMerge do
   def row_query(%Query{} = query), do: %{query | calculations: [], aggregates: []}
 
   @doc """
+  Splits the query's calculations into `{locally_evaluable, source_only}` for
+  `cache_layer`.
+
+  A calculation is locally evaluable when local evaluation is enabled for the
+  resource, its name is not in the overrides, and `cache_layer` can evaluate
+  its expression (see `AshMultiDatalayer.Capability`). Locally-evaluable calcs
+  are computed by the cache layer from the covered rows; the rest are fetched
+  from the source of truth. Aggregates are always source-only.
+  """
+  @spec local_and_source_calculations(Query.t() | struct(), module(), module()) ::
+          {[{term(), term()}], [{term(), term()}]}
+  def local_and_source_calculations(%Query{} = query, resource, cache_layer) do
+    if Info.local_evaluation?(resource) do
+      overrides = Info.local_evaluation_overrides(resource)
+
+      Enum.split_with(query.calculations, fn {calculation, expression} ->
+        calculation.name not in overrides and
+          Capability.layer_can_evaluate?(cache_layer, resource, expression)
+      end)
+    else
+      {[], query.calculations}
+    end
+  end
+
+  @doc """
   Fetches the query's calculations/aggregates for `rows` from `source_layer`
   and merges them in, preserving row order. Returns `{:ok, merged}`,
   `:stale_cache` when a row has no source counterpart, or `{:error, term}`.
@@ -43,6 +70,11 @@ defmodule AshMultiDatalayer.ValueMerge do
   @spec merge(Query.t() | struct(), [Ash.Resource.record()], module(), module()) ::
           {:ok, [Ash.Resource.record()]} | :stale_cache | {:error, term()}
   def merge(_query, [], _resource, _source_layer), do: {:ok, []}
+
+  # Nothing the source of truth must supply (all calcs computed locally, no
+  # aggregates): the cache rows already carry every value — no source read.
+  def merge(%Query{calculations: [], aggregates: []}, rows, _resource, _source_layer),
+    do: {:ok, rows}
 
   def merge(%Query{} = query, rows, resource, source_layer) do
     [pk] = Ash.Resource.Info.primary_key(resource)

@@ -66,4 +66,16 @@ defmodule AshMultiDatalayer.DataLayer.Info do
   def divergence_sampler(resource) do
     Extension.get_opt(resource, [:multi_data_layer], :divergence_sampler, 0.0)
   end
+
+  @doc "Whether cache-evaluable calculations are computed locally instead of from the source."
+  @spec local_evaluation?(Ash.Resource.t() | Spark.Dsl.t()) :: boolean()
+  def local_evaluation?(resource) do
+    Extension.get_opt(resource, [:multi_data_layer], :local_evaluation?, true)
+  end
+
+  @doc "Calculation names always computed by the source of truth (local-evaluation escape hatch)."
+  @spec local_evaluation_overrides(Ash.Resource.t() | Spark.Dsl.t()) :: [atom()]
+  def local_evaluation_overrides(resource) do
+    Extension.get_opt(resource, [:multi_data_layer], :local_evaluation_overrides, [])
+  end
 end

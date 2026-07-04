@@ -109,6 +109,34 @@ defmodule AshMultiDatalayer.DataLayer do
         extra lower-layer query per sampled hit. Useful in dev, or in
         production as an opt-in tracing aid.
         """
+      ],
+      local_evaluation?: [
+        type: :boolean,
+        default: true,
+        doc: """
+        Whether a loaded calculation whose expression an earlier read layer
+        can evaluate is computed by that layer from the covered rows, instead
+        of round-tripping to the source of truth for its value. On by default:
+        it removes a source read for every reproducible calculation (a
+        mirrored expression like `overdue?`). Calculations the cache layer
+        cannot evaluate (an `ash_remote` `remote(...)`) are always fetched
+        from the source regardless.
+
+        Correctness relies on the layers agreeing on the expression's value;
+        keeping them consistent (collation, numeric/date semantics) is the
+        operator's responsibility (see the layer-consistency contract). Turn
+        this off to force every calculation to the source of truth.
+        """
+      ],
+      local_evaluation_overrides: [
+        type: {:list, :atom},
+        default: [],
+        doc: """
+        Calculation names always computed by the source of truth even when a
+        cache layer could evaluate them — the per-calc escape hatch for
+        `local_evaluation?` (e.g. a clock-dependent calc where a caller wants
+        the source's exact evaluation instant).
+        """
       ]
     ]
   }
@@ -405,18 +433,33 @@ defmodule AshMultiDatalayer.DataLayer do
     end
   end
 
-  # Computed-value merge read: rows from covered cache, one narrow value
-  # query for the calculations/aggregates, merged by primary key. See the
+  # Computed-value merge read: rows from covered cache, calcs computed on the
+  # layer that can (local evaluation), and one narrow value query for the
+  # source-only calculations/aggregates, merged by primary key. See the
   # 20260703-computed-value-merge-reads ADR.
   defp merged_read(%Query{} = query, resource, read_layers) do
     started = System.monotonic_time()
-    row_query = AshMultiDatalayer.ValueMerge.row_query(query)
+    cache_layer = hd(read_layers)
 
-    with {:ok, _entry} <- Coverage.covers?(resource, query.tenant, row_query),
-         {:ok, rows} <- Delegate.run_on_layer(row_query, hd(read_layers)) do
-      case AshMultiDatalayer.ValueMerge.merge(query, rows, resource, List.last(read_layers)) do
+    {local_calcs, source_calcs} =
+      AshMultiDatalayer.ValueMerge.local_and_source_calculations(query, resource, cache_layer)
+
+    # The cache layer serves the rows AND computes the calcs it can evaluate;
+    # only the source-only calcs (and aggregates) round-trip to the source.
+    cache_query = %{query | calculations: local_calcs, aggregates: []}
+    source_query = %{query | calculations: source_calcs}
+
+    with {:ok, _entry} <- Coverage.covers?(resource, query.tenant, cache_query),
+         {:ok, rows} <- Delegate.run_on_layer(cache_query, cache_layer) do
+      case AshMultiDatalayer.ValueMerge.merge(
+             source_query,
+             rows,
+             resource,
+             List.last(read_layers)
+           ) do
         {:ok, merged} ->
-          emit_read(:hit, query, resource, started, %{computed_values: :merged})
+          emit_read(:hit, query, resource, started, %{computed_values: computed_tag(source_query)})
+
           AshMultiDatalayer.Divergence.maybe_sample(query, resource, merged)
           {:ok, merged}
 
@@ -433,6 +476,11 @@ defmodule AshMultiDatalayer.DataLayer do
       {:error, error} -> {:error, error}
     end
   end
+
+  # `:local` when every value was computed from the cache (no source read),
+  # `:merged` when the source of truth supplied some calcs/aggregates.
+  defp computed_tag(%Query{calculations: [], aggregates: []}), do: :local
+  defp computed_tag(%Query{}), do: :merged
 
   defp source_read(%Query{} = query, resource, read_layers, miss_reason) do
     started = System.monotonic_time()

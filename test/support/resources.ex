@@ -65,6 +65,7 @@ defmodule AshMultiDatalayer.Test.Resources do
       resource AshMultiDatalayer.Test.Resources.FailingPost
       resource AshMultiDatalayer.Test.Resources.CappedPost
       resource AshMultiDatalayer.Test.Resources.SampledPost
+      resource AshMultiDatalayer.Test.Resources.LocalEvalOffPost
       resource AshMultiDatalayer.Test.Resources.TestAuthor
     end
   end
@@ -282,6 +283,50 @@ defmodule AshMultiDatalayer.Test.Resources do
       attribute :age, :integer, public?: true
       attribute :score, :decimal, public?: true
       attribute :published_at, :date, public?: true
+    end
+
+    actions do
+      defaults [:read, :destroy, create: :*, update: :*]
+    end
+  end
+
+  defmodule LocalEvalOffPost do
+    @moduledoc """
+    Same layers as `TestPost` but with local evaluation disabled — every
+    calculation is fetched from the source of truth (the pre-local-eval merge
+    path). Shares the `mdl_posts` table.
+    """
+    use Ash.Resource,
+      domain: Domain,
+      data_layer: AshMultiDatalayer.DataLayer,
+      extensions: [AshPostgres.DataLayer]
+
+    multi_data_layer do
+      layer(:l1, Ash.DataLayer.Ets)
+      layer(:l2, AshMultiDatalayer.Test.CountingPostgres)
+
+      read_order([:l1, :l2])
+      write_order([:l2, :l1])
+      local_evaluation?(false)
+    end
+
+    postgres do
+      table "mdl_posts"
+      repo(AshMultiDatalayer.TestRepo)
+    end
+
+    attributes do
+      uuid_primary_key :id
+      attribute :name, :string, public?: true
+      attribute :age, :integer, public?: true
+      attribute :score, :decimal, public?: true
+      attribute :published_at, :date, public?: true
+    end
+
+    calculations do
+      calculate :adult?, :boolean, expr(age >= 18) do
+        public? true
+      end
     end
 
     actions do
