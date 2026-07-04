@@ -211,24 +211,47 @@ defmodule TodoClient.MultiDatalayerTest do
       assert todos == %{"Late" => true, "Future" => false}
     end
 
-    test "list count aggregates RPC every time and stay fresh", %{list: list} do
+    test "todo_count folds from the cache (0 RPC); completed_count is forwarded to the server",
+         %{list: list} do
       server_create_todo!(%{title: "One", list_id: list.id})
+      server_create_todo!(%{title: "Done", list_id: list.id, completed: true})
 
-      query =
-        TodoList
-        |> Ash.Query.filter(id == ^list.id)
-        |> Ash.Query.load([:todo_count, :completed_count])
+      # Simulate the page's first load: it reads the lists AND their todos,
+      # warming coverage for both (the todos are needed on the page anyway).
+      TodoList |> Ash.Query.filter(id == ^list.id) |> Ash.read!()
+      Todo |> Ash.Query.filter(list_id == ^list.id) |> Ash.read!()
+      warm = rpc()
 
-      assert [%{todo_count: 1, completed_count: 0}] = Ash.read!(query)
-      first = rpc()
+      # Reload: `todo_count` is a native aggregate the cache layer folds from the
+      # covered todos — NO server round trip.
+      assert [%{todo_count: 2}] =
+               TodoList
+               |> Ash.Query.filter(id == ^list.id)
+               |> Ash.Query.load(:todo_count)
+               |> Ash.read!()
 
-      # Aggregates are never cache hits: reading again RPCs again.
-      assert [%{todo_count: 1}] = Ash.read!(query)
-      assert rpc() > first
+      assert rpc() == warm
 
-      # And they observe out-of-band server writes immediately.
-      server_create_todo!(%{title: "Two", list_id: list.id, completed: true})
-      assert [%{todo_count: 2, completed_count: 1}] = Ash.read!(query)
+      # `completed_count` is opted out of folding (`fold_aggregate_overrides`) —
+      # it is handed to the remote layer, forwarded to the server by name, and so
+      # costs an RPC. The two aggregate strategies, side by side.
+      assert [%{completed_count: 1}] =
+               TodoList
+               |> Ash.Query.filter(id == ^list.id)
+               |> Ash.Query.load(:completed_count)
+               |> Ash.read!()
+
+      assert rpc() > warm
+
+      # Because it round-trips, the forwarded aggregate observes out-of-band
+      # server writes immediately.
+      server_create_todo!(%{title: "Also done", list_id: list.id, completed: true})
+
+      assert [%{completed_count: 2}] =
+               TodoList
+               |> Ash.Query.filter(id == ^list.id)
+               |> Ash.Query.load(:completed_count)
+               |> Ash.read!()
     end
 
     test "results are identical with the cache enabled and disabled", %{list: list} do

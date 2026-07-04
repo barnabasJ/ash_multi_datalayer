@@ -10,6 +10,12 @@ defmodule TodoClient.Remote.TodoList do
 
     read_order([:cache, :remote])
     write_order([:remote, :cache])
+
+    # Showcase both aggregate paths side by side: `todo_count` is folded from
+    # the cached todos (0 RPC when they're covered), while `completed_count` is
+    # opted out of folding — handed to the remote layer, which forwards it to
+    # the server by name (an RPC). Same page, two aggregates, two strategies.
+    fold_aggregate_overrides([:completed_count])
   end
 
   remote do
@@ -37,20 +43,6 @@ defmodule TodoClient.Remote.TodoList do
     )
   end
 
-  calculations do
-    # Server aggregates, regenerated as `remote(...)` expression calcs: the
-    # cache layer can't reproduce them, so ash_multi_datalayer fetches their
-    # values from the source — and filtering/sorting on them forwards to the
-    # server (the calc filter routes to the remote layer).
-    calculate :completed_count, :integer, expr(remote("completed_count", %{}, id)) do
-      public?(true)
-    end
-
-    calculate :todo_count, :integer, expr(remote("todo_count", %{}, id)) do
-      public?(true)
-    end
-  end
-
   actions do
     create :create do
       primary?(true)
@@ -59,6 +51,17 @@ defmodule TodoClient.Remote.TodoList do
 
     read :read do
       primary?(true)
+    end
+  end
+
+  aggregates do
+    count :completed_count, :todos do
+      public?(true)
+      filter(expr(completed))
+    end
+
+    count :todo_count, :todos do
+      public?(true)
     end
   end
 end

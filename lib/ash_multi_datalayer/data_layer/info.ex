@@ -78,4 +78,16 @@ defmodule AshMultiDatalayer.DataLayer.Info do
   def local_evaluation_overrides(resource) do
     Extension.get_opt(resource, [:multi_data_layer], :local_evaluation_overrides, [])
   end
+
+  @doc "Whether relationship aggregates are folded from cached related rows instead of the source."
+  @spec fold_aggregates?(Ash.Resource.t() | Spark.Dsl.t()) :: boolean()
+  def fold_aggregates?(resource) do
+    Extension.get_opt(resource, [:multi_data_layer], :fold_aggregates?, true)
+  end
+
+  @doc "Aggregate names never folded locally (fold-aggregates escape hatch)."
+  @spec fold_aggregate_overrides(Ash.Resource.t() | Spark.Dsl.t()) :: [atom()]
+  def fold_aggregate_overrides(resource) do
+    Extension.get_opt(resource, [:multi_data_layer], :fold_aggregate_overrides, [])
+  end
 end

@@ -2757,6 +2757,7 @@
       "embedded": false,
       "fields": {
         "completed_count": {
+          "aggregate_filter": "completed",
           "aggregate_kind": "count",
           "allow_nil": false,
           "filter_custom_expressions": [],
@@ -2812,6 +2813,7 @@
           "has_default": false,
           "kind": "aggregate",
           "primary_key": false,
+          "relationship": "todos",
           "select_by_default": true,
           "sensitive": false,
           "sortable": true,
@@ -3029,6 +3031,7 @@
           "has_default": false,
           "kind": "aggregate",
           "primary_key": false,
+          "relationship": "todos",
           "select_by_default": true,
           "sensitive": false,
           "sortable": true,
@@ -3261,6 +3264,7 @@
           "has_default": false,
           "kind": "aggregate",
           "primary_key": false,
+          "relationship": "lists",
           "select_by_default": true,
           "sensitive": false,
           "sortable": true,

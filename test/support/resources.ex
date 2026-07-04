@@ -67,6 +67,7 @@ defmodule AshMultiDatalayer.Test.Resources do
       resource AshMultiDatalayer.Test.Resources.SampledPost
       resource AshMultiDatalayer.Test.Resources.LocalEvalOffPost
       resource AshMultiDatalayer.Test.Resources.TestAuthor
+      resource AshMultiDatalayer.Test.Resources.OverrideAggAuthor
     end
   end
 
@@ -128,6 +129,60 @@ defmodule AshMultiDatalayer.Test.Resources do
 
       read_order([:l1, :l2])
       write_order([:l2, :l1])
+    end
+
+    postgres do
+      table "mdl_authors"
+      repo(AshMultiDatalayer.TestRepo)
+    end
+
+    attributes do
+      uuid_primary_key :id
+      attribute :name, :string, public?: true
+    end
+
+    relationships do
+      has_many :posts, AshMultiDatalayer.Test.Resources.TestPost,
+        public?: true,
+        destination_attribute: :author_id
+    end
+
+    aggregates do
+      count :post_count, :posts do
+        public? true
+      end
+
+      # A filtered aggregate — exercises the fold's in-memory filter path.
+      count :adult_post_count, :posts do
+        public? true
+        filter expr(age >= 18)
+      end
+    end
+
+    actions do
+      defaults [:read, :destroy, create: :*, update: :*]
+    end
+  end
+
+  defmodule OverrideAggAuthor do
+    @moduledoc """
+    Same as `TestAuthor` but `post_count` is in `fold_aggregate_overrides`, so
+    it is handed to the source of truth instead of folded. The SQL source cannot
+    compute a relationship aggregate over the MDL-wrapped `TestPost`, so this
+    must fail LOUDLY (never a silent NotLoaded). Shares `mdl_authors`.
+    """
+    use Ash.Resource,
+      domain: Domain,
+      data_layer: AshMultiDatalayer.DataLayer,
+      extensions: [AshPostgres.DataLayer]
+
+    multi_data_layer do
+      layer(:l1, Ash.DataLayer.Ets)
+      layer(:l2, AshMultiDatalayer.Test.CountingPostgres)
+
+      read_order([:l1, :l2])
+      write_order([:l2, :l1])
+      fold_aggregate_overrides([:post_count])
     end
 
     postgres do

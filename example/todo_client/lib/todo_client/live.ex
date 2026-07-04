@@ -3,11 +3,16 @@ defmodule TodoClient.Live do
   A LiveView that manages todo lists living on the remote backend.
 
   Every read/write goes through the generated `TodoClient.Remote.*` resources,
-  which `AshRemote.DataLayer` turns into `/rpc/run` calls — the LiveView never
-  talks HTTP directly. One `Ash.read!` demonstrates the full loading surface:
+  fronted by `AshMultiDatalayer` (an Ets cache over `AshRemote.DataLayer`). One
+  `Ash.read!` demonstrates the full loading surface — and, on a warm reload, how
+  little of it still touches the server:
 
-    * aggregates (`todo_count`, `completed_count` — computed server-side),
-    * a calculation (`overdue?` — the client only knows its name and type),
+    * `todo_count` — a native aggregate the cache layer **folds from the cached
+      todos** (0 RPC when they're covered),
+    * `completed_count` — the same kind of aggregate, but opted out of folding
+      (`fold_aggregate_overrides`) so it is **forwarded to the server** (1 RPC) —
+      the two aggregate strategies, side by side,
+    * `overdue?` — a mirrored calculation evaluated locally from the cached row,
     * relationships (`user`, `todos`, and self-referential `subtasks`).
   """
   use Phoenix.LiveView
@@ -49,7 +54,12 @@ defmodule TodoClient.Live do
           {list.name}
           <small :if={list.user} style="color:#888;font-weight:400">· {list.user.name}</small>
           <small style="margin-left:auto;color:#888;font-weight:400">
-            {list.completed_count}/{list.todo_count} done
+            <span title="native aggregate folded from the cached todos — 0 RPC on a warm reload">
+              {list.todo_count} todos <span style="color:#2e7d32">·local</span>
+            </span>
+            <span title="aggregate opted out of folding — forwarded to the server by name">
+              {list.completed_count} done <span style="color:#c62828">·server</span>
+            </span>
           </small>
         </h2>
 
@@ -160,7 +170,9 @@ defmodule TodoClient.Live do
     """
   end
 
-  defp tab_style(true), do: "padding:.3rem .7rem; border:0; background:#333; color:#fff; cursor:pointer;"
+  defp tab_style(true),
+    do: "padding:.3rem .7rem; border:0; background:#333; color:#fff; cursor:pointer;"
+
   defp tab_style(false), do: "padding:.3rem .7rem; border:0; background:#fff; cursor:pointer;"
 
   defp error_text({message, vars}) do

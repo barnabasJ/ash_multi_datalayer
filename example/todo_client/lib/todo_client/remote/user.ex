@@ -30,12 +30,6 @@ defmodule TodoClient.Remote.User do
     )
   end
 
-  calculations do
-    calculate :list_count, :integer, expr(remote("list_count", %{}, id)) do
-      public?(true)
-    end
-  end
-
   actions do
     create :create do
       primary?(true)
@@ -44,6 +38,12 @@ defmodule TodoClient.Remote.User do
 
     read :read do
       primary?(true)
+    end
+  end
+
+  aggregates do
+    count :list_count, :lists do
+      public?(true)
     end
   end
 end

@@ -1,14 +1,58 @@
 # 20260704-Relationship-Aggregates-And-The-Subquery-Boundary-ADR
 
-**Status**: Accepted **Date**: 2026-07-04 **Deciders**: Barnabas Jovanovics
+**Status**: Superseded by the load-and-fold implementation (2026-07-04) — see
+the update below. **Date**: 2026-07-04 **Deciders**: Barnabas Jovanovics
 
-## Decision
+## Update (2026-07-04): implemented via load-and-fold
 
-`ash_multi_datalayer` continues to **refuse native aggregates** loaded on an MDL
+The refusal below was lifted. MDL now **folds relationship aggregates** (option
+1 in "Options for revisiting"): it computes them itself by loading the related
+rows through its own read path — cache when the ledger proves coverage (**0
+source reads**), source otherwise — and folding the value in Elixir with
+`Ash.DataLayer.Ets.aggregate_value/6` (the exact primitive Ets uses). See
+`fold_aggregates/4` in `lib/ash_multi_datalayer/data_layer.ex`.
+
+Because MDL never asks the source to build an in-DB join over an MDL-wrapped
+related resource, **the subquery-boundary problem documented below is moot** —
+it only ever asks the source to read _rows_, which every data layer can do. So
+folding works uniformly for Ets, ash*remote, and SQL sources. (We verified the
+prior art empirically: a plain ash_postgres parent counting over a plain Ets
+child doesn't silently fail — it \_crashes* with
+`KeyError key :__ash_bindings__` when ash_sql gets a non-Ecto related query.
+There was never graceful cross-layer aggregation to reuse; folding is the
+mechanism.)
+
+Details:
+
+- **On by default**, per-resource `fold_aggregates?` and per-aggregate
+  `fold_aggregate_overrides` (mirrors `local_evaluation?`). Off → the old loud
+  `AggregatesNotSupported`.
+- **Soundness** is inherited from the read path, which always returns the
+  _complete_ related set before the fold; coverage only decides cache-vs-source,
+  never completeness. This is the aggregate analogue of local calc evaluation
+  (Feature B).
+- **Never silent**: an overridden aggregate handed to a source that can't
+  compute it raises a clear error (`ensure_source_aggregates_resolved!`) instead
+  of surfacing `%Ash.NotLoaded{}`.
+- **Reproducible aggregates now cross the wire natively**: `ash_remote`'s
+  generator emits a server aggregate whose relationship (and any mirrorable
+  filter) can be reproduced on the client as a _native_ `count :rel, …` (not a
+  `remote(...)` proxy calc), so the cache can fold it. The example showcases
+  both paths at once — `todo_count` folded locally (0 RPC on reload),
+  `completed_count` opted out and forwarded to the server.
+- **Tradeoff** (unchanged from option 1): an uncovered aggregate materialises
+  the related rows rather than issuing a bare `COUNT`. A per-source optimisation
+  (forward a bare count to sources that can produce one cheaply) is future work.
+
+The original analysis is retained below for the root-cause record.
+
+## Decision (superseded)
+
+`ash_multi_datalayer` originally **refused native aggregates** loaded on an MDL
 resource (`can?({:aggregate, _}) -> false`,
 `can?({:aggregate_relationship, _}) -> false`). This ADR records the _exact_
 reason — which is a data-layer-protocol boundary, not a missing capability — so
-the limitation can be revisited deliberately rather than rediscovered.
+the limitation could be revisited deliberately rather than rediscovered.
 
 ## What actually works today
 
@@ -28,7 +72,7 @@ whose source is a SQL layer.
 ## The exact root cause
 
 A SQL data layer computes a relationship aggregate as a **subquery/join inside
-one SQL statement**. ash_sql builds that subquery from the _related_ resource's
+one SQL statement**. ash*sql builds that subquery from the \_related* resource's
 query (`ash_sql/aggregate.ex:437`):
 
 ```elixir
@@ -36,11 +80,11 @@ case Ash.Query.data_layer_query(related_query) do
   %{valid?: true} = related_query -> ...   # then get_subquery/1, which requires an %Ecto.Query{}
 ```
 
-So ash_sql calls `Ash.Query.data_layer_query` on the related resource and
+So ash*sql calls `Ash.Query.data_layer_query` on the related resource and
 **assumes the result is an `%Ecto.Query{}`** to splice into the join.
 `data_layer_query` dispatches on the related resource's data layer. When that
 resource is MDL, it returns MDL's `%AshMultiDatalayer.DataLayer.Query{}` — a
-_routing struct_, not Ecto — and ash_sql (which has no knowledge of MDL) cannot
+\_routing struct*, not Ecto — and ash_sql (which has no knowledge of MDL) cannot
 turn it into a join, so the aggregate silently comes back `NotLoaded`. Flipping
 `can?` to `true` reproduces exactly this (verified by spike).
 
@@ -51,8 +95,8 @@ cache/route them. Its whole contract at build time is to _accumulate the query
 abstractly and defer the layer choice until `run_query`_ (coverage decides Ets
 vs. source). So `data_layer_query(an MDL resource)` returns the router struct by
 construction. MDL _can_ replay that struct into any layer's native query
-(`Delegate.to_layer_query(struct, AshPostgres)` yields the Ecto query ash_sql
-wants) — but that replay only happens _inside_ `run_query`, after a layer is
+(`Delegate.to_layer_query(struct, AshPostgres)` yields the Ecto query ash*sql
+wants) — but that replay only happens \_inside* `run_query`, after a layer is
 chosen.
 
 The tension in one sentence: **a SQL join needs the related query eagerly, as

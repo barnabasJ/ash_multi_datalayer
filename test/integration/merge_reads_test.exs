@@ -148,14 +148,90 @@ defmodule AshMultiDatalayer.Integration.MergeReadsTest do
     assert_receive {:mdl, [_, :read, :miss], _, %{reason: :stale_cache}}
   end
 
-  # --- aggregates --------------------------------------------------------------
+  # --- relationship aggregates: folded from the related rows -------------------
 
-  test "relationship aggregates fail loudly instead of silently NotLoaded" do
-    assert_raise Ash.Error.Invalid, ~r/aggregate/i, fn ->
+  test "a relationship aggregate over covered related rows is folded with no source read" do
+    # Warm both the author row and the related-row coverage: every post is now
+    # cached (universe coverage subsumes the fold's `author_id == …` read), and
+    # so is the author itself.
+    TestAuthor |> Ash.read!()
+    TestPost |> Ash.read!()
+    reads = pg_reads()
+
+    author =
+      TestAuthor
+      |> Ash.Query.filter(name == "ada")
+      |> Ash.Query.load([:post_count, :adult_post_count])
+      |> Ash.read_one!()
+
+    assert author.post_count == 2
+    # The filtered aggregate is folded in memory (only "grown", age 30, is >= 18).
+    assert author.adult_post_count == 1
+    # The count came from the cache — no round trip to Postgres for the related rows.
+    assert pg_reads() == reads
+  end
+
+  test "a folded aggregate equals an independent count of the actual related rows", %{
+    author: author
+  } do
+    # A cache-disabled read cannot be the oracle here: with MDL off, the
+    # aggregate is handed straight to Postgres, which cannot compute a count
+    # over the MDL-wrapped `TestPost` (the cross-layer limitation) — the fold is
+    # the only thing that produces this value. So verify against the real rows.
+    posts = TestPost |> Ash.Query.filter(author_id == ^author.id) |> Ash.read!()
+    expected_total = length(posts)
+    expected_adult = Enum.count(posts, &(&1.age >= 18))
+
+    folded =
+      TestAuthor
+      |> Ash.Query.filter(name == "ada")
+      |> Ash.Query.load([:post_count, :adult_post_count])
+      |> Ash.read_one!()
+
+    assert folded.post_count == expected_total
+    assert folded.adult_post_count == expected_adult
+  end
+
+  test "a cold relationship aggregate folds correctly by fetching the related rows" do
+    # No warming: the related rows aren't covered yet. The fold loads them
+    # through the read path (a source read), backfills, and counts — still
+    # correct, and warms the cache for next time.
+    author =
       TestAuthor
       |> Ash.Query.filter(name == "ada")
       |> Ash.Query.load(:post_count)
-      |> Ash.read!()
-    end
+      |> Ash.read_one!()
+
+    assert author.post_count == 2
+
+    reads = pg_reads()
+
+    # The related rows the fold fetched are now cached — a second fold is free.
+    again =
+      TestAuthor
+      |> Ash.Query.filter(name == "ada")
+      |> Ash.Query.load(:post_count)
+      |> Ash.read_one!()
+
+    assert again.post_count == 2
+    assert pg_reads() == reads
+  end
+
+  test "an overridden aggregate the source can't compute fails loudly, never silent" do
+    alias AshMultiDatalayer.Test.Resources.OverrideAggAuthor
+
+    # Warm the author rows so the merge path (not a whole source read) is taken.
+    OverrideAggAuthor |> Ash.read!()
+
+    error =
+      catch_error(
+        OverrideAggAuthor
+        |> Ash.Query.filter(name == "ada")
+        |> Ash.Query.load(:post_count)
+        |> Ash.read!()
+      )
+
+    # A clear error — not a silent %Ash.NotLoaded{} on `post_count`.
+    assert Exception.message(error) =~ ~r/could not compute aggregate/
   end
 end

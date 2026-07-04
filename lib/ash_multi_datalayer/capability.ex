@@ -49,7 +49,7 @@ defmodule AshMultiDatalayer.Capability do
   expression would let the router treat a source-only calc as locally
   evaluable and compute a wrong value from the cache.
   """
-  @spec custom_expressions(term()) :: [%Ash.CustomExpression{}]
+  @spec custom_expressions(term()) :: [struct()]
   def custom_expressions(expression), do: collect(expression, [])
 
   defp collect(%Ash.CustomExpression{} = custom, acc),
