@@ -8,6 +8,7 @@ defmodule AshMultiDatalayer.VerifiersTest do
   alias AshMultiDatalayer.Verifiers.{
     RejectFieldPolicies,
     RejectMultiNode,
+    ValidateAggregateOverrides,
     ValidateLayers,
     ValidateMultitenancy,
     ValidateSolverSupportedPredicates
@@ -276,6 +277,51 @@ defmodule AshMultiDatalayer.VerifiersTest do
       after
         Application.put_env(:ash_multi_datalayer, :assume_single_node, true)
       end
+    end
+  end
+
+  describe "ValidateAggregateOverrides" do
+    test "an override naming a real aggregate verifies" do
+      module =
+        define(
+          quote do
+            multi_data_layer do
+              layer(:l1, Ash.DataLayer.Ets)
+              layer(:l2, Ash.DataLayer.Ets)
+              read_order([:l1, :l2])
+              write_order([:l2, :l1])
+              sql_join_aggregate_overrides([:thing_count])
+            end
+
+            relationships do
+              has_many :things, AshMultiDatalayer.Test.Resources.TestPost,
+                destination_attribute: :author_id
+            end
+
+            aggregates do
+              count :thing_count, :things
+            end
+          end
+        )
+
+      assert :ok = ValidateAggregateOverrides.verify(module.spark_dsl_config())
+    end
+
+    test "an override naming something that isn't an aggregate is rejected" do
+      module =
+        define(
+          quote do
+            multi_data_layer do
+              layer(:l1, Ash.DataLayer.Ets)
+              read_order([:l1])
+              write_order([:l1])
+              sql_join_aggregate_overrides([:not_an_aggregate])
+            end
+          end
+        )
+
+      assert error_message(ValidateAggregateOverrides.verify(module.spark_dsl_config())) =~
+               "not an aggregate"
     end
   end
 

@@ -1,7 +1,47 @@
 # 20260704-Relationship-Aggregates-And-The-Subquery-Boundary-ADR
 
-**Status**: Superseded by the load-and-fold implementation (2026-07-04) — see
-the update below. **Date**: 2026-07-04 **Deciders**: Barnabas Jovanovics
+**Status**: Superseded — both the load-and-fold (option 1) and the in-database
+join (option 3) are now implemented (2026-07-04). See the updates below.
+**Date**: 2026-07-04 **Deciders**: Barnabas Jovanovics
+
+## Update (2026-07-04): option 3 (SQL join) implemented, and it is the default
+
+The `set_context` bridge below was built. A relationship aggregate whose related
+resource's source of truth is a **same-repo SQL layer** is now computed as a
+correlated **in-database join** by the source, not folded — see
+`AshMultiDatalayer.SqlPassthrough` and `aggregate_join_read/3` in
+`lib/ash_multi_datalayer/data_layer.ex`. This is **opt-out**
+(`sql_join_aggregates?`, default true; per-aggregate
+`sql_join_aggregate_overrides`), because folding a large relationship
+materialises **every related row into memory to count it** — and it does so even
+on a cache hit, since a cache (ETS) is itself a row store that folds
+(`Ash.count` over ETS is `Enum.count/2` on the fetched list). Only a SQL `COUNT`
+(or a remote server's native aggregate) counts without pulling rows into the
+BEAM, so the DB join is the memory-safe default for same-repo SQL.
+
+Two mechanisms result, both delegating the actual work to a data layer rather
+than reimplementing it:
+
+- **SQL join** (same-repo SQL related resource, not overridden): MDL delegates
+  the read to its SQL source, whose `add_aggregates` + `return_query` build the
+  lateral-join subquery; when the related resource is itself MDL-wrapped, its
+  `set_context/3` returns the SQL layer's `%Ecto.Query{}` (`SqlPassthrough`) so
+  ash_sql can splice it. This also lets a **plain** SQL parent aggregate over an
+  MDL-wrapped child — which previously crashed.
+- **Fold** (everything else — non-SQL/cross-repo related, or an override): MDL
+  serves the parent rows through its read path (which also warms the cache with
+  them) and then **delegates the aggregate to the cache layer's own
+  `run_query`** (aggregates only, calcs stripped, values stitched back by
+  primary key). The cache layer folds it with its own implementation, loading
+  each record's related rows through their data layer (so via MDL's cache when
+  covered). MDL keeps no aggregation code of its own and reaches into no
+  specific layer — both the join and the fold go through a data layer's standard
+  read callbacks (`add_aggregates` → `return_query` → `run_query`).
+
+A cross-repo / non-SQL related resource handed to a SQL parent's join fails with
+a **clear error** from `SqlPassthrough` (never ash_sql's raw `KeyError`, never a
+silent `NotLoaded`). All parent × child data-layer combinations are covered by
+`test/integration/aggregate_joins_test.exs`.
 
 ## Update (2026-07-04): implemented via load-and-fold
 
@@ -140,12 +180,13 @@ cached read would stop routing through MDL.
    layer (don't wrap it in MDL). Then `data_layer_query(related)` is Ecto and
    the source composes the join natively — at the cost of not caching that
    resource. A documentation note, not code.
-3. **Push the join down via `set_context` (viable, scoped to SQL-same-repo).**
-   _Reframed from the original "upstream / out of our hands"._ MDL's
-   `set_context/3` inspects `context.data_layer.parent_bindings`. When it is
-   present (⇒ an aggregate subquery, never a top-level read) and its
-   `sql_behaviour` + `context.data_layer.repo` match one of MDL's own SQL read
-   layers, MDL builds and returns **that layer's `%Ecto.Query{}`** — delegating
+3. **Push the join down via `set_context` (IMPLEMENTED — now the default for
+   same-repo SQL).** _Reframed from the original "upstream / out of our hands",
+   then built (see the update at the top)._ MDL's `set_context/3` inspects
+   `context.data_layer.parent_bindings`. When it is present (⇒ an aggregate
+   subquery, never a top-level read) and its `sql_behaviour` +
+   `context.data_layer.repo` match one of MDL's own SQL read layers, MDL builds
+   and returns **that layer's `%Ecto.Query{}`** — delegating
    `resource_to_query` + `set_context` (with the same context, so ash*sql's
    binding handshake lines up) to the SQL layer, and each subsequent build
    callback (`filter`/`sort`/`select`/`add_aggregates`/`limit`/…) to the SQL
@@ -157,10 +198,14 @@ cached read would stop routing through MDL.
    cache** — so it is not a 0-RPC-from-cache path but a "correct DB-side
    `COUNT`" path. It does **not** help remote sources. Relationship to option 1:
    folding already makes cross-layer aggregates \_correct* for every source, so
-   this is a pure **efficiency optimization** for large SQL-over-SQL
-   relationships, gated on top of folding: covered ⇒ fold (0 RPC); uncovered +
-   SQL-same-repo + large ⇒ push the join down; uncovered + small ⇒ fold by
-   fetching.
+   this is an **efficiency optimization** for SQL-over-SQL relationships. As
+   built, the routing is **opt-out** rather than the coverage/"large" heuristic
+   sketched here: a same-repo SQL relationship aggregate joins by default and an
+   escape hatch (`sql_join_aggregate_overrides`, or
+   `sql_join_aggregates? false`) folds it instead. The "large" heuristic was
+   dropped — relationship size isn't knowable before the read, and a fold
+   materialises every related row even on a cache hit, so the join is the safer
+   default for _any_ same-repo SQL relationship, not just provably-large ones.
 
 ## Consequences
 
@@ -173,11 +218,16 @@ The original consequences were:
   self-aggregates (all sources). Relationship aggregates on SQL-source MDL
   resources remain unsupported, deliberately.
 
-As implemented, instead: relationship aggregates are **folded** (option 1) and
-work for every source; `can?({:aggregate, kind})` is `true` for foldable kinds,
-gated by `fold_aggregates?`. Option 3 (push the SQL join down via `set_context`)
-remains an unbuilt but viable efficiency optimization for large SQL-over-SQL
-relationships.
+As implemented, instead: relationship aggregates **work for every source** and
+`can?({:aggregate, kind})` is `true` for foldable kinds whenever folding or the
+SQL join is enabled. A same-repo SQL relationship is computed as an in-database
+**join** by default (option 3, `sql_join_aggregates?`); everything else is
+**folded** by delegating to the cache layer's own `run_query` (option 1,
+`fold_aggregates?`), and either can be flipped per aggregate. A plain SQL parent
+can now aggregate over an MDL-wrapped child (via `SqlPassthrough`), and a
+combination that cannot be joined (cross-repo, or a non-SQL related resource
+handed to a SQL parent) fails with a clear error rather than a crash or a silent
+`NotLoaded`.
 
 ## Links
 

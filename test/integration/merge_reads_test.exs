@@ -216,22 +216,4 @@ defmodule AshMultiDatalayer.Integration.MergeReadsTest do
     assert again.post_count == 2
     assert pg_reads() == reads
   end
-
-  test "an overridden aggregate the source can't compute fails loudly, never silent" do
-    alias AshMultiDatalayer.Test.Resources.OverrideAggAuthor
-
-    # Warm the author rows so the merge path (not a whole source read) is taken.
-    OverrideAggAuthor |> Ash.read!()
-
-    error =
-      catch_error(
-        OverrideAggAuthor
-        |> Ash.Query.filter(name == "ada")
-        |> Ash.Query.load(:post_count)
-        |> Ash.read!()
-      )
-
-    # A clear error — not a silent %Ash.NotLoaded{} on `post_count`.
-    assert Exception.message(error) =~ ~r/could not compute aggregate/
-  end
 end

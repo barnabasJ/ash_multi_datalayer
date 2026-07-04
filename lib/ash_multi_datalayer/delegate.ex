@@ -19,8 +19,22 @@ defmodule AshMultiDatalayer.Delegate do
   @spec run_on_layer(Query.t() | struct(), module()) ::
           {:ok, [Ash.Resource.record()]} | {:error, term()}
   def run_on_layer(%Query{} = query, layer) do
-    with {:ok, layer_query} <- to_layer_query(query, layer) do
+    with {:ok, layer_query} <- to_layer_query(query, layer),
+         {:ok, layer_query} <- return_query(layer, layer_query, query.resource) do
       Ash.DataLayer.run_query(layer, layer_query, query.resource)
+    end
+  end
+
+  # The final build step Ash's own read pipeline runs before executing a query
+  # (`Ash.Query.data_layer_query/2`): it lets a layer finalise the query — for
+  # ash_sql layers this is where `load_aggregates` become real SELECTs/joins, so
+  # a delegated aggregate read must run it too. Layers without the callback (Ets)
+  # skip it.
+  defp return_query(layer, layer_query, resource) do
+    if callback?(layer, :return_query, 2) do
+      Ash.DataLayer.return_query(layer, layer_query, resource)
+    else
+      {:ok, layer_query}
     end
   end
 

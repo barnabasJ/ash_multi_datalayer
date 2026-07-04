@@ -67,7 +67,12 @@ defmodule AshMultiDatalayer.Test.Resources do
       resource AshMultiDatalayer.Test.Resources.SampledPost
       resource AshMultiDatalayer.Test.Resources.LocalEvalOffPost
       resource AshMultiDatalayer.Test.Resources.TestAuthor
-      resource AshMultiDatalayer.Test.Resources.OverrideAggAuthor
+      # Relationship-aggregate data-layer permutation matrix (parent × child):
+      resource AshMultiDatalayer.Test.Resources.PgPost
+      resource AshMultiDatalayer.Test.Resources.EtsPost
+      resource AshMultiDatalayer.Test.Resources.PgAuthor
+      resource AshMultiDatalayer.Test.Resources.MdlPgAuthor
+      resource AshMultiDatalayer.Test.Resources.EtsAuthor
     end
   end
 
@@ -117,7 +122,11 @@ defmodule AshMultiDatalayer.Test.Resources do
   end
 
   defmodule TestAuthor do
-    @moduledoc false
+    @moduledoc """
+    The relationship-aggregate **fold** example: `post_count`/`adult_post_count`
+    are opted out of the same-repo SQL join (`sql_join_aggregate_overrides`), so
+    they are folded from the cached related rows (0 source reads when covered).
+    """
     use Ash.Resource,
       domain: Domain,
       data_layer: AshMultiDatalayer.DataLayer,
@@ -129,6 +138,7 @@ defmodule AshMultiDatalayer.Test.Resources do
 
       read_order([:l1, :l2])
       write_order([:l2, :l1])
+      sql_join_aggregate_overrides([:post_count, :adult_post_count])
     end
 
     postgres do
@@ -164,12 +174,120 @@ defmodule AshMultiDatalayer.Test.Resources do
     end
   end
 
-  defmodule OverrideAggAuthor do
+  # --- relationship-aggregate permutation matrix (parent × child) -----------
+  #
+  # Children come in three data-layer kinds, each on the same logical posts:
+  #   * `PgPost`   — plain AshPostgres (shares `mdl_posts` with `TestPost`)
+  #   * `TestPost` — MDL over Postgres (defined above)
+  #   * `EtsPost`  — MDL without a SQL layer (single ETS layer; separate store)
+  # and parents come in the same three kinds (`PgAuthor`, `MdlPgAuthor`,
+  # `EtsAuthor`). Each parent carries a relationship + count aggregate to every
+  # child kind, so the integration test can assert the full 3×3 behaviour.
+
+  defmodule PgPost do
+    @moduledoc "Plain-AshPostgres child sharing `mdl_posts` with `TestPost`."
+    use Ash.Resource, domain: Domain, data_layer: AshPostgres.DataLayer
+
+    postgres do
+      table "mdl_posts"
+      repo(AshMultiDatalayer.TestRepo)
+    end
+
+    attributes do
+      uuid_primary_key :id
+      attribute :name, :string, public?: true
+      attribute :age, :integer, public?: true
+      attribute :score, :decimal, public?: true
+      attribute :published_at, :date, public?: true
+      attribute :author_id, :uuid, public?: true
+    end
+
+    actions do
+      defaults [:read, :destroy, create: :*, update: :*]
+    end
+  end
+
+  defmodule EtsPost do
     @moduledoc """
-    Same as `TestAuthor` but `post_count` is in `fold_aggregate_overrides`, so
-    it is handed to the source of truth instead of folded. The SQL source cannot
-    compute a relationship aggregate over the MDL-wrapped `TestPost`, so this
-    must fail LOUDLY (never a silent NotLoaded). Shares `mdl_authors`.
+    An MDL child **without** a SQL layer (a single ETS layer). A SQL parent
+    cannot join over it — `SqlPassthrough` returns a clear error instead of
+    ash_sql's `KeyError`; an MDL parent folds it. Its rows live in ETS, seeded
+    separately with matching `author_id`s.
+    """
+    use Ash.Resource, domain: Domain, data_layer: AshMultiDatalayer.DataLayer
+
+    multi_data_layer do
+      layer(:l1, Ash.DataLayer.Ets)
+      read_order([:l1])
+      write_order([:l1])
+    end
+
+    attributes do
+      uuid_primary_key :id
+      attribute :name, :string, public?: true
+      attribute :age, :integer, public?: true
+      attribute :author_id, :uuid, public?: true
+    end
+
+    actions do
+      defaults [:read, :destroy, create: :*, update: :*]
+    end
+  end
+
+  defmodule PgAuthor do
+    @moduledoc """
+    Plain-AshPostgres parent (matrix row P). A same-repo SQL child joins
+    natively (`PgPost`) or through `SqlPassthrough` (`TestPost`); a non-SQL MDL
+    child (`EtsPost`) cannot be joined and fails loudly. Shares `mdl_authors`.
+    """
+    use Ash.Resource, domain: Domain, data_layer: AshPostgres.DataLayer
+
+    postgres do
+      table "mdl_authors"
+      repo(AshMultiDatalayer.TestRepo)
+    end
+
+    attributes do
+      uuid_primary_key :id
+      attribute :name, :string, public?: true
+    end
+
+    relationships do
+      has_many :pg_posts, AshMultiDatalayer.Test.Resources.PgPost,
+        public?: true,
+        destination_attribute: :author_id
+
+      has_many :mdl_posts, AshMultiDatalayer.Test.Resources.TestPost,
+        public?: true,
+        destination_attribute: :author_id
+
+      has_many :ets_posts, AshMultiDatalayer.Test.Resources.EtsPost,
+        public?: true,
+        destination_attribute: :author_id
+    end
+
+    aggregates do
+      count :pg_post_count, :pg_posts, do: public?(true)
+      count :mdl_post_count, :mdl_posts, do: public?(true)
+
+      count :adult_mdl_post_count, :mdl_posts do
+        public? true
+        filter expr(age >= 18)
+      end
+
+      count :ets_post_count, :ets_posts, do: public?(true)
+    end
+
+    actions do
+      defaults [:read, :destroy, create: :*, update: :*]
+    end
+  end
+
+  defmodule MdlPgAuthor do
+    @moduledoc """
+    MDL-over-Postgres parent (matrix row M_pg). Same-repo SQL children join in
+    the database by default (`SqlPassthrough`); the non-SQL `EtsPost` child is
+    not same-repo SQL, so it folds. Shares `mdl_authors`.
     """
     use Ash.Resource,
       domain: Domain,
@@ -182,7 +300,6 @@ defmodule AshMultiDatalayer.Test.Resources do
 
       read_order([:l1, :l2])
       write_order([:l2, :l1])
-      fold_aggregate_overrides([:post_count])
     end
 
     postgres do
@@ -196,15 +313,80 @@ defmodule AshMultiDatalayer.Test.Resources do
     end
 
     relationships do
-      has_many :posts, AshMultiDatalayer.Test.Resources.TestPost,
+      has_many :pg_posts, AshMultiDatalayer.Test.Resources.PgPost,
+        public?: true,
+        destination_attribute: :author_id
+
+      has_many :mdl_posts, AshMultiDatalayer.Test.Resources.TestPost,
+        public?: true,
+        destination_attribute: :author_id
+
+      has_many :ets_posts, AshMultiDatalayer.Test.Resources.EtsPost,
         public?: true,
         destination_attribute: :author_id
     end
 
     aggregates do
-      count :post_count, :posts do
+      count :pg_post_count, :pg_posts, do: public?(true)
+      count :mdl_post_count, :mdl_posts, do: public?(true)
+
+      count :adult_mdl_post_count, :mdl_posts do
         public? true
+        filter expr(age >= 18)
       end
+
+      count :ets_post_count, :ets_posts, do: public?(true)
+    end
+
+    actions do
+      defaults [:read, :destroy, create: :*, update: :*]
+    end
+  end
+
+  defmodule EtsAuthor do
+    @moduledoc """
+    MDL parent **without** a SQL layer (single ETS layer; matrix row M_ets). It
+    has no SQL source to join from, so every relationship aggregate folds,
+    regardless of the child's data layer. Its rows live in ETS, seeded with an
+    id matching the shared author.
+    """
+    use Ash.Resource, domain: Domain, data_layer: AshMultiDatalayer.DataLayer
+
+    multi_data_layer do
+      layer(:l1, Ash.DataLayer.Ets)
+      read_order([:l1])
+      write_order([:l1])
+    end
+
+    attributes do
+      uuid_primary_key :id
+      attribute :name, :string, public?: true
+    end
+
+    relationships do
+      has_many :pg_posts, AshMultiDatalayer.Test.Resources.PgPost,
+        public?: true,
+        destination_attribute: :author_id
+
+      has_many :mdl_posts, AshMultiDatalayer.Test.Resources.TestPost,
+        public?: true,
+        destination_attribute: :author_id
+
+      has_many :ets_posts, AshMultiDatalayer.Test.Resources.EtsPost,
+        public?: true,
+        destination_attribute: :author_id
+    end
+
+    aggregates do
+      count :pg_post_count, :pg_posts, do: public?(true)
+      count :mdl_post_count, :mdl_posts, do: public?(true)
+
+      count :adult_mdl_post_count, :mdl_posts do
+        public? true
+        filter expr(age >= 18)
+      end
+
+      count :ets_post_count, :ets_posts, do: public?(true)
     end
 
     actions do

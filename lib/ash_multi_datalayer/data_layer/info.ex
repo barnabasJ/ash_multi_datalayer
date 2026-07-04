@@ -90,4 +90,16 @@ defmodule AshMultiDatalayer.DataLayer.Info do
   def fold_aggregate_overrides(resource) do
     Extension.get_opt(resource, [:multi_data_layer], :fold_aggregate_overrides, [])
   end
+
+  @doc "Whether same-repo SQL relationship aggregates are computed as an in-DB join by default."
+  @spec sql_join_aggregates?(Ash.Resource.t() | Spark.Dsl.t()) :: boolean()
+  def sql_join_aggregates?(resource) do
+    Extension.get_opt(resource, [:multi_data_layer], :sql_join_aggregates?, true)
+  end
+
+  @doc "Relationship-aggregate names folded from the cache instead of joined in SQL (opt-out)."
+  @spec sql_join_aggregate_overrides(Ash.Resource.t() | Spark.Dsl.t()) :: [atom()]
+  def sql_join_aggregate_overrides(resource) do
+    Extension.get_opt(resource, [:multi_data_layer], :sql_join_aggregate_overrides, [])
+  end
 end

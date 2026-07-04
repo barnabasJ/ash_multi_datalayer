@@ -162,6 +162,37 @@ defmodule AshMultiDatalayer.DataLayer do
         Aggregate names never folded locally even when `fold_aggregates?` is on
         — the per-aggregate escape hatch (sent to the source of truth instead).
         """
+      ],
+      sql_join_aggregates?: [
+        type: :boolean,
+        default: true,
+        doc: """
+        Whether a relationship aggregate whose related resource's source of
+        truth is a SQL layer in the **same repo** as this one is computed as an
+        in-database join by the source, instead of folded from the related rows.
+        On by default: a folded `COUNT` materialises every related row into
+        memory to count it (the cache layer is a row store — it folds too, so a
+        cache hit does not avoid this), which is unbounded for a large
+        relationship. A same-repo SQL join computes the count in the database
+        with bounded memory, so it is the safer default (see the relationship-
+        aggregates ADR, option 3).
+
+        Unlike folding, the join is a source read — it bypasses the cache (a
+        DB-side `COUNT`, not a 0-RPC fold). Turn this off (or use
+        `sql_join_aggregate_overrides`) to fold a small, hot relationship from
+        the cache instead. Relationship aggregates over a non-SQL or different-
+        repo related resource always fold — they cannot be joined.
+        """
+      ],
+      sql_join_aggregate_overrides: [
+        type: {:list, :atom},
+        default: [],
+        doc: """
+        Relationship-aggregate names folded from the related rows even when
+        `sql_join_aggregates?` is on — the per-aggregate escape hatch for a
+        small, hot relationship you would rather serve 0-RPC from the cache than
+        round-trip to the database.
+        """
       ]
     ]
   }
@@ -171,6 +202,7 @@ defmodule AshMultiDatalayer.DataLayer do
     verifiers: [
       AshMultiDatalayer.Verifiers.ValidateLayers,
       AshMultiDatalayer.Verifiers.ValidateMultitenancy,
+      AshMultiDatalayer.Verifiers.ValidateAggregateOverrides,
       AshMultiDatalayer.Verifiers.RejectFieldPolicies,
       AshMultiDatalayer.Verifiers.RejectMultiNode,
       AshMultiDatalayer.Verifiers.ValidateSolverSupportedPredicates
@@ -209,6 +241,7 @@ defmodule AshMultiDatalayer.DataLayer do
   alias AshMultiDatalayer.DataLayer.Info
   alias AshMultiDatalayer.Delegate
   alias AshMultiDatalayer.KillSwitch
+  alias AshMultiDatalayer.SqlPassthrough
   alias AshMultiDatalayer.Telemetry
 
   # --- capabilities --------------------------------------------------------
@@ -223,28 +256,37 @@ defmodule AshMultiDatalayer.DataLayer do
 
   @write_features [:create, :update, :destroy, :upsert, :transact]
 
-  # Aggregate kinds we can fold in memory from the related rows
-  # (`Ash.DataLayer.Ets.aggregate_value/6` covers exactly these). `:custom` is
-  # excluded — it carries a module implementation we don't run.
+  # Relationship-aggregate kinds we compute over a related resource — by a SQL
+  # join or by a data layer's own in-memory fold (see `merge_related_aggregates`).
+  # `:custom` is excluded — it carries a module implementation we don't run.
   @foldable_aggregate_kinds [:count, :sum, :avg, :min, :max, :first, :list, :exists]
+
+  # `AshPostgres.DataLayer.Info` is only present when a SQL layer is configured;
+  # reference it softly, exactly as `AshMultiDatalayer.Migration` does.
+  @compile {:no_warn_undefined, [AshPostgres.DataLayer.Info]}
+
+  # Relationship aggregates are supported when at least one mechanism is enabled.
+  defp aggregates_supported?(resource) do
+    Info.fold_aggregates?(resource) or Info.sql_join_aggregates?(resource)
+  end
 
   @impl true
   def can?(_resource, {:join, _}), do: false
   def can?(_resource, {:lateral_join, _}), do: false
 
-  # Relationship aggregates are computed by folding: MDL loads the related rows
-  # through its own read path (cache when covered → 0 source reads, source
-  # otherwise) and folds them in memory (see `fold_aggregates/4`). It never asks
-  # the source to build an in-DB join over an MDL-wrapped related resource — the
-  # failure shape the older refusal guarded against (a silent NotLoaded from a
-  # SQL layer; see the relationship-aggregates ADR). So we advertise support for
-  # the foldable kinds, gated by the `fold_aggregates?` option. With folding off,
-  # we answer false → Ash raises AggregatesNotSupported (loud) at query build.
+  # Relationship aggregates are computed one of two ways (see the aggregates
+  # ADR): a same-repo SQL relationship is joined in the database by the source
+  # (`SqlPassthrough`, gated by `sql_join_aggregates?`); everything else is
+  # folded from the related rows MDL loads through its own read path (cache when
+  # covered → 0 source reads, source otherwise; gated by `fold_aggregates?`). So
+  # we advertise support for the foldable kinds whenever either mechanism is on.
+  # With both off, we answer false → Ash raises AggregatesNotSupported (loud) at
+  # query build.
   def can?(resource, {:aggregate, kind}) do
-    Info.fold_aggregates?(resource) and kind in @foldable_aggregate_kinds
+    aggregates_supported?(resource) and kind in @foldable_aggregate_kinds
   end
 
-  def can?(resource, {:aggregate_relationship, _}), do: Info.fold_aggregates?(resource)
+  def can?(resource, {:aggregate_relationship, _}), do: aggregates_supported?(resource)
   def can?(_resource, :combine), do: false
   def can?(_resource, {:combine, _}), do: false
   def can?(_resource, :update_query), do: false
@@ -343,6 +385,14 @@ defmodule AshMultiDatalayer.DataLayer do
 
   # --- query building: accumulate into the Query struct -----------------
 
+  # Every build callback has a second head for the SQL-passthrough query
+  # (`set_context/3` flips into it inside an aggregate subquery — see below).
+  # It forwards verbatim to the SQL source layer, whose return is exactly what
+  # this callback must return, so ash_sql receives its own `%Ecto.Query{}` at
+  # the end of the build. Only `filter`/`set_tenant`/`add_aggregate`/
+  # `add_calculation` fire in practice (subqueries unset the rest), but covering
+  # all of them is cheap and robust.
+
   @impl true
   def filter(%Query{} = query, filter, _resource) do
     if query.filter do
@@ -352,43 +402,99 @@ defmodule AshMultiDatalayer.DataLayer do
     end
   end
 
+  def filter(%{__ash_bindings__: _} = passthrough, filter, resource),
+    do: Ash.DataLayer.filter(SqlPassthrough.layer(resource), passthrough, filter, resource)
+
   @impl true
   def sort(%Query{} = query, sort, _resource), do: {:ok, %{query | sort: sort}}
+
+  def sort(%{__ash_bindings__: _} = passthrough, sort, resource),
+    do: SqlPassthrough.layer(resource).sort(passthrough, sort, resource)
 
   @impl true
   def distinct_sort(%Query{} = query, sort, _resource),
     do: {:ok, %{query | distinct_sort: sort}}
 
+  def distinct_sort(%{__ash_bindings__: _} = passthrough, sort, resource),
+    do: SqlPassthrough.layer(resource).distinct_sort(passthrough, sort, resource)
+
   @impl true
   def distinct(%Query{} = query, distinct, _resource),
     do: {:ok, %{query | distinct: distinct}}
 
+  def distinct(%{__ash_bindings__: _} = passthrough, distinct, resource),
+    do: SqlPassthrough.layer(resource).distinct(passthrough, distinct, resource)
+
   @impl true
   def limit(%Query{} = query, limit, _resource), do: {:ok, %{query | limit: limit}}
+
+  def limit(%{__ash_bindings__: _} = passthrough, limit, resource),
+    do: SqlPassthrough.layer(resource).limit(passthrough, limit, resource)
 
   @impl true
   def offset(%Query{} = query, offset, _resource), do: {:ok, %{query | offset: offset}}
 
+  def offset(%{__ash_bindings__: _} = passthrough, offset, resource),
+    do: SqlPassthrough.layer(resource).offset(passthrough, offset, resource)
+
   @impl true
   def select(%Query{} = query, select, _resource), do: {:ok, %{query | select: select}}
+
+  def select(%{__ash_bindings__: _} = passthrough, select, resource),
+    do: SqlPassthrough.layer(resource).select(passthrough, select, resource)
 
   @impl true
   def lock(%Query{} = query, lock_type, _resource), do: {:ok, %{query | lock: lock_type}}
 
+  def lock(%{__ash_bindings__: _} = passthrough, lock_type, resource),
+    do: SqlPassthrough.layer(resource).lock(passthrough, lock_type, resource)
+
   @impl true
   def set_tenant(_resource, %Query{} = query, tenant), do: {:ok, %{query | tenant: tenant}}
 
+  def set_tenant(resource, %{__ash_bindings__: _} = passthrough, tenant),
+    do: SqlPassthrough.layer(resource).set_tenant(resource, passthrough, tenant)
+
+  # The only callback guaranteed to fire for every aggregate subquery. When
+  # ash_sql's `parent_bindings` signal is present and the related resource's
+  # source of truth is a same-repo SQL layer, flip into passthrough by returning
+  # that layer's `%Ecto.Query{}` (built with the same context, so ash_sql's
+  # binding handshake lines up). A top-level read carries no `parent_bindings`
+  # and stores the context as before.
   @impl true
-  def set_context(_resource, %Query{} = query, context),
-    do: {:ok, %{query | context: context}}
+  def set_context(resource, %Query{} = query, context) do
+    case SqlPassthrough.build(resource, query.domain, context) do
+      :not_a_subquery -> {:ok, %{query | context: context}}
+      {:ok, ecto_query} -> {:ok, ecto_query}
+      {:error, error} -> {:error, error}
+    end
+  end
 
   @impl true
   def add_aggregate(%Query{} = query, aggregate, _resource),
     do: {:ok, %{query | aggregates: query.aggregates ++ [aggregate]}}
 
+  def add_aggregate(%{__ash_bindings__: _} = passthrough, aggregate, resource),
+    do:
+      Ash.DataLayer.add_aggregates(
+        SqlPassthrough.layer(resource),
+        passthrough,
+        [aggregate],
+        resource
+      )
+
   @impl true
   def add_calculation(%Query{} = query, calculation, expression, _resource),
     do: {:ok, %{query | calculations: query.calculations ++ [{calculation, expression}]}}
+
+  def add_calculation(%{__ash_bindings__: _} = passthrough, calculation, expression, resource),
+    do:
+      Ash.DataLayer.add_calculations(
+        SqlPassthrough.layer(resource),
+        passthrough,
+        [{calculation, expression}],
+        resource
+      )
 
   # --- reads -------------------------------------------------------------
 
@@ -413,8 +519,11 @@ defmodule AshMultiDatalayer.DataLayer do
         # paths would hand the sort to the cache layer, which can't order by it.
         source_read(query, resource, read_layers, :calc_sort_source_only)
 
-      foldable_aggregates(query, resource) != [] ->
-        aggregate_fold_read(query, resource, read_layers)
+      related_aggregates?(query, resource) ->
+        # Relationship aggregates: a same-repo SQL one is joined in the database
+        # by the source (bounded memory); the rest are folded by the cache layer.
+        # Either way MDL delegates to a data layer's own read — see the ADR.
+        aggregate_read(query, resource, read_layers)
 
       computed? and not AshMultiDatalayer.ValueMerge.mergeable?(resource) ->
         # Computed values are the source of truth's job; without a mergeable
@@ -449,109 +558,130 @@ defmodule AshMultiDatalayer.DataLayer do
     end
   end
 
-  # Serve the rows (+ calcs + any non-foldable aggregates) via the normal read
-  # path, then fold the relationship aggregates onto them by loading their
-  # related rows through this layer's OWN read path (cache when covered → 0
-  # source reads, source otherwise — always the complete set) and counting in
-  # memory with Ash's own aggregation primitives. The aggregate is never handed
-  # to the source of truth, so it works for any related resource's data layer.
-  defp aggregate_fold_read(%Query{} = query, resource, _read_layers) do
-    started = System.monotonic_time()
-    folded = foldable_aggregates(query, resource)
-    base_query = %{query | aggregates: query.aggregates -- folded}
+  defp related_aggregates?(%Query{} = query, resource) do
+    join_aggregates(query, resource) != [] or foldable_aggregates(query, resource) != []
+  end
 
-    with {:ok, rows} <- run_query(base_query, resource),
-         {:ok, merged} <- fold_aggregates(rows, folded, query) do
-      emit_read(:aggregate_fold, query, resource, started, %{aggregates: length(folded)})
+  # Compute relationship aggregates by delegating each to the data layer that
+  # can produce it — never by folding them ourselves.
+  #
+  # When *every* aggregate is a same-repo SQL join, the SQL source returns the
+  # rows, calcs and aggregates in a single read (the join is a DB operation, so
+  # the parent rows come with it) — no redundant base read, no double source read
+  # on a cache miss. This is the opt-out default path.
+  #
+  # Otherwise (a fold is involved, alone or mixed with a join) we first serve the
+  # parent rows (+ calcs) through the normal read path — which also warms the
+  # cache with them, since a fold is done by the cache layer and the SQL source
+  # can't fold a non-SQL relationship. Then same-repo SQL aggregates go to the
+  # SQL **source** (in-DB join) and the rest to the now-warm **cache** layer,
+  # which folds them with its own implementation, loading each record's related
+  # rows through their data layer (this module → 0 source reads when covered).
+  # Each delegated read computes through the layer's standard `run_query`; the
+  # values are stitched back onto the rows by primary key.
+  defp aggregate_read(%Query{} = query, resource, read_layers) do
+    started = System.monotonic_time()
+    join = join_aggregates(query, resource)
+    fold = foldable_aggregates(%{query | aggregates: query.aggregates -- join}, resource)
+
+    if fold == [] and query.aggregates -- join == [] do
+      with {:ok, rows} <- Delegate.run_on_layer(query, List.last(read_layers)) do
+        emit_read(:aggregate_read, query, resource, started, %{joined: length(join), folded: 0})
+        {:ok, rows}
+      end
+    else
+      base_query = %{query | aggregates: query.aggregates -- (join ++ fold)}
+
+      with {:ok, rows} <- run_query(base_query, resource),
+           {:ok, rows} <-
+             add_aggregates_via_layer(rows, join, query, resource, List.last(read_layers)),
+           {:ok, rows} <- add_aggregates_via_layer(rows, fold, query, resource, hd(read_layers)) do
+        emit_read(:aggregate_read, query, resource, started, %{
+          joined: length(join),
+          folded: length(fold)
+        })
+
+        {:ok, rows}
+      end
+    end
+  end
+
+  # Relationship aggregates the SQL source computes as an in-database join: a
+  # foldable kind over a related resource whose own source of truth is a SQL
+  # layer in the same repo as ours, with the join enabled and not overridden to
+  # fold. See `AshMultiDatalayer.SqlPassthrough` and the aggregates ADR.
+  defp join_aggregates(%Query{aggregates: aggregates}, resource) do
+    if Info.sql_join_aggregates?(resource) do
+      overrides = Info.sql_join_aggregate_overrides(resource)
+      Enum.filter(aggregates, &join_eligible?(resource, overrides, &1))
+    else
+      []
+    end
+  end
+
+  defp join_eligible?(resource, overrides, %Ash.Query.Aggregate{
+         related?: true,
+         kind: kind,
+         name: name,
+         relationship_path: path
+       })
+       when kind in @foldable_aggregate_kinds do
+    name not in overrides and
+      same_repo_sql?(resource, Ash.Resource.Info.related(resource, path))
+  end
+
+  defp join_eligible?(_resource, _overrides, _aggregate), do: false
+
+  # Both resources' sources of truth are SQL layers in the same repo — the only
+  # case a correlated in-DB join can span. Detected via the postgres section
+  # each carries (so a counting/wrapping SQL layer, which keys off the section
+  # rather than the layer module, is handled too).
+  defp same_repo_sql?(resource, related) do
+    repo = sql_repo(resource)
+    not is_nil(repo) and repo == sql_repo(related)
+  end
+
+  defp sql_repo(resource) do
+    AshPostgres.DataLayer.Info.repo(resource, :read)
+  rescue
+    _ -> nil
+  end
+
+  # Compute the aggregates in `aggs` over the already-fetched parent `rows` by
+  # delegating one query — same filter/sort/limit, aggregates only, calcs
+  # stripped — to `layer` through the standard read callbacks (`add_aggregates` →
+  # `return_query` → `run_query`). The layer's own code does the work (SQL joins,
+  # ETS folds); we stitch the values back onto `rows` by primary key.
+  defp add_aggregates_via_layer(rows, [], _query, _resource, _layer), do: {:ok, rows}
+
+  defp add_aggregates_via_layer(rows, aggs, query, resource, layer) do
+    agg_query = %{query | aggregates: aggs, calculations: []}
+
+    with {:ok, agg_rows} <- Delegate.run_on_layer(agg_query, layer) do
+      [pk] = Ash.Resource.Info.primary_key(resource)
+      by_pk = Map.new(agg_rows, &{Map.fetch!(&1, pk), &1})
+
+      merged =
+        Enum.map(rows, fn row ->
+          copy_aggregate_values(row, Map.get(by_pk, Map.fetch!(row, pk)), aggs)
+        end)
+
       {:ok, merged}
     end
   end
 
-  defp fold_aggregates(rows, aggregates, %Query{domain: domain}) do
-    rows
-    |> Enum.reduce_while({:ok, []}, fn record, {:ok, acc} ->
-      case fold_record(record, aggregates, domain) do
-        {:ok, folded} -> {:cont, {:ok, [folded | acc]}}
-        {:error, error} -> {:halt, {:error, error}}
-      end
-    end)
-    |> case do
-      {:ok, folded} -> {:ok, Enum.reverse(folded)}
-      error -> error
-    end
-  end
+  defp copy_aggregate_values(row, nil, _aggs), do: row
 
-  defp fold_record(record, aggregates, domain) do
-    Enum.reduce_while(aggregates, {:ok, record}, fn aggregate, {:ok, record} ->
-      case fold_one(record, aggregate, domain) do
-        {:ok, record} -> {:cont, {:ok, record}}
-        {:error, error} -> {:halt, {:error, error}}
+  defp copy_aggregate_values(row, agg_row, folded) do
+    Enum.reduce(folded, row, fn %Ash.Query.Aggregate{load: load, name: name}, row ->
+      if load do
+        Map.put(row, load, Map.get(agg_row, load))
+      else
+        value = agg_row.aggregates |> Kernel.||(%{}) |> Map.get(name)
+        Map.update!(row, :aggregates, &Map.put(&1, name, value))
       end
     end)
   end
-
-  # Mirrors `Ash.DataLayer.Ets.do_add_aggregates/4` (the related branch): load
-  # the record's related rows (through their own data layer — this module — so
-  # via the cache-aware read path), materialise them, apply the aggregate's own
-  # filter/sort, and fold with the Ets primitive. `Ash.load` is what routes the
-  # related read through coverage.
-  defp fold_one(record, %Ash.Query.Aggregate{} = aggregate, domain) do
-    %Ash.Query.Aggregate{
-      kind: kind,
-      field: field,
-      relationship_path: path,
-      query: agg_query,
-      context: context,
-      uniq?: uniq?,
-      include_nil?: include_nil?,
-      default_value: default,
-      join_filters: join_filters
-    } = aggregate
-
-    tenant = context[:tenant]
-    actor = context[:actor]
-
-    load =
-      record.__struct__
-      |> Ash.Query.load(
-        relationship_path_to_load(
-          path,
-          Ash.Query.set_context(Ash.Query.unset(agg_query, :load), %{
-            private: %{authorize?: false}
-          })
-        )
-      )
-      |> Ash.Query.load(relationship_path_to_load(path, field))
-      |> Ash.Query.set_context(%{private: %{internal?: true}})
-
-    with {:ok, loaded} <-
-           Ash.load(record, load, domain: domain, tenant: tenant, actor: actor, authorize?: false),
-         related <-
-           Ash.Filter.Runtime.get_related(loaded, path, false, join_filters, [record], domain),
-         {:ok, filtered} <-
-           Ash.Filter.Runtime.filter_matches(domain, related, agg_query.filter,
-             tenant: tenant,
-             actor: actor
-           ) do
-      sorted =
-        Ash.Actions.Sort.runtime_sort(filtered, agg_query.sort, domain: domain, rekey?: false)
-
-      field = field || Enum.at(Ash.Resource.Info.primary_key(agg_query.resource), 0)
-      value = Ash.DataLayer.Ets.aggregate_value(sorted, kind, field, uniq?, include_nil?, default)
-      {:ok, write_aggregate(record, aggregate, value)}
-    end
-  end
-
-  defp write_aggregate(record, %Ash.Query.Aggregate{load: load}, value) when not is_nil(load),
-    do: Map.put(record, load, value)
-
-  defp write_aggregate(record, %Ash.Query.Aggregate{name: name}, value),
-    do: Map.update!(record, :aggregates, &Map.put(&1, name, value))
-
-  defp relationship_path_to_load([], leaf), do: leaf
-
-  defp relationship_path_to_load([key | rest], leaf),
-    do: [{key, relationship_path_to_load(rest, leaf)}]
 
   # An aggregate handed to the source of truth (the per-aggregate
   # `fold_aggregate_overrides` escape hatch, or folding turned off) that the
