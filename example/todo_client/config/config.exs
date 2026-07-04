@@ -37,3 +37,7 @@ if config_env() == :test do
 end
 
 config :ash, :validate_domain_config_inclusion?, false
+
+# The generated `remote(...)` calcs use ash_remote's custom expression; a
+# downstream app generating clients must register it (compile-time).
+config :ash, :custom_expressions, [AshRemote.Expressions.Remote]

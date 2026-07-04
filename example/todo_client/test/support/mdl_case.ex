@@ -19,6 +19,7 @@ defmodule TodoClient.MdlCase do
   @events [
     [:ash_multi_datalayer, :read, :hit],
     [:ash_multi_datalayer, :read, :miss],
+    [:ash_multi_datalayer, :read, :partial],
     [:ash_multi_datalayer, :read, :backfill],
     [:ash_multi_datalayer, :read, :divergence_detected],
     [:ash_multi_datalayer, :write, :applied],

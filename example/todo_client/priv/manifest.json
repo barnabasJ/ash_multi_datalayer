@@ -2436,6 +2436,7 @@
         },
         "overdue?": {
           "allow_nil": true,
+          "expression": "((not (is_nil(due_date)) and (due_date < today())) and not (completed))",
           "filter_custom_expressions": [],
           "filter_functions": [
             {

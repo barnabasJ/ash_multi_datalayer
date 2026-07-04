@@ -31,7 +31,7 @@ defmodule TodoClient.Remote.User do
   end
 
   calculations do
-    calculate :list_count, :integer, expr(not is_nil(id)) do
+    calculate :list_count, :integer, expr(remote("list_count", %{}, id)) do
       public?(true)
     end
   end

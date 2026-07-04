@@ -185,8 +185,8 @@ defmodule TodoClient.MultiDatalayerTest do
     end
   end
 
-  describe "T5: calculations and aggregates always consult the server" do
-    test "overdue? comes from the server expression, never the client stub", %{list: list} do
+  describe "T5 (B): mirrored calcs are evaluated locally; remote calcs consult the server" do
+    test "overdue? is computed from the cache with no RPC (local evaluation)", %{list: list} do
       server_create_todo!(%{title: "Late", list_id: list.id, due_date: ~D[2020-01-01]})
       server_create_todo!(%{title: "Future", list_id: list.id, due_date: ~D[2099-01-01]})
 
@@ -194,7 +194,8 @@ defmodule TodoClient.MultiDatalayerTest do
       Todo |> Ash.Query.filter(list_id == ^list.id) |> Ash.read!()
       warm = rpc()
 
-      # The calc-loaded read must RPC even though the filter is covered.
+      # `overdue?` is the real mirrored server expression; the cache layer can
+      # evaluate it from the covered rows, so loading it adds NO RPC.
       todos =
         Todo
         |> Ash.Query.filter(list_id == ^list.id)
@@ -202,11 +203,11 @@ defmodule TodoClient.MultiDatalayerTest do
         |> Ash.read!()
         |> Map.new(&{&1.title, &1.overdue?})
 
-      assert rpc() == warm + 1
+      assert rpc() == warm
+      assert_receive {:mdl, [_, :read, :hit], _, %{computed_values: :local}}
 
-      # The generated client stub is `expr(not is_nil(id))` - it would say
-      # TRUE for both rows. The server's real expression disagrees on the
-      # future one, proving the value came from the server.
+      # And the values carry the real server semantics — the 2099 row is not
+      # overdue — proving the mirrored expression is evaluated, not a stub.
       assert todos == %{"Late" => true, "Future" => false}
     end
 
@@ -263,6 +264,82 @@ defmodule TodoClient.MultiDatalayerTest do
     end
   end
 
+  describe "A: filter/sort on a remote calc forwards to the server" do
+    test "filtering a list by todo_count (a remote calc) routes to the server", %{
+      list: list,
+      other_list: other_list
+    } do
+      server_create_todo!(%{title: "aaa", list_id: list.id})
+      server_create_todo!(%{title: "bbb", list_id: list.id})
+      # other_list has no todos.
+
+      # Warm plain coverage for the lists.
+      TodoList |> Ash.read!()
+      warm = rpc()
+
+      # `todo_count` is a `remote(...)` calc the cache can't evaluate, so the
+      # filter routes to the remote layer, which forwards it to the server.
+      names =
+        TodoList
+        |> Ash.Query.filter(todo_count > 1)
+        |> Ash.read!()
+        |> Enum.map(& &1.name)
+
+      assert names == [list.name]
+      refute other_list.name in names
+      # The predicate reached the server (a source read happened).
+      assert rpc() > warm
+    end
+
+    test "sorting by todo_count forwards to the server", %{list: list, other_list: other_list} do
+      server_create_todo!(%{title: "aaa", list_id: list.id})
+      server_create_todo!(%{title: "bbb", list_id: other_list.id})
+      server_create_todo!(%{title: "ccc", list_id: other_list.id})
+
+      names =
+        TodoList
+        |> Ash.Query.sort(todo_count: :desc)
+        |> Ash.Query.load(:todo_count)
+        |> Ash.read!()
+        |> Enum.map(& &1.name)
+
+      # other_list (2 todos) sorts ahead of list (1 todo).
+      assert names == [other_list.name, list.name]
+    end
+  end
+
+  describe "C: remainder reads — serve the covered part, fetch only the missing rows" do
+    test "a partially-covered read fetches only the uncovered todos in one RPC", %{list: list} do
+      server_create_todo!(%{title: "Open", list_id: list.id, completed: false})
+      server_create_todo!(%{title: "Done", list_id: list.id, completed: true})
+
+      # Warm coverage for the completed todos only.
+      Todo
+      |> Ash.Query.filter(list_id == ^list.id and completed == true)
+      |> Ash.read!()
+
+      warm = rpc()
+
+      # Read every todo in the list: "Done" is served from the cache, and only
+      # the remainder ("Open", i.e. completed != true) is fetched — one RPC.
+      titles =
+        Todo
+        |> Ash.Query.filter(list_id == ^list.id)
+        |> Ash.read!()
+        |> Enum.map(& &1.title)
+        |> Enum.sort()
+
+      assert titles == ["Done", "Open"]
+      assert rpc() == warm + 1
+      assert_receive {:mdl, [_, :read, :partial], _, _}
+
+      # The remainder backfilled + recorded Q: the next read is a full hit.
+      Todo |> Ash.Query.filter(list_id == ^list.id) |> Ash.read!()
+      assert rpc() == warm + 1
+      assert_receive {:mdl, [_, :read, :hit], _, _}
+    end
+  end
+
   describe "T6: divergence detection" do
     test "an out-of-band server write is detected by the 1.0 sampler", %{list: list} do
       server_create_todo!(%{title: "watched", list_id: list.id})
@@ -278,8 +355,7 @@ defmodule TodoClient.MultiDatalayerTest do
       # server and reports the drift.
       assert [_] = Ash.read!(query)
 
-      assert_receive {:mdl, [_, :read, :divergence_detected],
-                      %{cache_count: 1, primary_count: 2},
+      assert_receive {:mdl, [_, :read, :divergence_detected], %{cache_count: 1, primary_count: 2},
                       %{pk_delta: %{only_in_cache: [], only_in_primary: [_]}}}
     end
   end

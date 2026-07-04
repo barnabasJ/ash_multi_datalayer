@@ -38,11 +38,15 @@ defmodule TodoClient.Remote.TodoList do
   end
 
   calculations do
-    calculate :completed_count, :integer, expr(not is_nil(id)) do
+    # Server aggregates, regenerated as `remote(...)` expression calcs: the
+    # cache layer can't reproduce them, so ash_multi_datalayer fetches their
+    # values from the source — and filtering/sorting on them forwards to the
+    # server (the calc filter routes to the remote layer).
+    calculate :completed_count, :integer, expr(remote("completed_count", %{}, id)) do
       public?(true)
     end
 
-    calculate :todo_count, :integer, expr(not is_nil(id)) do
+    calculate :todo_count, :integer, expr(remote("todo_count", %{}, id)) do
       public?(true)
     end
   end

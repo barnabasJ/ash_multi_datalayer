@@ -53,7 +53,12 @@ defmodule TodoClient.Remote.Todo do
   end
 
   calculations do
-    calculate :overdue?, :boolean, expr(not is_nil(id)) do
+    # Mirrored server expression (regenerated from the manifest): the cache
+    # layer can evaluate this from a covered row, so ash_multi_datalayer's
+    # local evaluation computes it with no source round trip.
+    calculate :overdue?,
+              :boolean,
+              expr(not is_nil(due_date) and due_date < today() and not completed) do
       public?(true)
     end
   end
