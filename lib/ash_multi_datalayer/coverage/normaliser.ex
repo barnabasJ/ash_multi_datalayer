@@ -188,6 +188,23 @@ defmodule AshMultiDatalayer.Coverage.Normaliser do
   defp flip(:not_eq), do: :not_eq
   defp flip(_), do: :opaque
 
+  # A calculation or aggregate reference is NOT a plain attribute, even though
+  # its struct carries `:name`/`:type`. Treating one as an attribute would let
+  # the prover key a disjunct on the calc's name and return a false coverage
+  # hit — after which the calc filter would be evaluated by the cache layer,
+  # which cannot compute a source-only calc (e.g. an ash_remote `remote(...)`).
+  # Opaque routes such a query to a layer that can (the source). Cache-serving
+  # a filter on a cache-evaluable, time-independent calc by inlining its
+  # expression is a sound future extension on this same seam.
+  defp ref_attribute(%Ref{attribute: %struct{}}, _resource)
+       when struct in [
+              Ash.Query.Calculation,
+              Ash.Resource.Calculation,
+              Ash.Query.Aggregate,
+              Ash.Resource.Aggregate
+            ],
+       do: :opaque_ref
+
   defp ref_attribute(
          %Ref{relationship_path: [], attribute: %{name: name, type: type}},
          _resource

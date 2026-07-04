@@ -151,6 +151,7 @@ defmodule AshMultiDatalayer.DataLayer do
   require Logger
 
   alias AshMultiDatalayer.Backfill
+  alias AshMultiDatalayer.Capability
   alias AshMultiDatalayer.Coverage
   alias AshMultiDatalayer.DataLayer.Info
   alias AshMultiDatalayer.Delegate
@@ -345,6 +346,12 @@ defmodule AshMultiDatalayer.DataLayer do
       not is_nil(query.lock) ->
         source_read(query, resource, read_layers, :not_cacheable)
 
+      sort_references_uncomputable_calc?(query, resource, hd(read_layers)) ->
+        # Sorting on a calc the cache layer can't evaluate (a source-only
+        # `remote(...)`) must not be served from the cache — the coverage/merge
+        # paths would hand the sort to the cache layer, which can't order by it.
+        source_read(query, resource, read_layers, :calc_sort_source_only)
+
       computed? and not AshMultiDatalayer.ValueMerge.mergeable?(resource) ->
         # Computed values are the source of truth's job; without a mergeable
         # primary key the whole query falls through.
@@ -357,6 +364,30 @@ defmodule AshMultiDatalayer.DataLayer do
         coverage_read(query, resource, read_layers)
     end
   end
+
+  # A calc referenced in the FILTER routes to the source via the normaliser
+  # (a calc ref is opaque — no false coverage hit). A calc referenced in the
+  # SORT needs a separate guard: coverage/merge would replay the sort onto the
+  # cache layer, which can't order by a calc it can't compute.
+  defp sort_references_uncomputable_calc?(%Query{sort: sort}, resource, cache_layer) do
+    Enum.any?(sort, fn
+      {%Ash.Query.Calculation{} = calc, _direction} ->
+        not calc_evaluable_by?(cache_layer, resource, calc)
+
+      _ ->
+        false
+    end)
+  end
+
+  defp calc_evaluable_by?(layer, resource, %Ash.Query.Calculation{opts: opts})
+       when is_list(opts) do
+    case opts[:expr] do
+      nil -> false
+      expression -> Capability.layer_can_evaluate?(layer, resource, expression)
+    end
+  end
+
+  defp calc_evaluable_by?(_layer, _resource, _calc), do: false
 
   defp coverage_read(%Query{} = query, resource, read_layers) do
     started = System.monotonic_time()
