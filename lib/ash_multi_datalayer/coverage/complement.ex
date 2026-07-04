@@ -46,9 +46,11 @@ defmodule AshMultiDatalayer.Coverage.Complement do
   def coverage_filter([], _resource), do: :empty
 
   def coverage_filter(disjuncts, resource) do
-    cond do
-      Enum.any?(disjuncts, &(&1 == %{})) -> :universe
-      true -> {:ok, Ash.Filter.parse!(resource, or_stmt(Enum.map(disjuncts, &disjunct_stmt/1)))}
+    # An unconstrained disjunct (`%{}`) means C already matches every row.
+    if Enum.any?(disjuncts, &(&1 == %{})) do
+      :universe
+    else
+      {:ok, Ash.Filter.parse!(resource, or_stmt(Enum.map(disjuncts, &disjunct_stmt/1)))}
     end
   end
 
@@ -64,14 +66,13 @@ defmodule AshMultiDatalayer.Coverage.Complement do
   def complement_filter([], _resource), do: :universe
 
   def complement_filter(disjuncts, resource) do
-    cond do
-      Enum.any?(disjuncts, &(&1 == %{})) ->
-        :empty
-
-      true ->
-        # ¬(D₁ ∨ … ∨ Dₙ) = ¬D₁ ∧ … ∧ ¬Dₙ
-        {:ok,
-         Ash.Filter.parse!(resource, and_stmt(Enum.map(disjuncts, &complement_disjunct_stmt/1)))}
+    # If C matches every row (an unconstrained disjunct), its complement is empty.
+    if Enum.any?(disjuncts, &(&1 == %{})) do
+      :empty
+    else
+      # ¬(D₁ ∨ … ∨ Dₙ) = ¬D₁ ∧ … ∧ ¬Dₙ
+      {:ok,
+       Ash.Filter.parse!(resource, and_stmt(Enum.map(disjuncts, &complement_disjunct_stmt/1)))}
     end
   end
 

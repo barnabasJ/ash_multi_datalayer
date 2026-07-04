@@ -5,9 +5,12 @@ defmodule AshMultiDatalayer.Telemetry do
   Events (all prefixed `[:ash_multi_datalayer, ...]`):
 
     * `[:read, :hit]` — a read served from an earlier layer via coverage
+    * `[:read, :partial]` — a remainder read: the covered part served from the
+      cache, only the uncovered remainder fetched from the source (metadata
+      `%{cached, fetched}` row counts)
     * `[:read, :miss]` — a read that fell through (metadata `reason:` one of
       `:no_coverage_entry`, `:solver_unsupported`, `:fields_insufficient`,
-      `:not_cacheable`, `:ledger_unavailable`)
+      `:not_cacheable`, `:calc_sort_source_only`, `:ledger_unavailable`)
     * `[:read, :backfill]` — fetched rows upserted into earlier layers +
       the filter recorded in the ledger
     * `[:read, :divergence_detected]` — a sampled cache hit disagreed with
