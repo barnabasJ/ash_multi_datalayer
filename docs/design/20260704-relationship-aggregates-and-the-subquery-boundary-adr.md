@@ -102,12 +102,28 @@ chosen.
 The tension in one sentence: **a SQL join needs the related query eagerly, as
 Ecto, at build time; MDL's entire value is keeping it abstract and deferred.**
 
-There is no clean bridge: the only place to convert is `resource_to_query`,
-which has no signal distinguishing "aggregate subquery" from "top-level read".
-Returning Ecto there would return it _always_, and every ordinary cached read
-would stop routing through MDL. Ash's data-layer protocol has no "give me your
-native form for embedding as a subquery" handshake, so this cannot be resolved
-in MDL alone or in ash_sql alone.
+> **Correction (2026-07-04): a clean bridge does exist.** This paragraph
+> originally claimed the only conversion point is `resource_to_query`, which is
+> context-blind, so returning Ecto would break normal reads. That was wrong. It
+> overlooked `set_context/3`: `Ash.Query.data_layer_query` calls the data
+> layer's `set_context/3` right after the initial query (`ash/query/query.ex`,
+> the `Ash.DataLayer.set_context` step), and **ash_sql populates exactly that
+> context for the subquery** — `context.data_layer.parent_bindings` +
+> `start_bindings_at` (`ash_sql/aggregate.ex:420`). MDL already implements
+> `set_context/3` (`data_layer.ex:382`), so it _can_ tell a subquery from a
+> top-level read: only the former carries `parent_bindings`. Moreover
+> `parent_bindings` **is the parent query's `__ash_bindings__`**, which carries
+> the caller's identity: `sql_behaviour` (the calling data-layer module) and
+> `context.data_layer.repo` (`ash_sql/bindings.ex:62-64`, `ash_sql.ex:11`). So
+> MDL can gate precisely — swap to the caller's Ecto query only when
+> `parent_bindings` is present _and_ its `sql_behaviour`/`repo` match MDL's own
+> SQL read layer; a normal read (no `parent_bindings`) always gets the routing
+> struct and still routes through the cache. See the revised option 3.
+
+The original (superseded) reasoning: the only place to convert is
+`resource_to_query`, which has no signal distinguishing "aggregate subquery"
+from "top-level read"; returning Ecto there would return it _always_ and every
+cached read would stop routing through MDL.
 
 ## Options for revisiting (not chosen now)
 
@@ -124,17 +140,44 @@ in MDL alone or in ash_sql alone.
    layer (don't wrap it in MDL). Then `data_layer_query(related)` is Ecto and
    the source composes the join natively — at the cost of not caching that
    resource. A documentation note, not code.
-3. **Upstream**: a cross-data-layer subquery protocol in Ash/ash_sql ("this
-   related resource isn't me; ask it to produce my native query"). Out of our
-   hands.
+3. **Push the join down via `set_context` (viable, scoped to SQL-same-repo).**
+   _Reframed from the original "upstream / out of our hands"._ MDL's
+   `set_context/3` inspects `context.data_layer.parent_bindings`. When it is
+   present (⇒ an aggregate subquery, never a top-level read) and its
+   `sql_behaviour` + `context.data_layer.repo` match one of MDL's own SQL read
+   layers, MDL builds and returns **that layer's `%Ecto.Query{}`** — delegating
+   `resource_to_query` + `set_context` (with the same context, so ash*sql's
+   binding handshake lines up) to the SQL layer, and each subsequent build
+   callback (`filter`/`sort`/`select`/`add_aggregates`/`limit`/…) to the SQL
+   layer while in this passthrough mode. ash_sql then splices the correlated
+   subquery natively. Cost: ~a dozen callback clauses; the gate is exact (no
+   `parent_bindings` ⇒ routing struct as before). Limits: works **only** when
+   the related resource's source is a SQL layer in the **same repo** as the
+   parent, and it computes the aggregate **in the database, bypassing the Ets
+   cache** — so it is not a 0-RPC-from-cache path but a "correct DB-side
+   `COUNT`" path. It does **not** help remote sources. Relationship to option 1:
+   folding already makes cross-layer aggregates \_correct* for every source, so
+   this is a pure **efficiency optimization** for large SQL-over-SQL
+   relationships, gated on top of folding: covered ⇒ fold (0 RPC); uncovered +
+   SQL-same-repo + large ⇒ push the join down; uncovered + small ⇒ fold by
+   fetching.
 
 ## Consequences
+
+_Superseded by the load-and-fold implementation (see the update at the top)._
+The original consequences were:
 
 - The `can?` refusal stays (a loud `AggregatesNotSupported` at query build beats
   a silent `NotLoaded`). The rationale is now precise and cited.
 - Aggregate needs are met today via remote-calc proxying (remote sources) and
   self-aggregates (all sources). Relationship aggregates on SQL-source MDL
   resources remain unsupported, deliberately.
+
+As implemented, instead: relationship aggregates are **folded** (option 1) and
+work for every source; `can?({:aggregate, kind})` is `true` for foldable kinds,
+gated by `fold_aggregates?`. Option 3 (push the SQL join down via `set_context`)
+remains an unbuilt but viable efficiency optimization for large SQL-over-SQL
+relationships.
 
 ## Links
 
