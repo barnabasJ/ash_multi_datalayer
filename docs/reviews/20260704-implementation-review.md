@@ -1,5 +1,14 @@
 # Implementation Review — ash_multi_datalayer v1
 
+> **Addendum (2026-07-05):** C1, C2, C3, and M1 are fixed, per
+> `docs/plans/critical-bugs-fix-plan.md`, in the commit series
+> `6b5ab7c..2aca728` (Phase 0 regression harness through Phase 7
+> verification). C1/C2 land in `6b5ab7c`, C3 in `ba7e3d0` (alongside C4 —
+> see the addendum below), M1 in `e1fa3cc`. M2–M7 and R1–R3 remain open;
+> out of scope for that plan. All new regression tests referenced below
+> (`field_coverage_test.exs`, `read_write_race_test.exs`, and the Phase 6
+> hardening suite) are green.
+
 **Date:** 2026-07-04
 **Scope:** entire library (`lib/`, `test/`, packaging), at commit `b9ddc8c`.
 **Method:** four parallel review passes (coverage/solver core, data-layer surface,

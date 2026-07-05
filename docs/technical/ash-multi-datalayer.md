@@ -112,6 +112,18 @@ Given `write_order = [:l2, :l1]`:
   20260417-reject-field-policies).
 - **At-most-once ledger entries per (filter, tenant)** after normalisation;
   duplicate materialisations don't produce duplicate entries.
+- **Invalidation is final**: once a write invalidates coverage, no in-flight
+  read may re-establish it (or cache rows under existing coverage) computed
+  from pre-write state. Enforced by a per-resource+tenant invalidation
+  epoch snapshotted at the top of every read that may backfill and rechecked
+  around the ledger insert (see [Row-aware invalidation](#row-aware-invalidation)).
+- **Covered region ⇒ the physical rows under it are fresh**: recording
+  coverage for a filter never launders stale physical rows into served
+  state — neither ghosts of externally-destroyed rows nor pre-update values
+  of rows that moved out of the region. Upheld at the write API
+  (`Coverage.Invalidation.on_write/4` evicts the physical row, not just the
+  ledger entry) and as defense in depth on the read path (reconcile-on-record
+  deletes cached rows outside the just-fetched set before recording).
 
 ### Edge Cases
 
@@ -143,9 +155,26 @@ Given `write_order = [:l2, :l1]`:
   Fixing this requires an upstream seam (ash_sql building related subqueries
   through a pluggable resolution instead of the destination's persisted data
   layer).
-- **Field coverage**: `Entry.loaded_fields` is the query's select **∪ the
-  primary key**; `covers?` requires the probe's fields ⊆ `loaded_fields`
-  (otherwise miss reason `:fields_insufficient`).
+- **Field coverage**: `Entry.loaded_fields` is `Coverage.needed_fields/2` —
+  the query's select (or all attributes when unselected) **∪ the primary
+  key ∪ attribute refs from the filter, sort, distinct/distinct_sort, and
+  every loaded calculation's expression**. Selecting a field is not the
+  only way a query touches it: a filter or a locally-evaluated calc can
+  demand a field the select never named, and coverage must hold it or the
+  hit re-evaluates over rows that physically lack it. `covers?` requires
+  the probe's `needed_fields` ⊆ `loaded_fields` (otherwise miss reason
+  `:fields_insufficient`); the remainder planner applies the same gate
+  per-entry before a filter's region may contribute to the covered split,
+  so a legitimately narrow entry can't poison a wider query's remainder
+  read. On a fingerprint match (same normalised filter, re-recorded with a
+  wider `needed_fields`), the existing entry's `loaded_fields` is unioned
+  in place rather than left stale — otherwise a narrow-then-wide workload
+  on the same filter would miss on `:fields_insufficient` forever. A
+  narrow-select **source** read is itself widened to `needed_fields` before
+  fetching (whenever it may backfill) so the physical rows it backfills
+  actually contain what gets recorded; the caller's result is unaffected
+  since Ash's own action pipeline narrows the final struct to the query's
+  actual select.
 - **Upsert writes**: no reliable before-image → the whole tenant partition of
   the ledger is dropped (see the write path above).
 - **Unsupported predicate in incoming filter**: solver short-circuits to "not
@@ -281,9 +310,19 @@ erDiagram
 - `fingerprint` is the dedupe key: the canonicalised normalised form
   **including literal values**. It is distinct from the PII-safe *telemetry*
   fingerprint, which type-tags values away.
-- `loaded_fields` is a `MapSet` of attribute atoms — the query's select **∪
-  the primary key**; a ledger entry only covers an incoming query whose fields
-  are a subset of `loaded_fields`.
+- `loaded_fields` is a `MapSet` of attribute atoms — `Coverage.needed_fields/2`
+  (select ∪ PK ∪ filter/sort/distinct/calculation refs, see
+  [Field coverage](#edge-cases)); a ledger entry only covers an incoming
+  query whose `needed_fields` are a subset of `loaded_fields`.
+- The table also holds one **invalidation-epoch** object per tenant
+  partition, under the 3-tuple key `{:__mdl_meta__, :epoch, tenant}` —
+  structurally distinct from every entry key (a 2-tuple), so it can never
+  collide with an entry or match `entries/2`'s select pattern, for any
+  tenant value. Its value is `{counter, incarnation}`: `counter` increments
+  on every invalidating write to that partition; `incarnation` is a fresh
+  `System.unique_integer/1` draw seeded on first access (and again after a
+  `TableOwner` restart or `reset/1`), so a stale pre-restart snapshot can
+  never numerically collide with a post-restart one.
 
 ## Key Decisions
 
@@ -344,6 +383,18 @@ at-least-once duplication risk; cross-node coherence broken. **ADR**:
 - **No cache stampede prevention.** Concurrent cold-reads for the same filter
   all hit the primary; documented v2 work.
 - **Only 2-layer configurations exercised in CI.** N>2 works in theory.
+- **Reconcile-on-record is not a safety net for invalidation sources that
+  never call `on_write/4`.** A ghost row under a surviving, still-valid
+  entry's coverage is served by plain covered reads regardless of anything
+  recording does — nothing local can distinguish untold staleness under
+  valid coverage from freshness. `forget!/3` (or LRU eviction) is the only
+  healer for that case; see [Physical eviction and reconcile-on-record]
+  (#physical-eviction-and-reconcile-on-record).
+- **The invalidation epoch is resource+tenant-scoped, not per-entry or
+  per-row.** A write anywhere in a partition can abort an unrelated read's
+  backfill under sustained concurrency (a hit-rate cost, never staleness);
+  narrower epochs are the sound escape hatch if this proves painful in
+  practice, not skipping the bump on zero-drop writes.
 
 ## Implementation Notes
 
@@ -431,19 +482,105 @@ and `test/ash_multi_datalayer/coverage/implication_property_test.exs`
 
 ### Row-aware invalidation
 
-`Coverage.Invalidation.on_write/5(resource, tenant, op, row_before, row_after)`
-iterates ledger entries, evaluates each entry's raw `Ash.Filter` against
-`row_before` and `row_after`, and drops matching entries. The evaluator is
-`Ash.Filter.Runtime.do_match/6` — the full signature is
-`do_match(record, expr, parent \\ nil, resource \\ nil,
-unknown_on_unknown_refs? \\ false, conflicting_upsert_values \\ nil)` — called
-with `unknown_on_unknown_refs?: true` so unresolvable refs yield `:unknown` →
-conservative drop. Note Ash keeps records on **truthy** results, not
-`== true`; invalidation mirrors that.
+`Coverage.Invalidation.on_write/4(resource, tenant, row_before, row_after)`
+bumps the partition's invalidation epoch (unconditionally, even when nothing
+below matches — see "Invalidation epoch" below), evicts the physical row from
+every earlier read layer by the before-image's primary key (see "Physical
+eviction" below), then iterates ledger entries, evaluates each entry's raw
+`Ash.Filter` against `row_before` and `row_after`, and drops matching
+entries. The evaluator is `Ash.Filter.Runtime.do_match/6` — the full
+signature is `do_match(record, expr, parent \\ nil, resource \\ nil,
+unknown_on_unknown_refs? \\ false, conflicting_upsert_values \\ nil)` —
+called with `unknown_on_unknown_refs?: true` so unresolvable refs yield
+`:unknown` → conservative drop. Note Ash keeps records on **truthy** results,
+not `== true`; invalidation mirrors that.
 
 **Verified by**: `test/ash_multi_datalayer/coverage/invalidation_test.exs`
 (unit), `test/ash_multi_datalayer/coverage/invalidation_property_test.exs`
 (StreamData cross-check).
+
+### Invalidation epoch
+
+A read-miss backfill racing a concurrent write can record stale rows *and*
+stale coverage: reader fetches pre-write rows, stalls before backfilling,
+writer commits (invalidation finds nothing to drop yet — the ledger has no
+entry for that filter), then the reader's backfill lands the stale rows over
+the writer's fresh propagation and records coverage claiming them. A
+per-resource+tenant **invalidation epoch** closes this:
+
+1. `Coverage.epoch/2` snapshots `epoch0 = {counter, incarnation}` at the top
+   of every read that may backfill — before `coverage_split`/the cache-side
+   fetch on the remainder path, before the source fetch everywhere else —
+   seeding it lazily on first access.
+2. `maybe_backfill` re-checks the epoch (`Coverage.epoch_moved?/3`) before
+   upserting; a move skips backfill AND recording entirely. The fetched rows
+   are still returned to the caller — the read result itself isn't stale,
+   only unsafe to cache.
+3. `Coverage.record/5` is **check-insert-verify**, not a pre-check alone: it
+   re-checks the epoch immediately before inserting (or widening an existing
+   entry on a fingerprint match), and again immediately after — a move on the
+   second check drops the entry it just wrote. A pre-check alone leaves a
+   window where the writer's bump-then-drop-scan lands between the reader's
+   check and its ETS insert; the post-insert verify closes it (either the
+   reader's own verify drops it, or the insert preceded the writer's
+   drop-scan and the writer's own scan removes it).
+4. `Invalidation.on_write/4` / `drop_all/2` bump the epoch **unconditionally,
+   including zero-drop writes** — skipping the bump when nothing matched is
+   exactly the original race (a zero-drop write racing an in-flight miss).
+
+Cost: under sustained write concurrency, a meaningful fraction of read-miss
+backfills abort recording — the correct trade (freshness over hit rate), not
+a free one; `test/integration/concurrency_stress_test.exs` measures it.
+
+**Verified by**: `test/integration/read_write_race_test.exs` (deterministic,
+via a blocking wrapper layer that parks `run_query` *after* delegating — never
+sleeps), `test/integration/concurrency_stress_test.exs`.
+
+### Physical eviction and reconcile-on-record
+
+Dropping a ledger entry only removes the *metadata claim* that a filter is
+covered — the physical row can still sit in an earlier layer's storage, and a
+later, differently-shaped read can legitimately record coverage over a region
+that still contains it, resurrecting a destroyed or pre-update row as if it
+were live. Two mechanisms uphold "covered region ⇒ physical rows are fresh":
+
+- **Evict-on-write** (`Invalidation.on_write/4`, closes the class at the
+  API): after bumping the epoch, evicts the row from every earlier read layer
+  by the **before-image's** primary key — for both destroys and updates
+  (an update's before-PK row is the stale one even when the update changed
+  the PK itself; the after-PK row heals via ordinary upsert/refetch). Runs
+  regardless of the kill switch (it's part of invalidation, not
+  propagation). Eviction failure is swallowed (logged + telemetried;
+  `[:ash_multi_datalayer, :ledger, :evict_failed]`) — never fails the write.
+- **Reconcile-on-record** (defense in depth, inside `maybe_backfill`, between
+  the physical backfill and `Coverage.record`'s insert): deletes cached rows
+  matching the just-recorded region whose primary key is **not** in the
+  source-fetched set — scoped to the whole of Q on the full-miss path, to
+  `Q ∧ ¬C` (threaded from the remainder planner, never recomputed) on the
+  remainder path, since the covered half's rows are legitimately absent from
+  a `¬C`-only fetch. This is what heals the residue of a failed eviction, and
+  any stale row under a region being freshly re-recorded — it is **not** a
+  safety net for an invalidation source that never calls `on_write/4` at all
+  (a ghost under a *surviving*, still-valid entry's coverage is served by
+  plain covered reads regardless of anything recording does).
+
+For consumers that discover staleness out-of-band (a lost realtime
+notification, typically surfaced as a `NotFound` from a direct call),
+`AshMultiDatalayer.forget!/3` promotes the same evict-on-write mechanism as a
+public pull-based healer: `forget!(resource, pk_or_record, opts)` is
+`Invalidation.on_write(resource, tenant, record, nil)` in a wrapper. A
+PK-only call builds the probe with every non-PK attribute set to
+`%Ash.NotLoaded{}`, never `nil` — under Ash's nil semantics a nil-built probe
+would let an entry that actually covers the row's true state survive the
+drop (`age > 5` over `age: nil` is a non-match), evicting the physical row
+while its stale coverage lives on. `AshMultiDatalayer.not_found?/1` is the
+matching predicate over `Ash.Error.Query.NotFound`, including wrapped/list
+error shapes.
+
+**Verified by**: `test/integration/external_invalidation_test.exs` (the C4
+ghost shapes — same-filter, unrelated-remainder, update-moves-region),
+`test/integration/reconcile_scope_test.exs` (the documented scope boundary),
+`test/integration/forget_test.exs`.
 
 ### Kill-switch
 
@@ -488,12 +625,21 @@ sequenceDiagram
 
   MDL->>Cov: covers?
   Cov-->>MDL: :none
-  MDL->>L2: run_query
+  MDL->>Cov: epoch(resource, tenant) [epoch0]
+  MDL->>L2: run_query (select widened to needed_fields)
   L2-->>MDL: [rows]
-  MDL->>L1: upsert([rows])
-  MDL->>Cov: record(filter, loaded_fields, tenant)
-  MDL->>Tel: [:read, :miss, reason: :no_coverage_entry]
-  MDL-->>Caller: [rows]
+  Cov->>Cov: epoch_moved?(epoch0)
+  alt moved
+    MDL->>Tel: [:read, :backfill_aborted, reason: :epoch_moved]
+    MDL-->>Caller: [rows] (not cached)
+  else unmoved
+    MDL->>L1: upsert([rows], fields: needed_fields)
+    MDL->>L1: reconcile scan (delete rows ∉ fetched PKs)
+    MDL->>Cov: record(filter, loaded_fields, tenant, epoch0, probe)
+    Cov->>Cov: epoch_moved?(epoch0) [post-insert verify]
+    MDL->>Tel: [:read, :miss, reason: :no_coverage_entry]
+    MDL-->>Caller: [rows]
+  end
 ```
 
 ### Write with row-aware invalidation
@@ -508,8 +654,11 @@ sequenceDiagram
 
   MDL->>L2: create/update/destroy
   L2-->>MDL: {:ok, record}
-  MDL->>Inv: on_write(resource, tenant, op, row_before, row_after)
-  Inv-->>MDL: :ok
+  MDL->>Inv: on_write(resource, tenant, row_before, row_after)
+  Inv->>Inv: bump_epoch(resource, tenant) [unconditional]
+  Inv->>L1: destroy(before-image PK) [physical eviction, C4]
+  Inv->>Inv: drop matching ledger entries
+  Inv-->>MDL: dropped_count
   MDL->>L1: upsert of the RETURNED record (best-effort)
   L1-->>MDL: :ok
   MDL->>Tel: [:write, :applied], dropped_count
