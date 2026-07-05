@@ -3,7 +3,8 @@
 **Metadata:**
 
 - Type: plan
-- Status: in progress — **Phase 1 complete** (pure-refactor gate met)
+- Status: in progress — **Phases 1 & 2 complete** (pure-refactor gate + walking
+  skeleton, all 11 spike items green)
 - Created: 2026-07-05
 - Topic: orchestrator-extraction, local-outbox, local-first
 - Depends on: [critical-bugs fix plan](./critical-bugs-fix-plan.md) (**hard
@@ -409,6 +410,13 @@ ash_oban trigger, running on Oban Lite over a temp SQLite file, proving:
 **Gate**: each numbered item is a passing test or a written answer in this
 plan's addendum section; any "no" answer gets a recorded fallback before Phase 3
 starts.
+
+**Status: complete.** All 11 items are passing tests in
+`test/integration/oban_sqlite_skeleton_test.exs` (18 tests green), answers
+recorded in the Addendum. Two findings feed Phase 3/4: (a) ash_oban's `on_error`
+does not fire for generic-action triggers → the flush action self-parks at its
+last attempt; (b) `scheduler_cron false` generates no scheduler → sweeping is
+MDL-owned (the four-enqueue-site design stands, unchanged).
 
 ### Phase 3 — sync-state resource extension + igniter generators
 
@@ -906,7 +914,72 @@ ecto_sqlite3 0.24.1, exqlite 0.38.0 (transitive), decimal 3.1.1 (unchanged,
 patched). All `optional: true` in the library's `mix.exs`; the library's own
 test env compiles them. `mix compile` clean.
 
-_(items 1–11: in progress — walking skeleton being built)_
+**Status: complete.** The skeleton lands as
+`test/integration/oban_sqlite_skeleton_test.exs` (18 tests, all green; tagged
+`:integration` + `:oban_sqlite`) plus test support under
+`test/support/oban_sqlite/` (`SkeletonRepo`, `SkeletonRepoB`, `SkeletonDomain`,
+`Entry`, `Migrations`, `Probe`). Per-item answers:
+
+1. **ash_sqlite resource + codegen** — CRUD round-trips through Ash on
+   ecto*sqlite3 (ash 3.29.3 compat);
+   `AshSqlite.MigrationGenerator.generate(..., dry_run: true)` emits
+   `create table "amd_skeleton_entries"` DDL. \_Tests: item 1.*
+2. **Trigger + immediate path** — `AshOban.run_trigger/2` enqueues,
+   `drain_queue` runs the generic `:flush` action. The scheduler `where`/sort is
+   exercised via the **MDL sweep** pattern (read the keyset-paginated `:pending`
+   action, insert a flush job per row) — see finding below. _Tests: item 2._
+3. **Park paths** — a rejection parks immediately and completes the job (no
+   retries). **Finding: `on_error` does NOT fire for generic-action (`:action`)
+   triggers** — ash*oban wires `handle_error` (the on_error/park path) only into
+   the update/destroy `perform`, not the `:action` one (`define_schedulers.ex`:
+   generic `perform` rescue at ~1072 just `check_for_oban_return |> reraise`;
+   `handle_error(job, …)` is called only at the update/destroy rescues
+   ~841/1207/1324). **Consequence for Phase 4:** the flush action must
+   **self-park at its last attempt** (`job.attempt >= job.max_attempts`) rather
+   than declaring `on_error :park`. \_Tests: item 3.*
+4. **`job.conf.name`** — readable in the generic action body via
+   `context[:ash_oban][:job].conf.name`; generic triggers do no read first, so
+   the action is the worker's first Ash call (the sound establishment point).
+   _Tests: items 4, 11._
+5. **Snooze** — `raise AshOban.Errors.SnoozeJob, snooze_for: n` →
+   `check_for_oban_return` → `{:snooze, n}` → Lite reschedules the job **and
+   bumps `max_attempts`** (zero retry-budget burn — asserted on the `oban_jobs`
+   row). _Tests: item 5._
+6. **Unique jobs on Lite** — the generated worker carries
+   `unique: [period: :infinity, states: incomplete]`; two identical
+   `Worker.new/1` inserts dedup to one row (same job id) under the MDL-owned
+   insertion path. _Tests: items 6, 11._
+7. **Keyset streaming** — the trigger's `read_action` **must** support keyset
+   pagination (compile-time error otherwise). Keyset pagination over the
+   `:pending` read works on ash*sqlite (`page: [limit: n]` → `Ash.page!(*,
+   :next)` in seq order). There is no ash*sqlite capability flag; keyset rides
+   Ash-level pagination. \_Tests: item 7.*
+8. **Co-commit** — `AshSqlite.DataLayer.can?(_, :transact) == false`, yet a raw
+   `SkeletonRepo.transaction/1` wrapping two Ash writes commits/rolls back
+   atomically. Co-commit predicate = **same Ecto repo + raw
+   `Repo.transaction/1`**, never the Ash capability. **Test strategy settled:**
+   temp-file SQLite + `async: false` + truncate-between-tests (NOT
+   `Ecto.Adapters.SQL.Sandbox` — the ecto*sqlite3 adapter documents Sandbox as
+   single-writer-awkward, and a temp file lets a drained worker in another
+   process see the same DB). \_Tests: item 8.*
+9. **`seq`** — `integer_primary_key :seq` → SQLite `INTEGER PRIMARY KEY`
+   (rowid), monotonically autoincrementing; `ref` (uuid) demoted to a secondary
+   identity. Decision: **integer PK/rowid** (no `max(seq)+1` needed). _Tests:
+   item 9._
+10. **Payload encoding** — a record snapshot stored in a `:map` attribute
+    round-trips through SQLite JSON intact for JSON-safe values (strings,
+    numbers, bools, nested maps/lists). Decision: **dumped-map in a `:map`
+    attribute** (string keys); embedded/`:term` not needed for v1. _Tests:
+    item 10._
+11. **Named instance (the R1 mechanism)** — proven with **two isolated SQLite
+    files** (A = resource+Oban, B = its own `oban_jobs`), the real two-profile
+    shape. MDL-owned insertion (`Oban.insert(instance, Worker.new(args))`) into
+    B runs under B and the action sees `job.conf.name == B`;
+    `AshOban.run_trigger` lands in the **default** instance only and B never
+    sees it (the R1 gap that forces MDL to own its four insertion sites); unique
+    dedup holds under B. `scheduler_cron false` → **no scheduler module is
+    generated** (so `AshOban.schedule/2` is unavailable — confirming sweeping
+    must be MDL-owned). _Tests: item 11._
 
 ## Links
 
