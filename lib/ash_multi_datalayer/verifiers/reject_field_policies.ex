@@ -16,6 +16,17 @@ defmodule AshMultiDatalayer.Verifiers.RejectFieldPolicies do
 
   @impl true
   def verify(dsl_state) do
+    # The cache-served-rows-bypass-redaction hazard is ProvenCoverage's
+    # fall-through path; other strategies read differently (a LocalOutbox local
+    # layer is a complete authoritative copy). No-op when not ProvenCoverage.
+    if Info.proven_coverage?(dsl_state) do
+      verify_field_policies(dsl_state)
+    else
+      :ok
+    end
+  end
+
+  defp verify_field_policies(dsl_state) do
     if field_policies?(dsl_state) and length(Info.read_order(dsl_state)) > 1 do
       {:error,
        Spark.Error.DslError.exception(

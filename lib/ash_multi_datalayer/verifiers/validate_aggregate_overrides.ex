@@ -6,10 +6,21 @@ defmodule AshMultiDatalayer.Verifiers.ValidateAggregateOverrides do
   """
   use Spark.Dsl.Verifier
 
+  alias AshMultiDatalayer.DataLayer.Info
   alias Spark.Dsl.Verifier
 
   @impl true
   def verify(dsl_state) do
+    # `sql_join_aggregate_overrides` is a ProvenCoverage concept; no-op for any
+    # other strategy (orchestrator-behaviour ADR).
+    if Info.proven_coverage?(dsl_state) do
+      verify_overrides(dsl_state)
+    else
+      :ok
+    end
+  end
+
+  defp verify_overrides(dsl_state) do
     overrides =
       Verifier.get_option(dsl_state, [:multi_data_layer], :sql_join_aggregate_overrides, [])
 

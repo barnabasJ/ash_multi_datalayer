@@ -16,6 +16,17 @@ defmodule AshMultiDatalayer.Verifiers.ValidateSolverSupportedPredicates do
 
   @impl true
   def verify(dsl_state) do
+    # The subsumption solver is ProvenCoverage's coverage machinery; a
+    # base_filter outside its predicate set costs hit rate only for that
+    # strategy. No-op for any other orchestrator.
+    if Info.proven_coverage?(dsl_state) do
+      verify_predicates(dsl_state)
+    else
+      :ok
+    end
+  end
+
+  defp verify_predicates(dsl_state) do
     with true <- length(Info.read_order(dsl_state)) > 1,
          base_filter when not is_nil(base_filter) <-
            Ash.Resource.Info.base_filter(dsl_state),
