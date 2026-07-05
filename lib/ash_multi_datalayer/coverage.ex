@@ -79,6 +79,113 @@ defmodule AshMultiDatalayer.Coverage do
     ArgumentError -> :ok
   end
 
+  @typedoc """
+  An invalidation epoch snapshot: `{counter, incarnation}`. Within one
+  incarnation any bump strictly moves the counter; across a `TableOwner`
+  restart or `reset/1` the incarnation is a fresh, never-repeating raw
+  `System.unique_integer/1` draw, so a stale pre-restart pair can never
+  compare equal to a post-restart one regardless of counter arithmetic (see
+  `epoch/2`'s moduledoc for why a single seeded counter is not sufficient).
+  """
+  @type epoch :: {counter :: non_neg_integer(), incarnation :: integer()}
+
+  # A 3-tuple key is structurally incapable of matching `entries/2`'s
+  # `{{tenant, :_}, :"$1"}` select pattern (a 2-tuple key) or colliding with a
+  # real entry key, for any tenant value including a tenant literally named
+  # `:__mdl_meta__` (review-1 W-P6 / review-2 F11).
+  defp epoch_key(tenant), do: {:__mdl_meta__, :epoch, tenant_key(tenant)}
+
+  @doc """
+  Snapshots the current invalidation epoch for a resource+tenant, seeding it
+  on first access.
+
+  Must be taken **at the top of the read**, before any layer is consulted —
+  a bump landing after this snapshot but before the source fetch completes
+  is legitimately absorbed (the fetch sees the write); any bump after that
+  is what `epoch_moved?/3` catches later. Returns the epoch pair, or
+  `:unavailable` when the ledger itself is unavailable (`ensure_table`
+  failed) or was reset/restarted between the seed attempt and the read-back
+  — both degrade callers to skip caching, never crash. `:unavailable` is
+  itself a valid `epoch0` to pass through the read path: `epoch_moved?/3`
+  always treats it as moved.
+
+  The seed-or-read is a **non-atomic two-step sequence, deliberately**: no
+  single ETS op both inserts-if-absent and returns the resulting value. It
+  is sound because the source fetch that follows this snapshot runs AFTER
+  it — a bump landing between the two steps belongs to a write the
+  about-to-run fetch will see, so the snapshot legitimately absorbs it.
+  """
+  @spec epoch(module(), term()) :: epoch() | :unavailable
+  def epoch(resource, tenant) do
+    case ensure_table(resource) do
+      :ok ->
+        table = TableOwner.table_name(resource)
+        key = epoch_key(tenant)
+        :ets.insert_new(table, {key, 0, System.unique_integer([:positive])})
+
+        case :ets.lookup(table, key) do
+          [{^key, counter, incarnation}] -> {counter, incarnation}
+          [] -> :unavailable
+        end
+
+      {:error, :unavailable} ->
+        :unavailable
+    end
+  rescue
+    ArgumentError -> :unavailable
+  end
+
+  @doc """
+  Whether the invalidation epoch has moved since `epoch0` was snapshotted —
+  a plain, non-seeding lookup (a seeding check could never observe absence,
+  making the "table gone" case dead code). Both absence and a pair mismatch
+  count as moved: either means a write raced this read, or the table itself
+  was reset/restarted underneath it — both must abort caching. An
+  `epoch0` of `:unavailable` (the snapshot itself failed) is always moved.
+
+  Any lookup failure (a dying/mid-restart table) is treated as moved too —
+  conservative, never a crash on the caller's read path.
+  """
+  @spec epoch_moved?(module(), term(), epoch() | :unavailable) :: boolean()
+  def epoch_moved?(_resource, _tenant, :unavailable), do: true
+
+  def epoch_moved?(resource, tenant, epoch0) do
+    table = TableOwner.table_name(resource)
+    key = epoch_key(tenant)
+
+    case :ets.lookup(table, key) do
+      [{^key, counter, incarnation}] -> {counter, incarnation} != epoch0
+      [] -> true
+    end
+  rescue
+    ArgumentError -> true
+  end
+
+  @doc """
+  Bumps the invalidation epoch for a resource+tenant — called by
+  `AshMultiDatalayer.Coverage.Invalidation` before dropping any entries, for
+  every write **including zero-drop ones** (skipping the bump when nothing
+  matched reopens the exact race this mechanism exists to close).
+
+  Uses the identical default tuple shape as `epoch/2`'s seed, so a
+  never-read-then-written partition seeds a value no stale snapshot could
+  equal. Bump failure is **non-fatal**: `on_write`/`drop_all` run after the
+  authoritative write has already committed (or inside an external
+  notification handler), so a raise from a dying/mid-restart table must
+  never crash either — it is rescued and treated as "the epoch moved (or
+  the table is gone), best effort". This is conservative, not stale: a
+  table restart already erased the coverage the bump was protecting.
+  """
+  @spec bump_epoch(module(), term()) :: :ok
+  def bump_epoch(resource, tenant) do
+    table = TableOwner.table_name(resource)
+    key = epoch_key(tenant)
+    :ets.update_counter(table, key, {2, 1}, {key, 0, System.unique_integer([:positive])})
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
   @doc """
   Whether a query's row coverage may be recorded (and its rows backfilled).
 
@@ -201,63 +308,102 @@ defmodule AshMultiDatalayer.Coverage do
 
   @doc """
   Records that the query's filter has been fully materialised into the
-  earlier read layers. Deduplicates by the normalised filter form; opaque
-  and non-recordable queries are never recorded.
+  earlier read layers, guarded by the invalidation epoch snapshotted at
+  `epoch0` (see `AshMultiDatalayer.Coverage.Invalidation` and the read-path
+  protocol in the fix plan). `normalised` is the pre-normalised probe from
+  the shared gate (`recordable_gate/2`) — the caller has already checked
+  `recordable?`/opaqueness; `record/5` does not re-check them.
 
-  On a fingerprint match against an existing entry, the query's
-  `needed_fields` are UNIONED into that entry's `loaded_fields` instead of
-  being a no-op (review-2 F2): sound because the backfill that just ran
-  wrote those fields into the physical rows, and it is what stops a
-  narrow-then-wide same-filter workload from being a permanent miss loop
-  (the wide read would otherwise re-miss on `:fields_insufficient` forever,
-  since the entry keeps claiming the narrow set). Two readers concurrently
-  widening the same entry with disjoint field sets is a last-writer-wins
-  union on the metadata only — the physical rows are unaffected
-  (`force_change_attributes` never strips fields) — so the only consequence
-  is a transient unnecessary miss that a later read re-widens, never
-  staleness; not worth a CAS loop (pass-3 S1).
+  **Check-insert-verify** (not a pre-check alone): the epoch is checked
+  before touching the ledger; on a fresh entry, it is inserted and then the
+  epoch is re-read — if it moved, the just-inserted entry is dropped by id.
+  Pre-checks alone leave one window open: a writer's bump-then-drop-scan
+  landing between this function's own pre-check and its ETS insert would
+  let a pre-write entry survive (the drop-scan ran before the entry
+  existed). The post-insert verify closes it: if the bump happened before
+  our verify, we drop our own entry; if the bump happens strictly after our
+  verify, our insert necessarily preceded the writer's drop-scan (`on_write`
+  enumerates entries AFTER bumping), so the writer's own scan removes it.
+  The fingerprint-widening path (below) follows the identical discipline —
+  a widened claim from a racing/aborted backfill is a field-level version of
+  the same hazard, so a mid-widen epoch move drops the entry entirely
+  (conservative: the write may or may not have actually touched this
+  region, but distinguishing the two would need per-row tracking this
+  mechanism doesn't have — a transient hit-rate cost, never staleness).
 
-  Returns `:ok` when a (new or pre-existing) entry covers the filter,
-  `:skipped` otherwise.
+  On a fingerprint match against an existing entry (post epoch-check), the
+  query's `needed_fields` are UNIONED into that entry's `loaded_fields`
+  instead of being a no-op (review-2 F2): sound because the backfill that
+  just ran wrote those fields into the physical rows, and it is what stops
+  a narrow-then-wide same-filter workload from being a permanent miss loop.
+  Two readers concurrently widening the same entry with disjoint field sets
+  is a last-writer-wins union on the metadata only — the physical rows are
+  unaffected (`force_change_attributes` never strips fields) — so absent an
+  epoch move the only consequence is a transient unnecessary miss a later
+  read re-widens, never staleness; not worth a CAS loop (pass-3 S1).
+
+  Returns `:ok` when a (new or pre-existing) entry now covers the filter,
+  `:skipped` when the ledger cap was full, or `:epoch_moved` when a
+  concurrent write aborted the recording.
   """
-  @spec record(module(), term(), Query.t() | struct()) :: :ok | :skipped
-  def record(resource, tenant, %Query{} = query) do
-    normalised = Normaliser.normalise(query.filter, resource)
+  @spec record(
+          module(),
+          term(),
+          Query.t() | struct(),
+          epoch() | :unavailable,
+          Normaliser.Normalised.t()
+        ) ::
+          :ok | :skipped | :epoch_moved
+  def record(resource, tenant, %Query{} = query, epoch0, %Normaliser.Normalised{} = normalised) do
+    case ensure_table(resource) do
+      :ok -> do_record(resource, tenant, query, epoch0, normalised)
+      {:error, :unavailable} -> :skipped
+    end
+  end
 
-    with true <- recordable?(query),
-         false <- normalised.opaque?,
-         :ok <- ensure_table(resource) do
+  defp do_record(resource, tenant, query, epoch0, normalised) do
+    if epoch_moved?(resource, tenant, epoch0) do
+      :epoch_moved
+    else
       fingerprint = dedupe_key(normalised)
       needed = needed_fields(query, resource)
 
       case Enum.find(entries(resource, tenant), &(&1.fingerprint == fingerprint)) do
         %Entry{} = existing ->
-          widen_loaded_fields(resource, tenant, existing, needed)
-          :ok
+          widen_loaded_fields(resource, tenant, existing, needed, epoch0)
 
         nil ->
-          if enforce_cap(resource, tenant) == :full do
-            :skipped
-          else
-            entry = %Entry{
-              id: make_ref(),
-              tenant: tenant_key(tenant),
-              filter: query.filter,
-              normalised: normalised,
-              fingerprint: fingerprint,
-              loaded_fields: needed,
-              loaded_at: System.monotonic_time()
-            }
-
-            insert(resource, tenant, entry)
-          end
+          insert_new_entry(resource, tenant, query, normalised, fingerprint, needed, epoch0)
       end
-    else
-      _ -> :skipped
     end
   end
 
-  defp widen_loaded_fields(resource, tenant, %Entry{loaded_fields: loaded} = existing, needed) do
+  defp insert_new_entry(resource, tenant, query, normalised, fingerprint, needed, epoch0) do
+    if enforce_cap(resource, tenant) == :full do
+      :skipped
+    else
+      entry = %Entry{
+        id: make_ref(),
+        tenant: tenant_key(tenant),
+        filter: query.filter,
+        normalised: normalised,
+        fingerprint: fingerprint,
+        loaded_fields: needed,
+        loaded_at: System.monotonic_time()
+      }
+
+      insert(resource, tenant, entry)
+      verify_or_drop(resource, tenant, entry.id, epoch0)
+    end
+  end
+
+  defp widen_loaded_fields(
+         resource,
+         tenant,
+         %Entry{loaded_fields: loaded} = existing,
+         needed,
+         epoch0
+       ) do
     if MapSet.subset?(needed, loaded) do
       :ok
     else
@@ -270,10 +416,19 @@ defmodule AshMultiDatalayer.Coverage do
         {2, %Entry{existing | loaded_fields: widened}}
       )
 
-      :ok
+      verify_or_drop(resource, tenant, existing.id, epoch0)
     end
   rescue
-    ArgumentError -> :ok
+    ArgumentError -> :skipped
+  end
+
+  defp verify_or_drop(resource, tenant, entry_id, epoch0) do
+    if epoch_moved?(resource, tenant, epoch0) do
+      drop(resource, tenant, entry_id)
+      :epoch_moved
+    else
+      :ok
+    end
   end
 
   # Hard per-resource-per-tenant cap: at the cap, evict the least-recently

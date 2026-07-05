@@ -511,13 +511,28 @@ defmodule AshMultiDatalayer.DataLayer do
         Delegate.run_on_layer(query, hd(read_layers))
 
       not is_nil(query.lock) ->
-        source_read(query, resource, read_layers, :not_cacheable)
+        source_read(
+          query,
+          resource,
+          read_layers,
+          :not_cacheable,
+          Coverage.epoch(resource, query.tenant)
+        )
 
       sort_references_uncomputable_calc?(query, resource, hd(read_layers)) ->
         # Sorting on a calc the cache layer can't evaluate (a source-only
         # `remote(...)`) must not be served from the cache — the coverage/merge
         # paths would hand the sort to the cache layer, which can't order by it.
-        source_read(query, resource, read_layers, :calc_sort_source_only)
+        # `Coverage.epoch/2` calls `ensure_table` itself, so this branch (which
+        # never passes through `covers?`) still warms from a cold start
+        # (pass-6 F2).
+        source_read(
+          query,
+          resource,
+          read_layers,
+          :calc_sort_source_only,
+          Coverage.epoch(resource, query.tenant)
+        )
 
       related_aggregates?(query, resource) ->
         # Relationship aggregates: a same-repo SQL one is joined in the database
@@ -528,7 +543,13 @@ defmodule AshMultiDatalayer.DataLayer do
       computed? and not AshMultiDatalayer.ValueMerge.mergeable?(resource) ->
         # Computed values are the source of truth's job; without a mergeable
         # primary key the whole query falls through.
-        source_read(query, resource, read_layers, :not_cacheable)
+        source_read(
+          query,
+          resource,
+          read_layers,
+          :not_cacheable,
+          Coverage.epoch(resource, query.tenant)
+        )
 
       computed? ->
         merged_read(query, resource, read_layers)
@@ -751,12 +772,19 @@ defmodule AshMultiDatalayer.DataLayer do
         end
 
       {:miss, reason} ->
+        # Snapshotted BEFORE `remainder_plan`'s `coverage_split` (and
+        # therefore before the cache-side region fetch too, on the
+        # remainder branch) — a snapshot taken only before the source fetch
+        # would be blind to a writer landing between the two halves
+        # (review-1 C-P1 / review-2 F5).
+        epoch0 = Coverage.epoch(resource, query.tenant)
+
         case remainder_plan(query, resource) do
           {:ok, coverage, complement} ->
-            remainder_read(query, resource, read_layers, coverage, complement)
+            remainder_read(query, resource, read_layers, coverage, complement, epoch0)
 
           :none ->
-            source_read(query, resource, read_layers, reason)
+            source_read(query, resource, read_layers, reason, epoch0)
         end
     end
   end
@@ -792,7 +820,7 @@ defmodule AshMultiDatalayer.DataLayer do
       match?([_], Ash.Resource.Info.primary_key(resource))
   end
 
-  defp remainder_read(%Query{} = query, resource, read_layers, coverage, complement) do
+  defp remainder_read(%Query{} = query, resource, read_layers, coverage, complement, epoch0) do
     started = System.monotonic_time()
     cache_layer = hd(read_layers)
     source_layer = List.last(read_layers)
@@ -808,9 +836,14 @@ defmodule AshMultiDatalayer.DataLayer do
         fetched: length(source_rows)
       })
 
-      # The source rows are the previously-uncovered remainder; backfilling the
-      # full result and recording Q makes the next identical read a full hit.
-      maybe_backfill(query, resource, read_layers, merged)
+      # Backfill/reconcile/record consume the SOURCE-HALF rows only, never
+      # `merged` (review-2 F4): cache-half rows are already physically
+      # present (recording Q needs nothing re-upserted for them), and
+      # re-upserting them risks clobbering good values with
+      # `%Ash.NotLoaded{}` sentinels behind a select-honouring cache layer,
+      # or laundering a stale/ghost cache-half row into "freshly backfilled"
+      # state. The caller still gets `merged`.
+      maybe_backfill(query, resource, read_layers, source_rows, epoch0, complement: complement)
       AshMultiDatalayer.Divergence.maybe_sample(query, resource, merged)
       {:ok, merged}
     end
@@ -872,14 +905,23 @@ defmodule AshMultiDatalayer.DataLayer do
         :stale_cache ->
           # A cached row has no source counterpart (out-of-band delete):
           # abandon the merge, serve everything fresh.
-          source_read(query, resource, read_layers, :stale_cache)
+          source_read(
+            query,
+            resource,
+            read_layers,
+            :stale_cache,
+            Coverage.epoch(resource, query.tenant)
+          )
 
         {:error, error} ->
           {:error, error}
       end
     else
-      {:miss, reason} -> source_read(query, resource, read_layers, reason)
-      {:error, error} -> {:error, error}
+      {:miss, reason} ->
+        source_read(query, resource, read_layers, reason, Coverage.epoch(resource, query.tenant))
+
+      {:error, error} ->
+        {:error, error}
     end
   end
 
@@ -888,14 +930,14 @@ defmodule AshMultiDatalayer.DataLayer do
   defp computed_tag(%Query{calculations: [], aggregates: []}), do: :local
   defp computed_tag(%Query{}), do: :merged
 
-  defp source_read(%Query{} = query, resource, read_layers, miss_reason) do
+  defp source_read(%Query{} = query, resource, read_layers, miss_reason, epoch0) do
     started = System.monotonic_time()
     earlier_layers = Enum.drop(read_layers, -1)
     fetch_query = widen_select_for_backfill(query, resource, earlier_layers)
 
     with {:ok, records} <- Delegate.run_on_layer(fetch_query, List.last(read_layers)) do
       emit_read(:miss, query, resource, started, %{reason: miss_reason})
-      maybe_backfill(query, resource, read_layers, records)
+      maybe_backfill(query, resource, read_layers, records, epoch0)
       {:ok, records}
     end
   end
@@ -918,35 +960,163 @@ defmodule AshMultiDatalayer.DataLayer do
     end
   end
 
-  defp maybe_backfill(%Query{} = query, resource, read_layers, records) do
+  # `source_rows` are the previously-uncovered rows just fetched from the
+  # source of truth (the whole result on the full-miss path; the source
+  # HALF only on the remainder path — never `merged`, see `remainder_read`).
+  # `epoch0` is the invalidation-epoch snapshot taken at the top of the read
+  # (before `source_rows` was even fetched), guarding both the physical
+  # backfill and the coverage record against a write that raced this read.
+  # `opts[:complement]` is the remainder planner's `¬C` region (`nil` on the
+  # full-miss path, where reconcile scans the whole of Q instead).
+  defp maybe_backfill(%Query{} = query, resource, read_layers, source_rows, epoch0, opts \\ []) do
     earlier_layers = Enum.drop(read_layers, -1)
+    {gate, probe} = Coverage.recordable_gate(query, resource)
 
-    if Coverage.recordable?(query) and earlier_layers != [] do
-      started = System.monotonic_time()
+    cond do
+      not (gate and earlier_layers != []) ->
+        :ok
 
-      opts = [
-        tenant: query.tenant,
-        domain: query.domain,
-        fields: Enum.to_list(Coverage.needed_fields(query, resource))
-      ]
+      Coverage.epoch_moved?(resource, query.tenant, epoch0) ->
+        # A write raced this read before the backfill even started: the
+        # fetched rows are still returned to the caller (the read result
+        # itself is not stale), but caching them would be unsafe.
+        Telemetry.read(:backfill_aborted, resource, query, %{}, %{reason: :epoch_moved})
+        :ok
 
-      case Backfill.upsert_records(earlier_layers, resource, records, opts) do
-        :ok ->
-          Coverage.record(resource, query.tenant, query)
-          emit_read(:backfill, query, resource, started, %{records: length(records)})
+      true ->
+        started = System.monotonic_time()
 
-        {:error, layer, reason} ->
-          # No coverage is recorded for a partial backfill — the next read
-          # falls through again. A cache-population failure is never an
-          # operation failure.
-          Logger.warning(
-            "ash_multi_datalayer backfill into #{inspect(layer)} failed for " <>
-              "#{inspect(resource)}: #{inspect(reason)}"
-          )
-      end
+        backfill_opts = [
+          tenant: query.tenant,
+          domain: query.domain,
+          fields: Enum.to_list(Coverage.needed_fields(query, resource))
+        ]
+
+        case Backfill.upsert_records(earlier_layers, resource, source_rows, backfill_opts) do
+          :ok ->
+            reconcile(query, resource, earlier_layers, source_rows, opts[:complement])
+
+            case Coverage.record(resource, query.tenant, query, epoch0, probe) do
+              :ok ->
+                emit_read(:backfill, query, resource, started, %{records: length(source_rows)})
+
+              :skipped ->
+                :ok
+
+              :epoch_moved ->
+                Telemetry.read(:backfill_aborted, resource, query, %{}, %{
+                  reason: :epoch_moved_at_record
+                })
+            end
+
+          {:error, layer, reason} ->
+            # No coverage is recorded for a partial backfill — the next read
+            # falls through again. A cache-population failure is never an
+            # operation failure.
+            Logger.warning(
+              "ash_multi_datalayer backfill into #{inspect(layer)} failed for " <>
+                "#{inspect(resource)}: #{inspect(reason)}"
+            )
+        end
     end
 
     :ok
+  end
+
+  # Reconcile-on-record (C4, defense in depth): deletes cached rows matching
+  # the region just (re-)recorded whose primary key is NOT in the
+  # source-fetched set — the residue of a failed physical eviction
+  # (`Coverage.Invalidation`'s evict-on-write), and any stale/ghost row
+  # under a region being freshly re-recorded. Scan region and fetch region
+  # are the SAME object as the just-completed source fetch (pass-8 F1): the
+  # entry set is not stable across this window (concurrent records, LRU
+  # evictions, other readers' verify-drops), so recomputing the region here
+  # instead of reusing `complement` could scan a region wider than what was
+  # actually fetched and delete fresh, legitimate rows outside it.
+  #
+  # On the full-miss path (`complement: nil`), the scan is the whole of Q.
+  # On the remainder path, only `Q ∧ ¬C` is scanned — the covered half needs
+  # no reconcile (every surviving entry's region provably excludes a stale
+  # physical row: any row whose before-image matched it would have dropped
+  # it via `Invalidation.on_write`) and must not be reconciled against the
+  # source-fetched set, since covered-half rows are legitimately absent
+  # from a `¬C`-only fetch.
+  defp reconcile(_query, _resource, _earlier_layers, _source_rows, :empty), do: :ok
+
+  defp reconcile(%Query{} = query, resource, earlier_layers, source_rows, complement) do
+    [pk] = Ash.Resource.Info.primary_key(resource)
+    fetched_pks = MapSet.new(source_rows, &Map.fetch!(&1, pk))
+
+    reconcile_query = %Query{
+      resource: resource,
+      domain: query.domain,
+      tenant: query.tenant,
+      context: query.context,
+      filter: reconcile_filter(query, complement),
+      select: Ash.Resource.Info.primary_key(resource),
+      sort: [],
+      calculations: [],
+      aggregates: [],
+      distinct: [],
+      distinct_sort: nil,
+      limit: nil,
+      offset: 0,
+      lock: nil
+    }
+
+    Enum.each(
+      earlier_layers,
+      &reconcile_layer(&1, reconcile_query, resource, query, pk, fetched_pks)
+    )
+  end
+
+  defp reconcile_filter(%Query{filter: filter}, nil), do: filter
+  defp reconcile_filter(%Query{filter: filter}, :universe), do: filter
+  defp reconcile_filter(%Query{filter: filter}, {:ok, region}), do: and_filter(filter, region)
+
+  defp reconcile_layer(layer, reconcile_query, resource, original_query, pk, fetched_pks) do
+    case Delegate.run_on_layer(reconcile_query, layer) do
+      {:ok, cached_rows} ->
+        cached_rows
+        |> Enum.reject(&MapSet.member?(fetched_pks, Map.fetch!(&1, pk)))
+        |> Enum.each(&evict_ghost(layer, resource, &1, original_query))
+
+      {:error, reason} ->
+        # Neither failing the read (it already succeeded) nor skipping the
+        # record (the backfill was fine) is correct — proceed to `record`,
+        # which has its own epoch guard; any ghost a skipped reconcile
+        # leaves is unservable until the next re-covering read reconciles
+        # again (defense in depth degrades gracefully by construction).
+        Logger.warning(
+          "ash_multi_datalayer reconcile scan on #{inspect(layer)} failed for " <>
+            "#{inspect(resource)}: #{inspect(reason)}"
+        )
+
+        Telemetry.read(:backfill_aborted, resource, original_query, %{}, %{
+          reason: :reconcile_scan_failed
+        })
+    end
+  end
+
+  defp evict_ghost(layer, resource, ghost_row, query) do
+    case Backfill.destroy_record(layer, resource, ghost_row,
+           tenant: query.tenant,
+           domain: query.domain
+         ) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "ash_multi_datalayer reconcile eviction on #{inspect(layer)} failed for " <>
+            "#{inspect(resource)}: #{inspect(reason)}"
+        )
+
+        Telemetry.ledger(:evict_failed, resource, query.tenant, %{}, %{
+          layer: layer,
+          reason: reason
+        })
+    end
   end
 
   defp emit_read(kind, query, resource, started, extra) do

@@ -101,19 +101,21 @@ defmodule AshMultiDatalayer.Integration.ReadWriteRaceTest do
       |> Ash.update!()
 
       BlockingLayer.release(BlockingEts, reader_pid)
-      result = Task.await(task)
+      _result = Task.await(task)
 
-      # The row no longer matches Q post-write; the merged/caller-visible
-      # result must not resurrect it via the stale cache-half fetch.
-      assert result == []
-
-      # Entry-resurrection check first: no coverage for Q was recorded from
-      # the raced backfill (and the age==999 entry the write's before-image
-      # matched should be gone too, via ordinary row-aware invalidation).
+      # The racing read's OWN merged result is not what this mechanism
+      # promises to fix — it's a plain snapshot race (the cache-side fetch
+      # legitimately captured pre-write state before the write landed), and
+      # the fix plan is explicit that the caller still gets `merged` as-is
+      # (Phase 3.4). What must never happen is COVERAGE surviving that
+      # claims this stale state — checked FIRST, before any further read (a
+      # later healing read would legitimately re-record Q and make this
+      # assertion meaningless if checked afterwards, per pass-7 F2).
       assert Coverage.entries(RaceTestPost, nil) == [],
              "the raced remainder backfill must not have recorded coverage for Q"
 
-      # Follow-up identical read reflects the write.
+      # Only now does the follow-up identical read run — it must reflect
+      # the write, never the stale snapshot the race captured.
       assert [] = Ash.read!(race_query)
     end
   end

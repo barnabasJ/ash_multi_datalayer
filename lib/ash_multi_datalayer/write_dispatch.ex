@@ -17,8 +17,11 @@ defmodule AshMultiDatalayer.WriteDispatch do
        does not fail the operation — step 2 already degraded it to a miss.
 
   Kill-switch engaged: only the authoritative write happens; invalidation
-  still runs (so re-enabling can't serve pre-switch coverage); propagation
-  is skipped.
+  still runs (so re-enabling can't serve pre-switch coverage) — **including
+  the physical eviction `Coverage.Invalidation.on_write/4` performs (C4)**,
+  which is part of invalidation and therefore never skippable either;
+  propagation (the upsert half of keeping earlier layers warm) is what's
+  skipped.
   """
 
   require Logger
