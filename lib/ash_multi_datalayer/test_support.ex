@@ -26,4 +26,16 @@ defmodule AshMultiDatalayer.TestSupport do
     KillSwitch.enable!(resource)
     :ok
   end
+
+  @doc """
+  The sanctioned test seam for `AshMultiDatalayer.Coverage.touch/3` (M1): a
+  test can drop an entry (as `AshMultiDatalayer.Coverage.Invalidation`
+  would) and then `touch_entry!/3` the stale struct to assert it does NOT
+  get resurrected — `Coverage.touch/3` fires inside `covers?` on every hit
+  with no deterministic way to interleave a drop between the select and the
+  touch, so this wraps the same production function as the test entry point
+  instead.
+  """
+  @spec touch_entry!(module(), term(), Coverage.Entry.t()) :: boolean()
+  def touch_entry!(resource, tenant, entry), do: Coverage.touch(resource, tenant, entry)
 end

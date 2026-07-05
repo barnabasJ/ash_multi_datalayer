@@ -582,8 +582,28 @@ defmodule AshMultiDatalayer.Coverage do
     |> :erlang.phash2()
   end
 
-  defp touch(resource, tenant, entry) do
-    insert(resource, tenant, %Entry{entry | loaded_at: System.monotonic_time()})
+  @doc false
+  # LRU-touch on a coverage hit. `:ets.update_element/3` returns `false`
+  # instead of recreating the key when it's gone — an unconditional `insert`
+  # would resurrect an entry `Invalidation.on_write/4` just dropped for a
+  # concurrent write whose cache-propagation then failed (M1): `covers?`
+  # snapshots entries, a writer drops one and its propagation fails (exactly
+  # the case invalidate-before-propagate is designed for), then the reader's
+  # touch would recreate it, serving pre-write rows indefinitely and
+  # defeating the invalidation-before-propagation ordering from the inside.
+  # `@doc false` and public only so `AshMultiDatalayer.TestSupport.touch_entry!/3`
+  # has a deterministic seam to test this race's fix without a scheduler.
+  @spec touch(module(), term(), Entry.t()) :: boolean()
+  def touch(resource, tenant, entry) do
+    table = TableOwner.table_name(resource)
+
+    :ets.update_element(
+      table,
+      {tenant_key(tenant), entry.id},
+      {2, %Entry{entry | loaded_at: System.monotonic_time()}}
+    )
+  rescue
+    ArgumentError -> false
   end
 
   @doc "Current ledger size for a resource+tenant (for telemetry)."
