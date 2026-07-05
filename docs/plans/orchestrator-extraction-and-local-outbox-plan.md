@@ -3,8 +3,9 @@
 **Metadata:**
 
 - Type: plan
-- Status: in progress — **Phases 1 & 2 complete** (pure-refactor gate + walking
-  skeleton, all 11 spike items green)
+- Status: in progress — **Phases 1, 2 & 3 complete** (pure-refactor gate;
+  walking skeleton, all 11 spike items green; OutboxEntry extension + igniter
+  generators)
 - Created: 2026-07-05
 - Topic: orchestrator-extraction, local-outbox, local-first
 - Depends on: [critical-bugs fix plan](./critical-bugs-fix-plan.md) (**hard
@@ -494,6 +495,27 @@ formatter entries, supervisor children, migrations, or resources); the generated
 repo boots against a temp SQLite file with Oban Lite migrated and a job
 round-trips; the generated Oban queue/cron config matches the generated
 trigger + MDL sweep worker.
+
+**Status: complete.** The `AshMultiDatalayer.Sync.OutboxEntry` extension
+(`lib/ash_multi_datalayer/sync/`) injects the full contract via one transformer
+(attributes, actions incl. a generic `:flush` delegating to
+`LocalOutbox.Flush.run/2`, the ash_oban `:flush` trigger with explicit worker
+module names, `scheduler_cron false`, no `on_error` — both Phase 2 findings) and
+auto-adds AshOban via `add_extensions`; a `VerifyDataLayer` verifier rejects
+non-SQL layers; `Sync.Info` exposes the config; `Sync.Enqueue` is the one MDL
+enqueue helper (four Phase 4 call sites) that builds against the generated
+worker and inserts into the configured instance. Generators
+`ash_multi_datalayer.install`
+
+- `ash_multi_datalayer.gen.outbox` land under `lib/mix/tasks/` (igniter, guarded
+  by `Code.ensure_loaded?(Igniter)`). Tests:
+  `test/ash_multi_datalayer/sync/outbox_entry_test.exs` (13 — injection, every
+  structural action, flush chain-head check, verifier) and
+  `test/mix/tasks/gen_outbox_test.exs` (7 — files created, Oban Lite config,
+  idempotency, notice). The generated-resource _runtime_ (repo boots, Oban Lite
+  job round-trips) is covered by the extension test + the Phase 2 skeleton,
+  which use a resource of the exact generated shape. `Flush.run/2` ships the
+  chain-head check; its target push + full triage is Phase 4.
 
 ### Phase 4 — `Orchestrator.LocalOutbox`
 
