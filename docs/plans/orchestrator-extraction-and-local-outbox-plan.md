@@ -3,10 +3,14 @@
 **Metadata:**
 
 - Type: plan
-- Status: in progress — **Phases 1–4 complete; 4a part 1 done** (extraction;
-  skeleton; OutboxEntry extension + generators; LocalOutbox strategy core, RFC
-  v2.1 update-trigger flush; per-action `read_from:` / `write_through:`).
-  Remaining: 4a capability derivation + alias removal; Phases 5–8.
+- Status: in progress — **Phases 1–4a complete** (extraction; skeleton;
+  OutboxEntry extension + generators; LocalOutbox strategy core, RFC v2.1
+  update-trigger flush; per-action `read_from:` / `write_through:` + capability
+  derivation). **Phase 5 deferred** by its own benchmark gate — raw-ETS ledger
+  retained as default (validated by the browser demo); ledger-as-resource port
+  is opt-in future work (plan-sanctioned, review D3). Alias removal deferred
+  (collaborator-edited files). Remaining: Phase 6 (ash_remote fold-in), Phase 7
+  (flagship offline-conflict demo, in progress), Phase 8 (docs).
 - Created: 2026-07-05
 - Topic: orchestrator-extraction, local-outbox, local-first
 - Depends on: [critical-bugs fix plan](./critical-bugs-fix-plan.md) (**hard
