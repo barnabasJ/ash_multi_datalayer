@@ -1,49 +1,118 @@
 defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
   @moduledoc """
-  The body of the outbox `:flush` action (library code, so fixes ship in the
-  library rather than in generated user files). Invoked by the ash_oban-generated
-  worker with the entry's `primary_key`.
+  The body of the outbox `:flush` **update** action (library code, so fixes ship
+  in the library, not in generated user files). ash_oban's update-trigger machinery
+  owns the framing — `worker_read_action :pending` re-checks relevance, retries are
+  Oban's, `on_error :park` parks on transient exhaustion. This change is only the
+  irreducible per-flush logic:
 
-  **Phase 3 scope:** the per-PK **chain-head check** on `seq` — the correctness
-  spine of ordered draining. If a lower-`seq` pending/parked entry exists for the
-  same `(resource, record_pk, target)`, this entry is not the chain head and the
-  job completes without flushing (the head's completion re-triggers).
+    1. **Chain position** on `seq` — per-PK FIFO enforced in data (Oban gives no
+       execution order). Behind a pending ancestor → snooze (racing); behind a
+       parked ancestor → hold (the chain is blocked until that head is resolved).
+    2. **Push** the entry to `target` via `Backfill`, honouring `conflict_detection`.
+    3. **Mark** the entry `:synced` and kick the next pending chain entry
+       (post-commit); a semantic **rejection**/**conflict** parks in-action, a
+       transient error raises (Oban retries → `on_error` parks).
 
-  **Phase 4 completes it:** the actual push to `target` via `Backfill`, the
-  offline/transient/rejection/conflict triage (snooze / retry / self-park —
-  ash_oban's `on_error` does not fire for generic-action triggers), success
-  deletion + chain-continuation kick, and `conflict_detection`.
+  Deliberately **no** offline/transport error class: a target may be ETS/Mnesia
+  with no network at all. A failed push retries then parks; the application pauses
+  the queue (`pause_sync/1`) when it detects it cannot sync.
   """
-  use Ash.Resource.Actions.Implementation
+  use Ash.Resource.Change
 
   require Ash.Query
 
+  alias AshMultiDatalayer.Orchestrator.LocalOutbox
+  alias AshMultiDatalayer.Orchestrator.LocalOutbox.{Snapshot, Target}
+  alias AshMultiDatalayer.Sync.Enqueue
+
   @impl true
-  def run(input, _opts, context) do
-    outbox = input.resource
-    domain = context.domain
-    seq = pk_seq(input.arguments.primary_key)
+  def change(changeset, _opts, _context) do
+    Ash.Changeset.before_action(changeset, &flush/1)
+  end
 
-    case Ash.get(outbox, %{seq: seq}, domain: domain, authorize?: false) do
-      {:error, _} ->
-        # The entry is gone (already flushed/discarded). Nothing to do.
-        {:ok, :entry_missing}
+  defp flush(changeset) do
+    outbox = changeset.resource
+    domain = Ash.Resource.Info.domain(outbox)
+    entry = changeset.data
+    host = String.to_existing_atom(entry.resource)
 
-      {:ok, entry} ->
-        if chain_head?(outbox, domain, entry) do
-          # Phase 4: push `entry.payload`/destroy to `entry.target` via Backfill,
-          # triage the result, delete on success + kick the next chain entry.
-          {:ok, {:chain_head, entry.seq}}
-        else
-          {:ok, :not_chain_head}
-        end
+    case chain_position(outbox, domain, entry) do
+      :head ->
+        apply_result(changeset, outbox, domain, host, entry, push(host, entry))
+
+      :racing ->
+        # A pending ancestor is still ahead; try again shortly (zero budget burn).
+        raise AshOban.Errors.SnoozeJob, snooze_for: reorder_snooze()
+
+      :blocked ->
+        # A parked ancestor blocks the chain; hold without change. Resolving that
+        # head re-kicks this chain.
+        changeset
+    end
+  end
+
+  # --- chain position ----------------------------------------------------
+
+  @doc "`:head` | `:racing` (pending ancestor) | `:blocked` (parked ancestor)."
+  def chain_position(outbox, domain, entry) do
+    ahead =
+      outbox
+      |> Ash.Query.for_read(
+        :for_record,
+        %{resource: entry.resource, record_pk: entry.record_pk, target: entry.target},
+        domain: domain,
+        authorize?: false
+      )
+      |> Ash.Query.filter(seq < ^entry.seq and state != :synced)
+      |> Ash.read!(authorize?: false)
+
+    cond do
+      Enum.any?(ahead, &(&1.state == :parked)) -> :blocked
+      ahead != [] -> :racing
+      true -> :head
     end
   end
 
   @doc false
-  # No pending/parked entry with the same (resource, record_pk, target) and a
-  # lower seq — i.e. this entry is the head of its per-PK chain.
-  def chain_head?(outbox, domain, entry) do
+  def chain_head?(outbox, domain, entry), do: chain_position(outbox, domain, entry) == :head
+
+  # --- apply the flush result to the changeset --------------------------
+
+  defp apply_result(changeset, outbox, domain, host, _entry, :ok) do
+    changeset
+    |> Ash.Changeset.force_change_attribute(:state, :synced)
+    |> Ash.Changeset.after_action(fn _cs, synced ->
+      kick_next(outbox, domain, host, synced)
+      {:ok, synced}
+    end)
+  end
+
+  defp apply_result(changeset, _outbox, _domain, _host, _entry, {:conflict, remote}) do
+    park(changeset, :conflict, %{}, remote)
+  end
+
+  defp apply_result(changeset, _outbox, _domain, _host, entry, {:error, error}) do
+    case classify(error) do
+      :rejected ->
+        park(changeset, :rejected, error_map(error), nil)
+
+      :transient ->
+        # Retry via Oban backoff; `on_error :park` fires on exhaustion.
+        raise "LocalOutbox flush transient failure for #{entry.resource}: #{inspect(error)}"
+    end
+  end
+
+  defp park(changeset, error_class, last_error, remote_snapshot) do
+    changeset
+    |> Ash.Changeset.force_change_attribute(:state, :parked)
+    |> Ash.Changeset.force_change_attribute(:error_class, error_class)
+    |> Ash.Changeset.force_change_attribute(:last_error, last_error)
+    |> Ash.Changeset.force_change_attribute(:remote_snapshot, remote_snapshot)
+    |> Ash.Changeset.force_change_attribute(:parked_at, DateTime.utc_now())
+  end
+
+  defp kick_next(outbox, domain, _host, entry) do
     outbox
     |> Ash.Query.for_read(
       :for_record,
@@ -51,11 +120,85 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
       domain: domain,
       authorize?: false
     )
-    |> Ash.Query.filter(seq < ^entry.seq)
+    |> Ash.Query.filter(state == :pending)
+    |> Ash.Query.sort(seq: :asc)
     |> Ash.Query.limit(1)
     |> Ash.read!(authorize?: false)
-    |> Enum.empty?()
+    |> case do
+      [next | _] -> Enqueue.flush(outbox, next)
+      [] -> :ok
+    end
   end
 
-  defp pk_seq(pk) when is_map(pk), do: pk["seq"] || pk[:seq]
+  # --- push to the target -----------------------------------------------
+
+  @doc false
+  def push(host, %{op: :destroy} = entry) do
+    with :ok <- check_stale(host, entry) do
+      normalize(Target.destroy(host, entry.target, Target.record_from_entry(host, entry)))
+    end
+  end
+
+  def push(host, entry) do
+    with :ok <- check_stale(host, entry) do
+      normalize(Target.upsert(host, entry.target, Target.record_from_entry(host, entry)))
+    end
+  end
+
+  defp check_stale(host, entry) do
+    case LocalOutbox.conflict_detection(host) do
+      :off ->
+        :ok
+
+      {:stale_check, field} when entry.op in [:update, :destroy] ->
+        stale_check(host, entry, field)
+
+      {:stale_check, _field} ->
+        :ok
+    end
+  end
+
+  defp stale_check(host, entry, field) do
+    case Target.read_pk(host, entry.target, entry.record_pk) do
+      {:ok, nil} ->
+        :ok
+
+      {:ok, remote} ->
+        expected = entry.base_image && entry.base_image[to_string(field)]
+        actual = dump_field(host, field, Map.get(remote, field))
+        if expected == actual, do: :ok, else: {:conflict, Snapshot.dump(host, remote)}
+
+      {:error, error} ->
+        {:error, error}
+    end
+  end
+
+  defp dump_field(host, field, value) do
+    attribute = Ash.Resource.Info.attribute(host, field)
+    {:ok, dumped} = Ash.Type.dump_to_embedded(attribute.type, value, attribute.constraints)
+    dumped
+  end
+
+  defp normalize(:ok), do: :ok
+  defp normalize({:ok, _record}), do: :ok
+  defp normalize({:error, error}), do: {:error, error}
+
+  # --- error classification (semantic rejection vs transient) -----------
+
+  @doc false
+  # No offline class (targets can be networkless). Only two classes: a semantic
+  # rejection the replica will never accept (park now), and everything else
+  # (transient — retry, then park on exhaustion).
+  def classify({:rejected, _}), do: :rejected
+  def classify({:transient, _}), do: :transient
+  def classify(%Ash.Error.Invalid{}), do: :rejected
+  def classify(%{class: :invalid}), do: :rejected
+  def classify(_error), do: :transient
+
+  defp error_map({_tag, reason}), do: %{"reason" => inspect(reason)}
+  defp error_map(error), do: %{"reason" => inspect(error)}
+
+  defp reorder_snooze do
+    Application.get_env(:ash_multi_datalayer, :outbox_reorder_snooze_seconds, 1)
+  end
 end

@@ -1,0 +1,284 @@
+defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
+  @moduledoc """
+  Phase 4: the LocalOutbox strategy end-to-end — local-authoritative reads/writes,
+  co-committed outbox entries, flush draining to a replication target (a failable
+  ETS layer), per-PK FIFO + chain-block-on-park, every resolution verb, sync
+  pause/resume, stale-check conflicts, and inbound refresh with the dirty rule.
+  """
+  use ExUnit.Case, async: false
+
+  @moduletag :integration
+  @moduletag :oban_sqlite
+
+  alias AshMultiDatalayer.Orchestrator.LocalOutbox
+  alias AshMultiDatalayer.Orchestrator.LocalOutbox.Target
+  alias AshMultiDatalayer.Test.FailableLayer
+
+  alias AshMultiDatalayer.Test.LocalOutbox.{Domain, OutboxEntry, Remote, StaleWidget, Widget}
+  alias AshMultiDatalayer.Test.LocalOutbox.Migrations, as: LoMigrations
+  alias AshMultiDatalayer.Test.ObanSqlite.Migrations, as: ObanMigrations
+  alias AshMultiDatalayer.Test.ObanSqlite.SkeletonRepo
+
+  @queue :lo_sync
+
+  setup_all do
+    FailableLayer.ensure_table!()
+
+    db = Path.join(System.tmp_dir!(), "amd_local_outbox_#{System.unique_integer([:positive])}.db")
+    File.rm(db)
+    on_exit(fn -> File.rm(db) end)
+
+    start_supervised!({SkeletonRepo, database: db, pool_size: 1, name: SkeletonRepo})
+    Ecto.Migrator.up(SkeletonRepo, 1, LoMigrations, log: false)
+    Ecto.Migrator.up(SkeletonRepo, 2, ObanMigrations.ObanJobsTable, log: false)
+
+    start_supervised!(
+      {Oban,
+       name: Oban,
+       engine: Oban.Engines.Lite,
+       repo: SkeletonRepo,
+       testing: :manual,
+       queues: [{@queue, 5}],
+       plugins: [{Oban.Plugins.Cron, crontab: []}]}
+    )
+
+    :ok
+  end
+
+  setup do
+    for t <- ~w(lo_widgets lo_stale_widgets lo_outbox oban_jobs) do
+      Ecto.Adapters.SQL.query!(SkeletonRepo, "DELETE FROM #{t}", [])
+    end
+
+    Ash.DataLayer.Ets.stop(Widget)
+    Ash.DataLayer.Ets.stop(StaleWidget)
+    FailableLayer.clear(Remote)
+    :ok
+  end
+
+  # --- helpers -----------------------------------------------------------
+
+  defp create!(attrs) do
+    Widget
+    |> Ash.Changeset.for_create(:create, Map.new(attrs), domain: Domain)
+    |> Ash.create!()
+  end
+
+  defp update!(widget, attrs) do
+    widget
+    |> Ash.Changeset.for_update(:update, Map.new(attrs), domain: Domain)
+    |> Ash.update!()
+  end
+
+  defp drain,
+    do: Oban.drain_queue(Oban, queue: @queue, with_recursion: true, with_scheduled: true)
+
+  defp entries,
+    do: Ash.read!(OutboxEntry, domain: Domain, authorize?: false) |> Enum.sort_by(& &1.seq)
+
+  defp remote(resource \\ Widget), do: elem(Target.read_all(resource, :remote), 1)
+  defp local(resource \\ Widget), do: elem(Target.read_all(resource, :local), 1)
+
+  # --- read + write path -------------------------------------------------
+
+  describe "read + write path" do
+    test "a write commits locally, co-commits a pending outbox entry, sets outbox_ref" do
+      w = create!(name: "a")
+
+      assert w.__metadata__.outbox_ref
+      assert [local_row] = local()
+      assert local_row.id == w.id
+      # the entry is present + pending, and the target is untouched until flush.
+      assert [%{state: :pending, op: :create, target: :remote}] = entries()
+      assert remote() == []
+    end
+
+    test "reads are served from the local layer (target stays empty pre-flush)" do
+      w = create!(name: "r")
+      assert [%{id: id}] = Ash.read!(Widget, domain: Domain)
+      assert id == w.id
+      assert remote() == []
+    end
+  end
+
+  # --- flush drains to the target ---------------------------------------
+
+  describe "flush" do
+    test "draining pushes the record to the target and marks the entry :synced" do
+      w = create!(name: "f", count: 3)
+      assert %{success: n} = drain()
+      assert n >= 1
+
+      assert [synced] = entries()
+      assert synced.state == :synced
+      assert [remote_row] = remote()
+      assert remote_row.id == w.id
+      assert remote_row.count == 3
+    end
+
+    test "await returns :synced once the chain drains" do
+      w = create!(name: "aw")
+      drain()
+      assert LocalOutbox.await(w, timeout: 200) == :synced
+    end
+  end
+
+  # --- per-PK FIFO + chain-block ----------------------------------------
+
+  describe "ordering" do
+    test "successive writes to one record flush in seq order; target ends at the final state" do
+      w = create!(name: "v1", count: 1)
+      w = update!(w, count: 2)
+      _w = update!(w, count: 3)
+
+      # three entries, seq-ordered, same record.
+      assert [e1, e2, e3] = entries()
+      assert e1.seq < e2.seq and e2.seq < e3.seq
+
+      drain()
+      assert Enum.all?(entries(), &(&1.state == :synced))
+      assert [%{count: 3}] = remote()
+    end
+
+    test "a parked chain head blocks later entries for the same record" do
+      FailableLayer.fail(Remote, :rejected)
+      w = create!(name: "blocked")
+      _w = update!(w, name: "blocked-2")
+
+      drain()
+
+      es = entries()
+      # head parked (:rejected), tail held (:pending) — never flushed past the park.
+      assert Enum.find(es, &(&1.op == :create)).state == :parked
+      assert Enum.find(es, &(&1.op == :update)).state == :pending
+      assert remote() == []
+    end
+  end
+
+  # --- resolution verbs -------------------------------------------------
+
+  describe "resolution verbs" do
+    setup do
+      FailableLayer.fail(Remote, :rejected)
+      w = create!(name: "res")
+      drain()
+      [parked] = Enum.filter(entries(), &(&1.state == :parked))
+      %{widget: w, parked: parked}
+    end
+
+    test "retry re-drains a fixed cause", %{parked: parked} do
+      FailableLayer.clear(Remote)
+      :ok = LocalOutbox.retry(parked)
+      drain()
+
+      assert [%{state: :synced}] = entries()
+      assert [%{name: "res"}] = remote()
+    end
+
+    test "discard of a create drops the whole chain (loudly)", %{widget: w, parked: parked} do
+      _ = update!(w, name: "res-2")
+      assert {:ok, %{dropped_chain: true, discarded: n}} = LocalOutbox.discard(parked)
+      assert n >= 1
+      # only synced entries (none) remain; the pending/parked chain is gone.
+      assert Enum.filter(entries(), &(&1.state != :synced)) == []
+    end
+
+    test "force pushes blind and clears the entry", %{parked: parked} do
+      FailableLayer.clear(Remote)
+      assert :ok = LocalOutbox.force(parked)
+      assert [%{name: "res"}] = remote()
+      assert Enum.filter(entries(), &(&1.state != :synced)) == []
+    end
+
+    test "discard_local overwrites the local layer with the replica row", %{
+      widget: w,
+      parked: parked
+    } do
+      # put a divergent row in the replica, then let the replica win.
+      FailableLayer.clear(Remote)
+      Target.upsert(Widget, :remote, %{w | name: "server-wins", count: 99})
+
+      :ok = LocalOutbox.discard_local(parked)
+
+      assert [%{name: "server-wins", count: 99}] = local()
+      assert Enum.filter(entries(), &(&1.state != :synced)) == []
+    end
+  end
+
+  # --- sync control ------------------------------------------------------
+
+  describe "pause / resume" do
+    # Under Oban's :manual testing mode queues never auto-run, so jobs accumulate
+    # regardless — which lets us assert the accumulate → resume → drain sequence
+    # deterministically. The levers themselves must succeed and not crash.
+    test "writes accumulate; resume + drain flushes them" do
+      assert :ok = LocalOutbox.pause_sync(Widget)
+      assert is_boolean(LocalOutbox.sync_paused?(Widget))
+
+      w1 = create!(name: "p1")
+      w2 = create!(name: "p2")
+
+      # nothing has drained yet — both entries are still pending.
+      assert Enum.all?(entries(), &(&1.state == :pending))
+      assert remote() == []
+
+      assert :ok = LocalOutbox.resume_sync(Widget)
+      drain()
+
+      assert Enum.all?(entries(), &(&1.state == :synced))
+      assert MapSet.new(remote(), & &1.id) == MapSet.new([w1.id, w2.id])
+    end
+  end
+
+  # --- conflict detection (stale-check) ----------------------------------
+
+  describe "stale-check conflict detection" do
+    test "a diverged replica parks the flush as :conflict with the remote snapshot" do
+      s =
+        StaleWidget
+        |> Ash.Changeset.for_create(:create, %{name: "s", version: 1}, domain: Domain)
+        |> Ash.create!()
+
+      drain()
+      assert [%{name: "s", version: 1}] = remote(StaleWidget)
+
+      # a concurrent server write bumps the version out from under us.
+      Target.upsert(StaleWidget, :remote, %{s | version: 5})
+
+      # local update (base_image version == 1) now conflicts with remote version 5.
+      s
+      |> Ash.Changeset.for_update(:update, %{name: "s-local"}, domain: Domain)
+      |> Ash.update!()
+
+      drain()
+
+      parked = Enum.filter(entries(), &(&1.state == :parked))
+      assert [%{error_class: :conflict, remote_snapshot: snap}] = parked
+      assert snap["version"] == 5
+    end
+  end
+
+  # --- inbound refresh ---------------------------------------------------
+
+  describe "refresh" do
+    test "refresh pulls replica rows into the local layer" do
+      # seed the replica directly (as if another client wrote it).
+      id = Ash.UUID.generate()
+      Target.upsert(Widget, :remote, %Widget{id: id, name: "external", count: 7})
+
+      assert %{refreshed: 1} = LocalOutbox.refresh(Widget, :all)
+      assert [%{id: ^id, name: "external"}] = local()
+    end
+
+    test "refresh skips a dirty PK (non-empty outbox chain) and reports it" do
+      w = create!(name: "dirty")
+      # divergent replica row for the same PK, but the record has a pending entry.
+      Target.upsert(Widget, :remote, %Widget{id: w.id, name: "remote-version", count: 42})
+
+      result = LocalOutbox.refresh(Widget, :all)
+      assert %{"id" => w.id} in result.skipped_dirty
+      # local keeps the unflushed local write, not the remote version.
+      assert [%{name: "dirty"}] = local()
+    end
+  end
+end

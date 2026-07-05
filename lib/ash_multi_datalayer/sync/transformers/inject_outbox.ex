@@ -70,7 +70,10 @@ defmodule AshMultiDatalayer.Sync.Transformers.InjectOutbox do
     |> attr(:attribute,
       name: :state,
       type: :atom,
-      constraints: [one_of: [:pending, :parked]],
+      # :synced — flush marks the entry processed (idiomatic ash_oban update
+      # trigger), so `where state == :pending` naturally skips done entries and
+      # the chain-head check only ever sees unflushed work.
+      constraints: [one_of: [:pending, :parked, :synced]],
       default: :pending,
       allow_nil?: false,
       public?: true
@@ -125,28 +128,32 @@ defmodule AshMultiDatalayer.Sync.Transformers.InjectOutbox do
     Transformer.add_entity(dsl, [:actions], action, type: :append)
   end
 
-  # The worker action — generic, so no atomic read precedes it; its body is
-  # `LocalOutbox.Flush.run/2` (library code, so fixes ship in the library).
+  # The worker action — an idiomatic ash_oban **update** trigger action. The
+  # trigger's `worker_read_action` re-checks the entry is still `:pending` (the
+  # "no longer relevant" skip), `on_error` parks on exhaustion, and Oban owns
+  # retries. Its body is the `LocalOutbox.Flush` change (library code, so fixes
+  # ship in the library): chain-head snooze → push to target → mark `:synced`
+  # (or park in-action on a rejection/conflict).
   defp add_flush_action(dsl) do
-    {:ok, arg} =
-      Transformer.build_entity(Ash.Resource.Dsl, [:actions, :action], :argument,
-        name: :primary_key,
-        type: :map,
-        allow_nil?: false
+    {:ok, change} =
+      Transformer.build_entity(Ash.Resource.Dsl, [:actions, :update], :change,
+        change: {@flush_runner, []}
       )
 
     {:ok, action} =
-      Transformer.build_entity(Ash.Resource.Dsl, [:actions], :action,
+      Transformer.build_entity(Ash.Resource.Dsl, [:actions], :update,
         name: :flush,
-        returns: :term,
-        arguments: [arg],
-        run: {@flush_runner, []}
+        accept: [],
+        require_atomic?: false,
+        changes: [change]
       )
 
     Transformer.add_entity(dsl, [:actions], action, type: :append)
   end
 
   # parked ← pending: records error_class/last_error/remote_snapshot/parked_at.
+  # Also the ash_oban `on_error` target: on transient exhaustion ash_oban runs
+  # `:park` with no input, so `error_class` defaults to `:transient_exhausted`.
   defp add_park_action(dsl) do
     {:ok, set_state} =
       Transformer.build_entity(Ash.Resource.Dsl, [:actions, :update], :change,
@@ -159,12 +166,17 @@ defmodule AshMultiDatalayer.Sync.Transformers.InjectOutbox do
           {Ash.Resource.Change.SetAttribute, attribute: :parked_at, value: &DateTime.utc_now/0}
       )
 
+    {:ok, default_error_class} =
+      Transformer.build_entity(Ash.Resource.Dsl, [:actions, :update], :change,
+        change: AshMultiDatalayer.Sync.Changes.DefaultTransientExhausted
+      )
+
     {:ok, action} =
       Transformer.build_entity(Ash.Resource.Dsl, [:actions], :update,
         name: :park,
         accept: [:error_class, :last_error, :remote_snapshot],
         require_atomic?: false,
-        changes: [set_state, set_parked_at]
+        changes: [set_state, set_parked_at, default_error_class]
       )
 
     Transformer.add_entity(dsl, [:actions], action, type: :append)
@@ -272,9 +284,10 @@ defmodule AshMultiDatalayer.Sync.Transformers.InjectOutbox do
         where: expr(state == :pending),
         sort: [seq: :asc],
         max_attempts: max_attempts,
-        # No `on_error`: ash_oban does not run it for generic-action triggers
-        # (Phase 2 finding) — the flush action self-parks. Sweeping is MDL-owned,
-        # so ash_oban's own scheduler is disabled.
+        # `:flush` is an update action, so `on_error` DOES run on transient
+        # exhaustion → parks the entry (`:transient_exhausted`). Sweeping is
+        # MDL-owned, so ash_oban's own scheduler is disabled.
+        on_error: :park,
         scheduler_cron: false,
         # Set explicitly (plan facts) so a trigger rename never dangles jobs and
         # MDL's enqueue helper has a stable worker module to build against.

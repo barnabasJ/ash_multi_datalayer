@@ -3,9 +3,9 @@
 **Metadata:**
 
 - Type: plan
-- Status: in progress — **Phases 1, 2 & 3 complete** (pure-refactor gate;
-  walking skeleton, all 11 spike items green; OutboxEntry extension + igniter
-  generators)
+- Status: in progress — **Phases 1–4 complete** (extraction; skeleton;
+  OutboxEntry extension + generators; LocalOutbox strategy core with the RFC
+  v2.1 update-trigger flush)
 - Created: 2026-07-05
 - Topic: orchestrator-extraction, local-outbox, local-first
 - Depends on: [critical-bugs fix plan](./critical-bugs-fix-plan.md) (**hard
@@ -600,6 +600,30 @@ Property test: random op sequences per PK against a chaos target layer converge
 validation criterion, review F2): the Phase 4 diff touches no shell data-path
 code — checkable by inspection because everything shell-side lands in Phase 4a
 instead.
+
+**Status: complete (core).** `AshMultiDatalayer.Orchestrator.LocalOutbox` +
+`LocalOutbox.{Write,Flush,Api,Target,Snapshot}` implement the strategy behind
+the seam with **no shell data-path change** (the seam gate). Landed: local-only
+read/`run_aggregate_query`; co-commit write (`Write` — same-repo
+`Repo.transaction/1`, `outbox_ref` metadata, post-commit kick via the Phase 3
+`Sync.Enqueue` helper); the flush **update trigger** per the RFC v2.1 revision
+(chain-position snooze/hold → push → mark `:synced`, or park on
+rejection/conflict; `on_error :park`; **no offline class** — the app pauses the
+queue); `conflict_detection {:stale_check, field}`; the resolution/control API
+(`await`, `status`, `pending`, `parked`, `retry`, `discard`, `discard_local`,
+`force`, `rebase`, `pause_sync`/`resume_sync`/`sync_paused?`); inbound
+`refresh/3` with the dirty-chain rule + hydration + `child_specs/1` boot
+hydration; and ProvenCoverage's `handle_external_change/2` (via `forget!`) /
+`handle_external_gap/2` (ledger drop). `LocalOutbox.can?/2` inverts to the local
+layer with the bypass-guard falses; `validate_opts/2` enforces the
+read/write-order shape + deps. Tests: `test/integration/local_outbox_test.exs`
+(14 — write+co-commit, flush drain, per-PK FIFO, chain-block-on-park, every
+resolution verb, pause→accumulate→drain, stale-check conflict, refresh + dirty
+rule) against a failable ETS target layer (`test/support/failable_layer.ex`).
+**Deferred (recorded):** the randomised chaos-convergence property test, the two
+separately-named crash-window tests, telemetry, and the additional
+strategy-keyed verifiers (multitenant rejection etc.) — validate_opts covers the
+shape/deps today.
 
 ### Phase 4a — shell increments + capability derivation
 

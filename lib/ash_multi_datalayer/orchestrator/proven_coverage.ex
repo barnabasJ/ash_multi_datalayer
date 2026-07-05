@@ -93,6 +93,37 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
   @impl AshMultiDatalayer.Orchestrator
   def child_specs(_resources), do: []
 
+  # --- inbound changes (notification bridge) ----------------------------
+
+  # A change that bypassed this node's write path invalidates the row's coverage
+  # so the next read fetches it fresh — `forget!/3` is exactly this (epoch bump +
+  # ledger drops + physical eviction via `Invalidation.on_write/4`). Conservative
+  # for updates (drop-then-refetch rather than in-place refresh), which is the
+  # sound reaction under at-most-once notification delivery (RFC open question 7).
+  @impl AshMultiDatalayer.Orchestrator
+  def handle_external_change(resource, notification) do
+    case notification.data do
+      nil ->
+        :ok
+
+      record ->
+        AshMultiDatalayer.forget!(resource, record, tenant: notification_tenant(notification))
+    end
+
+    :ok
+  end
+
+  # A notification gap (resubscribe/join-denied) carries no row-level info and
+  # notifications are at-most-once — drop the whole ledger for resource+tenant.
+  @impl AshMultiDatalayer.Orchestrator
+  def handle_external_gap(resource, tenant) do
+    AshMultiDatalayer.Coverage.Invalidation.drop_all(resource, tenant)
+    :ok
+  end
+
+  defp notification_tenant(%{changeset: %{tenant: tenant}}), do: tenant
+  defp notification_tenant(_), do: nil
+
   # --- writes ------------------------------------------------------------
 
   @impl AshMultiDatalayer.Orchestrator
