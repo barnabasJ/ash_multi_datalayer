@@ -100,6 +100,25 @@ defmodule AshMultiDatalayer.Coverage do
   end
 
   @doc """
+  The shared gate for anything that would replay the query against a cache
+  layer for bookkeeping purposes (the remainder planner's split, and the
+  read path's reconcile-on-record step): `recordable?(query) and not
+  normalised.opaque?`, normalising the filter once so callers that also need
+  the normalised probe (reconcile, `record`) don't re-normalise.
+
+  An opaque probe (a calc/aggregate ref, or any shape outside the supported
+  predicate set) must never split or be reconciled against the cache layer —
+  it cannot prove what a cache-side replay would return, so both the
+  remainder planner and reconcile treat it exactly like a full-hit miss:
+  fall through whole to the source (review-2 F3).
+  """
+  @spec recordable_gate(Query.t() | struct(), module()) :: {boolean(), Normaliser.Normalised.t()}
+  def recordable_gate(%Query{} = query, resource) do
+    normalised = Normaliser.normalise(query.filter, resource)
+    {recordable?(query) and not normalised.opaque?, normalised}
+  end
+
+  @doc """
   Looks for a recorded filter that provably covers the query.
 
   A hit requires an entry whose normalised filter is implied by the probe's
@@ -131,16 +150,24 @@ defmodule AshMultiDatalayer.Coverage do
   `{coverage_filter, complement_filter}` (see
   `AshMultiDatalayer.Coverage.Complement`), or `:none` when nothing is cached.
 
-  `C` is the union of every current ledger entry's normalised filter — a sound
-  under-approximation of what the earlier layers hold. Remainder reads serve
-  `Q ∧ C` from the cache and fetch only `Q ∧ ¬C` from the source.
+  `C` is the union of every current ledger entry's normalised filter **whose
+  `loaded_fields` are a superset of `needed`** — a per-entry field gate,
+  exactly like a full hit (plan rule 4 of the partial-serving-remainder-reads
+  plan). A legitimately-narrow entry must not contribute region to a wider
+  query's split even after `needed_fields` itself is widened (C1): entries
+  failing the gate contribute nothing to `C` and their rows are fetched from
+  the source via `¬C` instead — correct, merely less cached.
+
+  Remainder reads serve `Q ∧ C` from the cache and fetch only `Q ∧ ¬C` from
+  the source.
   """
-  @spec coverage_split(module(), term()) ::
+  @spec coverage_split(module(), term(), MapSet.t(atom())) ::
           {Complement.region(), Complement.region()} | :none
-  def coverage_split(resource, tenant) do
+  def coverage_split(resource, tenant, needed) do
     disjuncts =
       resource
       |> entries(tenant)
+      |> Enum.filter(&MapSet.subset?(needed, &1.loaded_fields))
       |> Enum.flat_map(& &1.normalised.disjuncts)
       |> Enum.uniq()
 
@@ -177,6 +204,19 @@ defmodule AshMultiDatalayer.Coverage do
   earlier read layers. Deduplicates by the normalised filter form; opaque
   and non-recordable queries are never recorded.
 
+  On a fingerprint match against an existing entry, the query's
+  `needed_fields` are UNIONED into that entry's `loaded_fields` instead of
+  being a no-op (review-2 F2): sound because the backfill that just ran
+  wrote those fields into the physical rows, and it is what stops a
+  narrow-then-wide same-filter workload from being a permanent miss loop
+  (the wide read would otherwise re-miss on `:fields_insufficient` forever,
+  since the entry keeps claiming the narrow set). Two readers concurrently
+  widening the same entry with disjoint field sets is a last-writer-wins
+  union on the metadata only — the physical rows are unaffected
+  (`force_change_attributes` never strips fields) — so the only consequence
+  is a transient unnecessary miss that a later read re-widens, never
+  staleness; not worth a CAS loop (pass-3 S1).
+
   Returns `:ok` when a (new or pre-existing) entry covers the filter,
   `:skipped` otherwise.
   """
@@ -188,30 +228,52 @@ defmodule AshMultiDatalayer.Coverage do
          false <- normalised.opaque?,
          :ok <- ensure_table(resource) do
       fingerprint = dedupe_key(normalised)
+      needed = needed_fields(query, resource)
 
-      cond do
-        Enum.any?(entries(resource, tenant), &(&1.fingerprint == fingerprint)) ->
+      case Enum.find(entries(resource, tenant), &(&1.fingerprint == fingerprint)) do
+        %Entry{} = existing ->
+          widen_loaded_fields(resource, tenant, existing, needed)
           :ok
 
-        enforce_cap(resource, tenant) == :full ->
-          :skipped
+        nil ->
+          if enforce_cap(resource, tenant) == :full do
+            :skipped
+          else
+            entry = %Entry{
+              id: make_ref(),
+              tenant: tenant_key(tenant),
+              filter: query.filter,
+              normalised: normalised,
+              fingerprint: fingerprint,
+              loaded_fields: needed,
+              loaded_at: System.monotonic_time()
+            }
 
-        true ->
-          entry = %Entry{
-            id: make_ref(),
-            tenant: tenant_key(tenant),
-            filter: query.filter,
-            normalised: normalised,
-            fingerprint: fingerprint,
-            loaded_fields: needed_fields(query, resource),
-            loaded_at: System.monotonic_time()
-          }
-
-          insert(resource, tenant, entry)
+            insert(resource, tenant, entry)
+          end
       end
     else
       _ -> :skipped
     end
+  end
+
+  defp widen_loaded_fields(resource, tenant, %Entry{loaded_fields: loaded} = existing, needed) do
+    if MapSet.subset?(needed, loaded) do
+      :ok
+    else
+      table = TableOwner.table_name(resource)
+      widened = MapSet.union(loaded, needed)
+
+      :ets.update_element(
+        table,
+        {tenant_key(tenant), existing.id},
+        {2, %Entry{existing | loaded_fields: widened}}
+      )
+
+      :ok
+    end
+  rescue
+    ArgumentError -> :ok
   end
 
   # Hard per-resource-per-tenant cap: at the cap, evict the least-recently
@@ -240,15 +302,114 @@ defmodule AshMultiDatalayer.Coverage do
     end
   end
 
-  @doc "The fields a query needs: its select (or all attributes) plus the PK."
+  @doc """
+  The fields a query touches: everything a cache layer must physically hold
+  to both backfill and re-evaluate the query — not just its select.
+
+  The union of:
+
+    * `query.select` (or all attributes when `nil`), plus the primary key;
+    * attribute refs from `query.filter`;
+    * `query.sort` fields (a calc-sort's expression refs, for the atoms
+      directly);
+    * `query.distinct` fields and `query.distinct_sort`'s refs;
+    * attribute refs from every `query.calculations` expression — this is
+      what makes a merged-read's cache-side probe (which carries the
+      locally-evaluated calcs) demand the fields those calcs read.
+
+  Only refs with an empty `relationship_path` that resolve to a real
+  resource attribute count — a calc/aggregate ref or a related-path ref is
+  not a field of this resource's own rows (and filters containing one are
+  opaque to the normaliser regardless).
+  """
   @spec needed_fields(Query.t() | struct(), module()) :: MapSet.t(atom())
-  def needed_fields(%Query{select: select}, resource) do
-    fields =
-      select ||
+  def needed_fields(%Query{} = query, resource) do
+    select_fields =
+      query.select ||
         Enum.map(Ash.Resource.Info.attributes(resource), & &1.name)
 
-    MapSet.union(MapSet.new(fields), MapSet.new(Ash.Resource.Info.primary_key(resource)))
+    MapSet.new(select_fields)
+    |> MapSet.union(MapSet.new(Ash.Resource.Info.primary_key(resource)))
+    |> MapSet.union(expression_attribute_refs(query.filter, resource))
+    |> MapSet.union(sort_fields(query.sort, resource))
+    |> MapSet.union(sort_fields(query.distinct_sort, resource))
+    |> MapSet.union(MapSet.new(query.distinct || []))
+    |> MapSet.union(calculation_fields(query.calculations, resource))
   end
+
+  # `query.sort`/`query.distinct_sort` entries are `{field, direction}` with
+  # `field` either a plain attribute atom, or `%Ash.Query.Calculation{}` for
+  # a calc-sort (only locally-evaluable calc sorts ever reach a cache layer —
+  # `sort_references_uncomputable_calc?` already guards the rest). A
+  # calc-sort's expression lives at `calc.opts[:expr]`, NOT as a second tuple
+  # element (that slot is the sort direction) — reading the wrong one would
+  # silently return no fields for a calc sort (the M5-class hole).
+  defp sort_fields(nil, _resource), do: MapSet.new()
+
+  defp sort_fields(sort, resource) do
+    Enum.reduce(sort, MapSet.new(), fn
+      {%Ash.Query.Calculation{opts: opts}, _direction}, acc when is_list(opts) ->
+        MapSet.union(acc, expression_attribute_refs(opts[:expr], resource))
+
+      {field, _direction}, acc when is_atom(field) ->
+        MapSet.put(acc, field)
+
+      field, acc when is_atom(field) ->
+        MapSet.put(acc, field)
+
+      _other, acc ->
+        acc
+    end)
+  end
+
+  # `query.calculations` entries are `{calculation, expression}` tuples —
+  # here `expression` (the second element) is already the hydrated
+  # expression tree, unlike a calc-sort's `opts[:expr]`.
+  defp calculation_fields(calculations, resource) do
+    Enum.reduce(calculations, MapSet.new(), fn {_calculation, expression}, acc ->
+      MapSet.union(acc, expression_attribute_refs(expression, resource))
+    end)
+  end
+
+  defp expression_attribute_refs(nil, _resource), do: MapSet.new()
+
+  defp expression_attribute_refs(expression, resource) do
+    expression
+    |> Ash.Filter.list_refs()
+    |> Enum.filter(&(&1.relationship_path == []))
+    |> Enum.flat_map(fn ref ->
+      case resource_attribute_name(ref.attribute, resource) do
+        {:ok, name} -> [name]
+        :error -> []
+      end
+    end)
+    |> MapSet.new()
+  end
+
+  # Mirrors `Normaliser.ref_attribute/2`'s attribute-vs-calc/aggregate
+  # distinction: a calc/aggregate struct also carries `:name`/`:type` keys,
+  # so it must be excluded BEFORE the generic `%{name: name}` match — treating
+  # one as a plain attribute would demand a field that doesn't exist on the
+  # resource's rows.
+  defp resource_attribute_name(%struct{}, _resource)
+       when struct in [
+              Ash.Query.Calculation,
+              Ash.Resource.Calculation,
+              Ash.Query.Aggregate,
+              Ash.Resource.Aggregate
+            ],
+       do: :error
+
+  defp resource_attribute_name(%{name: name}, _resource), do: {:ok, name}
+
+  defp resource_attribute_name(name, resource) when is_atom(name) do
+    case Ash.Resource.Info.attribute(resource, name) do
+      %{name: name} -> {:ok, name}
+      _ -> :error
+    end
+  end
+
+  defp resource_attribute_name(_other, _resource), do: :error
 
   # Dedupe key: the canonicalised normalised form INCLUDING literal values —
   # unlike the telemetry fingerprint, which type-tags values away. Two

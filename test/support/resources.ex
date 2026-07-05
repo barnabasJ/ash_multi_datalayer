@@ -3,6 +3,22 @@ defmodule AshMultiDatalayer.Test.CountingPostgres do
   use AshMultiDatalayer.Test.CountingLayer, wraps: AshPostgres.DataLayer
 end
 
+defmodule AshMultiDatalayer.Test.BlockingPostgres do
+  @moduledoc """
+  Counted Postgres source layer that can park `run_query` — for
+  deterministic read/write race tests (see `AshMultiDatalayer.Test.BlockingLayer`).
+  """
+  use AshMultiDatalayer.Test.BlockingLayer, wraps: AshMultiDatalayer.Test.CountingPostgres
+end
+
+defmodule AshMultiDatalayer.Test.BlockingEts do
+  @moduledoc """
+  Ets cache layer that can park `run_query` — for deterministic
+  cache-side-fetch race tests (see `AshMultiDatalayer.Test.BlockingLayer`).
+  """
+  use AshMultiDatalayer.Test.BlockingLayer, wraps: Ash.DataLayer.Ets
+end
+
 defmodule AshMultiDatalayer.Test.FailingEts do
   @moduledoc """
   Delegates to `Ash.DataLayer.Ets` but fails upserts/destroys on demand —
@@ -66,6 +82,7 @@ defmodule AshMultiDatalayer.Test.Resources do
       resource AshMultiDatalayer.Test.Resources.CappedPost
       resource AshMultiDatalayer.Test.Resources.SampledPost
       resource AshMultiDatalayer.Test.Resources.LocalEvalOffPost
+      resource AshMultiDatalayer.Test.Resources.RaceTestPost
       resource AshMultiDatalayer.Test.Resources.TestAuthor
       # Relationship-aggregate data-layer permutation matrix (parent × child):
       resource AshMultiDatalayer.Test.Resources.PgPost
@@ -564,6 +581,43 @@ defmodule AshMultiDatalayer.Test.Resources do
       calculate :adult?, :boolean, expr(age >= 18) do
         public? true
       end
+    end
+
+    actions do
+      defaults [:read, :destroy, create: :*, update: :*]
+    end
+  end
+
+  defmodule RaceTestPost do
+    @moduledoc """
+    Same shape as `TestPost` but its source layer can park mid-read — for
+    deterministic read/write race tests (`BlockingLayer`/`BlockingPostgres`).
+    Shares `mdl_posts`.
+    """
+    use Ash.Resource,
+      domain: Domain,
+      data_layer: AshMultiDatalayer.DataLayer,
+      extensions: [AshPostgres.DataLayer]
+
+    multi_data_layer do
+      layer(:l1, AshMultiDatalayer.Test.BlockingEts)
+      layer(:l2, AshMultiDatalayer.Test.BlockingPostgres)
+
+      read_order([:l1, :l2])
+      write_order([:l2, :l1])
+    end
+
+    postgres do
+      table "mdl_posts"
+      repo(AshMultiDatalayer.TestRepo)
+    end
+
+    attributes do
+      uuid_primary_key :id
+      attribute :name, :string, public?: true
+      attribute :age, :integer, public?: true
+      attribute :score, :decimal, public?: true
+      attribute :published_at, :date, public?: true
     end
 
     actions do

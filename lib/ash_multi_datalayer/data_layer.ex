@@ -768,7 +768,9 @@ defmodule AshMultiDatalayer.DataLayer do
   # two reads soundly, so those fall through whole.
   defp remainder_plan(%Query{} = query, resource) do
     if remainder_applicable?(query, resource) do
-      case Coverage.coverage_split(resource, query.tenant) do
+      needed = Coverage.needed_fields(query, resource)
+
+      case Coverage.coverage_split(resource, query.tenant, needed) do
         :none -> :none
         {coverage, complement} -> {:ok, coverage, complement}
       end
@@ -777,8 +779,15 @@ defmodule AshMultiDatalayer.DataLayer do
     end
   end
 
+  # Opaque probes never split (review-2 F3): a filter the normaliser can't
+  # see through (a calc/aggregate ref, an unsupported predicate) must fall
+  # through to the source whole, exactly like the full-hit path already
+  # does — its demands are invisible to every field set this planner builds,
+  # and it can never record coverage either.
   defp remainder_applicable?(%Query{} = query, resource) do
-    Coverage.recordable?(query) and
+    {gate, _probe} = Coverage.recordable_gate(query, resource)
+
+    gate and
       query.sort in [nil, []] and
       match?([_], Ash.Resource.Info.primary_key(resource))
   end
@@ -787,9 +796,11 @@ defmodule AshMultiDatalayer.DataLayer do
     started = System.monotonic_time()
     cache_layer = hd(read_layers)
     source_layer = List.last(read_layers)
+    earlier_layers = Enum.drop(read_layers, -1)
+    source_fetch_query = widen_select_for_backfill(query, resource, earlier_layers)
 
     with {:ok, cache_rows} <- run_region(query, cache_layer, coverage),
-         {:ok, source_rows} <- run_region(query, source_layer, complement) do
+         {:ok, source_rows} <- run_region(source_fetch_query, source_layer, complement) do
       merged = pk_merge(source_rows, cache_rows, resource)
 
       emit_read(:partial, query, resource, started, %{
@@ -879,11 +890,31 @@ defmodule AshMultiDatalayer.DataLayer do
 
   defp source_read(%Query{} = query, resource, read_layers, miss_reason) do
     started = System.monotonic_time()
+    earlier_layers = Enum.drop(read_layers, -1)
+    fetch_query = widen_select_for_backfill(query, resource, earlier_layers)
 
-    with {:ok, records} <- Delegate.run_on_layer(query, List.last(read_layers)) do
+    with {:ok, records} <- Delegate.run_on_layer(fetch_query, List.last(read_layers)) do
       emit_read(:miss, query, resource, started, %{reason: miss_reason})
       maybe_backfill(query, resource, read_layers, records)
       {:ok, records}
+    end
+  end
+
+  # A narrow-select source read returns rows WITHOUT the filter/sort/calc
+  # fields `needed_fields` demands — backfilling those into the cache would
+  # copy `nil`s (or `%Ash.NotLoaded{}`s) instead of real values. Widen the
+  # SOURCE query's select to the superset `needed_fields` computes before
+  # fetching; the caller-visible result is unaffected — Ash's own action
+  # pipeline narrows the final struct back to the query's actual select
+  # (same reason a select-blind layer returning full rows is already fine).
+  defp widen_select_for_backfill(%Query{select: nil} = query, _resource, _earlier_layers),
+    do: query
+
+  defp widen_select_for_backfill(%Query{} = query, resource, earlier_layers) do
+    if earlier_layers != [] and Coverage.recordable?(query) do
+      %{query | select: Enum.to_list(Coverage.needed_fields(query, resource))}
+    else
+      query
     end
   end
 

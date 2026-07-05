@@ -6,6 +6,7 @@ ExUnit.start(exclude: exclude)
 
 {:ok, _} = AshMultiDatalayer.Supervisor.start_link()
 :ok = AshMultiDatalayer.Test.CountingLayer.ensure_table!()
+:ok = AshMultiDatalayer.Test.BlockingLayer.ensure_table!()
 
 {:ok, _} = AshMultiDatalayer.TestRepo.start_link()
 Ecto.Adapters.SQL.Sandbox.mode(AshMultiDatalayer.TestRepo, :manual)
