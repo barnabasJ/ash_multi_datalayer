@@ -22,8 +22,10 @@ defmodule AshMultiDatalayer.DataCase do
     end
   end
 
-  setup do
-    :ok = Ecto.Adapters.SQL.Sandbox.checkout(AshMultiDatalayer.TestRepo)
+  setup context do
+    checkout_opts = Map.get(context, :sandbox_checkout_opts, [])
+
+    :ok = Ecto.Adapters.SQL.Sandbox.checkout(AshMultiDatalayer.TestRepo, checkout_opts)
     Ecto.Adapters.SQL.Sandbox.mode(AshMultiDatalayer.TestRepo, {:shared, self()})
 
     CountingLayer.reset!()
