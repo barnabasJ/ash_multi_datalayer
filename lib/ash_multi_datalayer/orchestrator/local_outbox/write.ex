@@ -13,12 +13,103 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
   identity, never `can?(:transact)` (ash_sqlite hardcodes that false).
   """
 
+  require Ash.Query
+
   alias AshMultiDatalayer.Orchestrator.LocalOutbox
   alias AshMultiDatalayer.Orchestrator.LocalOutbox.Snapshot
   alias AshMultiDatalayer.Sync.Enqueue
 
   @doc false
   def run(resource, changeset, op) do
+    if write_through?(changeset) do
+      write_through(resource, changeset, op)
+    else
+      async_run(resource, changeset, op)
+    end
+  end
+
+  # --- write_through: synchronous "durable on the server or error" ------
+
+  # `write_through: true` context — the per-action kill-switch write path (RFC
+  # "Targeted writes"): drain the record's pending PK chain inline, then write
+  # every replica target synchronously *first*, then the local layer; a replica
+  # failure fails the whole action with nothing committed. No outbox entry — the
+  # caller gets a hard server-durability guarantee for exactly this write.
+  defp write_through?(changeset) do
+    changeset.context |> Map.get(:multi_datalayer, %{}) |> Map.get(:write_through) == true
+  end
+
+  defp write_through(resource, changeset, op) do
+    local = LocalOutbox.local_layer(resource)
+    op_atom = op_atom(op)
+    record_pk = Snapshot.record_pk(resource, changeset.data)
+
+    with :ok <- drain_chain_inline(resource, record_pk),
+         {:ok, record} <- local_write(local, resource, changeset, op),
+         :ok <- push_all_targets(resource, op_atom, record) do
+      finalize_write_through(op, record)
+    end
+  end
+
+  defp drain_chain_inline(resource, record_pk) do
+    outbox = LocalOutbox.outbox_resource(resource)
+    key = Atom.to_string(resource)
+
+    outbox
+    |> Ash.Query.for_read(:read, %{}, domain: Ash.Resource.Info.domain(outbox))
+    |> Ash.Query.filter(resource == ^key and record_pk == ^record_pk and state != :synced)
+    |> Ash.Query.sort(seq: :asc)
+    |> Ash.read!(authorize?: false)
+    |> Enum.reduce_while(:ok, fn entry, :ok ->
+      case AshMultiDatalayer.Orchestrator.LocalOutbox.Flush.push(resource, entry) do
+        :ok ->
+          Ash.destroy!(entry,
+            action: :discard,
+            domain: Ash.Resource.Info.domain(outbox),
+            authorize?: false
+          )
+
+          {:cont, :ok}
+
+        {:conflict, _} = c ->
+          {:halt, {:error, c}}
+
+        {:error, _} = e ->
+          {:halt, e}
+      end
+    end)
+  end
+
+  defp push_all_targets(resource, op_atom, record) do
+    Enum.reduce_while(LocalOutbox.targets(resource), :ok, fn target, :ok ->
+      result =
+        if op_atom == :destroy do
+          normalize(
+            AshMultiDatalayer.Orchestrator.LocalOutbox.Target.destroy(resource, target, record)
+          )
+        else
+          normalize(
+            AshMultiDatalayer.Orchestrator.LocalOutbox.Target.upsert(resource, target, record)
+          )
+        end
+
+      case result do
+        :ok -> {:cont, :ok}
+        {:error, _} = e -> {:halt, e}
+      end
+    end)
+  end
+
+  defp finalize_write_through(:destroy, _record), do: :ok
+  defp finalize_write_through(_op, record), do: {:ok, record}
+
+  defp normalize(:ok), do: :ok
+  defp normalize({:ok, _}), do: :ok
+  defp normalize({:error, error}), do: {:error, error}
+
+  # --- async (default) write path ---------------------------------------
+
+  defp async_run(resource, changeset, op) do
     local = LocalOutbox.local_layer(resource)
     outbox = LocalOutbox.outbox_resource(resource)
     targets = LocalOutbox.targets(resource)

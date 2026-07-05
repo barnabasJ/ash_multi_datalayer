@@ -281,4 +281,75 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
       assert [%{name: "dirty"}] = local()
     end
   end
+
+  # --- per-action layer targeting (Phase 4a) ----------------------------
+
+  describe "read_from: context" do
+    test "routes the read to the named layer, side-effect-free" do
+      w = create!(name: "orig", count: 1)
+      drain()
+      _w = update!(w, count: 2)
+
+      # normal read is served from the local layer (the fresh local write).
+      assert [%{count: 2}] = Ash.read!(Widget, domain: Domain)
+
+      # read_from: :remote observes the replica (still the flushed count 1).
+      remote_read =
+        Widget
+        |> Ash.Query.set_context(%{multi_datalayer: %{read_from: :remote}})
+        |> Ash.read!(domain: Domain)
+
+      assert [%{count: 1}] = remote_read
+
+      # side-effect-free: the pending update entry is untouched by the compare-read.
+      assert Enum.any?(entries(), &(&1.state == :pending and &1.op == :update))
+    end
+  end
+
+  describe "write_through: context" do
+    test "writes the replica synchronously with no outbox entry" do
+      Widget
+      |> Ash.Changeset.for_create(:create, %{name: "wt", count: 9}, domain: Domain)
+      |> Ash.Changeset.set_context(%{multi_datalayer: %{write_through: true}})
+      |> Ash.create!()
+
+      # replica has it immediately (synchronous), local has it, and NO entry was
+      # enqueued — the hard "durable on the server or error" guarantee.
+      assert [%{name: "wt", count: 9}] = remote()
+      assert [%{name: "wt", count: 9}] = local()
+      assert entries() == []
+    end
+
+    test "drains the record's in-flight chain first, leaving no entries to clobber it" do
+      # a create is still in-flight (pending, not yet drained).
+      w = create!(name: "inflight", count: 1)
+      assert Enum.any?(entries(), &(&1.state == :pending))
+
+      # a write_through update to the same record: the pending create is drained
+      # (pushed to the replica + removed), then the update writes synchronously.
+      w
+      |> Ash.Changeset.for_update(:update, %{count: 5}, domain: Domain)
+      |> Ash.Changeset.set_context(%{multi_datalayer: %{write_through: true}})
+      |> Ash.update!()
+
+      # both layers end at the write_through state; no queued entry survives to
+      # later clobber the direct write.
+      assert [%{count: 5}] = remote()
+      assert [%{count: 5}] = local()
+      assert entries() == []
+    end
+
+    test "a replica failure fails the action with nothing left enqueued" do
+      FailableLayer.fail(Remote, :rejected)
+
+      assert_raise Ash.Error.Unknown, fn ->
+        Widget
+        |> Ash.Changeset.for_create(:create, %{name: "wt-fail"}, domain: Domain)
+        |> Ash.Changeset.set_context(%{multi_datalayer: %{write_through: true}})
+        |> Ash.create!()
+      end
+
+      assert entries() == []
+    end
+  end
 end

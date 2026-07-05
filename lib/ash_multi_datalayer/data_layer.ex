@@ -249,7 +249,9 @@ defmodule AshMultiDatalayer.DataLayer do
   end
 
   alias AshMultiDatalayer.DataLayer.Info
+  alias AshMultiDatalayer.Delegate
   alias AshMultiDatalayer.SqlPassthrough
+  alias AshMultiDatalayer.Telemetry
 
   # --- capabilities --------------------------------------------------------
   #
@@ -545,9 +547,27 @@ defmodule AshMultiDatalayer.DataLayer do
 
   @impl true
   def run_query(%Query{} = query, resource) do
-    {orchestrator, _opts} = Info.orchestrator(resource)
-    orchestrator.read(query, resource)
+    case forced_read_layer(query) do
+      nil ->
+        {orchestrator, _opts} = Info.orchestrator(resource)
+        orchestrator.read(query, resource)
+
+      layer_name ->
+        # `read_from:` escape hatch — route the query raw to the named layer,
+        # strategy-independent and **side-effect-free** (no coverage recording,
+        # backfill, LRU touch, or outbox interaction). A compare-read observes,
+        # never perturbs. See the LocalOutbox RFC's "Per-action layer targeting".
+        layer = Info.layer!(resource, layer_name)
+        Telemetry.read(:forced, resource, query, %{}, %{layer: layer_name})
+        Delegate.run_on_layer(query, layer)
+    end
   end
+
+  defp forced_read_layer(%Query{context: context}) when is_map(context) do
+    context |> Map.get(:multi_datalayer, %{}) |> Map.get(:read_from)
+  end
+
+  defp forced_read_layer(_query), do: nil
 
   @impl true
   def run_aggregate_query(%Query{} = query, aggregates, resource) do
