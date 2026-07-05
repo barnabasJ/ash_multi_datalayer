@@ -3,9 +3,10 @@
 **Metadata:**
 
 - Type: plan
-- Status: in progress — **Phases 1–4 complete** (extraction; skeleton;
-  OutboxEntry extension + generators; LocalOutbox strategy core with the RFC
-  v2.1 update-trigger flush)
+- Status: in progress — **Phases 1–4 complete; 4a part 1 done** (extraction;
+  skeleton; OutboxEntry extension + generators; LocalOutbox strategy core, RFC
+  v2.1 update-trigger flush; per-action `read_from:` / `write_through:`).
+  Remaining: 4a capability derivation + alias removal; Phases 5–8.
 - Created: 2026-07-05
 - Topic: orchestrator-extraction, local-outbox, local-first
 - Depends on: [critical-bugs fix plan](./critical-bugs-fix-plan.md) (**hard
