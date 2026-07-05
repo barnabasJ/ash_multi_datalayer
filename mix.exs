@@ -46,12 +46,17 @@ defmodule AshMultiDatalayer.MixProject do
       {:ash_oban, "0.8.10", optional: true},
       {:ash_sqlite, "0.2.17", optional: true},
       {:ecto_sqlite3, "0.24.1", optional: true},
+      # Powers the Phase 3 install/gen.outbox generators. Optional — only the
+      # mix tasks need it; runtime code never does.
+      {:igniter, "0.8.2", optional: true},
       # Pinned to hex-cache-available versions (sandbox has no hex.pm access);
       # matches ash_remote's lock so both projects share identical deps.
       {:crux, "0.1.3", override: true},
       # No :only restriction — ash 3.29+ depends on stream_data in all envs.
       {:stream_data, "~> 1.0"},
-      {:sourceror, "~> 1.7", only: [:dev, :test]},
+      # Not `:only [:dev, :test]` — igniter (via ex_ast) requires sourceror in
+      # all envs. Harmless: it is a compile-time AST tool, unused at runtime.
+      {:sourceror, "~> 1.7"},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
     ]
