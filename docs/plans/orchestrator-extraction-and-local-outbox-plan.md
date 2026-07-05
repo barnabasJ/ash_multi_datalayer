@@ -83,11 +83,21 @@
 
 ## Facts the plan depends on (recorded so it survives context loss)
 
-- **This sandbox has no hex.pm access.** All new deps verified present in
-  `~/.hex/packages/hexpm`: oban 2.23.0, ash_oban 0.8.10, ash_sqlite 0.2.17,
-  ecto_sqlite3 (≤0.22.0), exqlite (≤0.36.0), igniter 0.8.2, and for the example:
-  phx_new (≤1.8.5), oban_web 2.12.5 + oban_met 1.2.0. Pin exact versions in mix
-  files like the existing `crux` pin.
+- **Deps (Phase 2 update — hex.pm now reachable; user-authorised).** The
+  original constraint was "no hex.pm access; all deps in `~/.hex/packages/hexpm`
+  at oban 2.23.0, ash_oban 0.8.10, ash_sqlite 0.2.17, ecto_sqlite3 (≤0.22.0),
+  exqlite (≤0.36.0), igniter 0.8.2, phx_new (≤1.8.5), oban_web 2.12.5 + oban_met
+  1.2.0." **Deviation, recorded (Phase 2):** the cached `ecto_sqlite3 ≤0.22.0`
+  pins `decimal ~> 1.6 or ~> 2.0` (**< 3.0**, the CVE-affected range), which
+  cannot coexist with `ash 3.29.3 → ecto 3.14 → decimal ~> 3.0` — the resolver
+  cannot place `ecto_sqlite3` at all. Hex became reachable and the user
+  confirmed updating is fine (decimal CVE), so **`ecto_sqlite3` is pinned to
+  0.24.1** (requires `decimal ~> 3.0`, `ecto ~> 3.14`, `exqlite ~> 0.22`) —
+  resolves cleanly, `exqlite` lands at 0.38.0, `decimal` stays 3.1.1 (the
+  patched latest). Locked: oban 2.23.0, ash_oban 0.8.10, ash_sqlite 0.2.17,
+  ecto_sqlite3 0.24.1, exqlite 0.38.0.
+  `ash_sqlite 0.2.17 → ecto_sqlite3 ~> 0.12` admits 0.24.1. Pin exact versions
+  in mix files like the existing `crux` pin.
 - **oban_web 2.12.5 verified** (package source): dep requirements all satisfied
   by our pins (oban ~> 2.21, oban_met ~> 1.1, phoenix ~> 1.7, phoenix_live_view
   ~> 1.0); its own dev/test stack runs on **ecto_sqlite3**, so SQLite/Lite is a
@@ -887,7 +897,16 @@ the offline matrix behaviours demonstrated in tests, not just prose.
 Filled in as the walking skeleton lands — one entry per numbered Phase 2 item:
 passing test reference, or the recorded answer + fallback.
 
-_(empty — Phase 2 not started)_
+**Dep resolution (prerequisite to all items).** `ecto_sqlite3` was bumped from
+the plan's original `≤0.22.0` to **0.24.1**: 0.22.0 constrains `decimal` to
+`< 3.0` (CVE-affected), incompatible with
+`ash 3.29.3 → ecto 3.14 → decimal ~> 3.0`. hex.pm became reachable and the user
+authorised the update. Locked: oban 2.23.0, ash_oban 0.8.10, ash_sqlite 0.2.17,
+ecto_sqlite3 0.24.1, exqlite 0.38.0 (transitive), decimal 3.1.1 (unchanged,
+patched). All `optional: true` in the library's `mix.exs`; the library's own
+test env compiles them. `mix compile` clean.
+
+_(items 1–11: in progress — walking skeleton being built)_
 
 ## Links
 

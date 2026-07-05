@@ -35,6 +35,17 @@ defmodule AshMultiDatalayer.MixProject do
       {:ash_postgres, "~> 2.0", optional: true},
       {:ecto_sql, "~> 3.10", optional: true},
       {:postgrex, ">= 0.0.0", optional: true},
+      # LocalOutbox strategy stack — optional, required only by
+      # `AshMultiDatalayer.Orchestrator.LocalOutbox` and its tests. Exact-pinned
+      # like `crux`. NB: `ecto_sqlite3` is pinned to 0.24.1, NOT the plan's
+      # original ≤0.22.0 offline-cache figure: 0.22.0 caps `decimal` at `< 3.0`
+      # (the CVE-affected range), which cannot coexist with ash 3.29 → ecto 3.14
+      # → `decimal ~> 3.0`. 0.24.1 requires `decimal ~> 3.0` and resolves
+      # cleanly. See the plan's Phase 2 Addendum.
+      {:oban, "2.23.0", optional: true},
+      {:ash_oban, "0.8.10", optional: true},
+      {:ash_sqlite, "0.2.17", optional: true},
+      {:ecto_sqlite3, "0.24.1", optional: true},
       # Pinned to hex-cache-available versions (sandbox has no hex.pm access);
       # matches ash_remote's lock so both projects share identical deps.
       {:crux, "0.1.3", override: true},
