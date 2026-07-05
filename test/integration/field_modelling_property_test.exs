@@ -64,10 +64,15 @@ defmodule AshMultiDatalayer.Integration.FieldModellingPropertyTest do
 
       normalised = AshMultiDatalayer.Coverage.Normaliser.normalise(filter, TestPost)
 
-      unless normalised.opaque? do
-        narrow_query =
-          TestPost |> Ash.Query.do_filter(filter) |> Ash.Query.select(select)
+      narrow_query =
+        TestPost |> Ash.Query.do_filter(filter) |> Ash.Query.select(select)
 
+      # A *statically*-false filter (`#Ash.Filter<false>`) is short-circuited by
+      # Ash before the data layer — MDL never runs, so there is no coverage read
+      # to warm and no hit to assert. (Unsatisfiable but non-literal filters, e.g.
+      # `age > 100 and age < 0`, DO reach the layer and are covered normally —
+      # verified — so only the literal case is excluded here.)
+      unless normalised.opaque? or match?(%Ash.Filter{expression: false}, narrow_query.filter) do
         cold = Ash.read!(narrow_query) |> by_id()
         warm = Ash.read!(narrow_query) |> by_id()
 

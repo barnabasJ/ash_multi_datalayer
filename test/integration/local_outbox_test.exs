@@ -50,9 +50,15 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
       Ecto.Adapters.SQL.query!(SkeletonRepo, "DELETE FROM #{t}", [])
     end
 
-    Ash.DataLayer.Ets.stop(Widget)
-    Ash.DataLayer.Ets.stop(StaleWidget)
+    # Disarm first, then clear the Remote (ETS-backed) target explicitly — the
+    # wrapped-layer ETS table is not reliably reset by `Ash.DataLayer.Ets.stop/1`.
     FailableLayer.clear(Remote)
+
+    for res <- [Widget, StaleWidget] do
+      {:ok, rows} = Target.read_all(res, :remote)
+      Enum.each(rows, &Target.destroy(res, :remote, &1, domain: Domain))
+    end
+
     :ok
   end
 
