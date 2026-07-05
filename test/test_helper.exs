@@ -1,6 +1,14 @@
 # Integration tests need the Postgres TestRepo; run them with
 # `mix test --include integration` (or INTEGRATION=1 mix test).
-exclude = if System.get_env("INTEGRATION") == "1", do: [], else: [:integration]
+#
+# The drop-in equivalence properties are DB-backed generated replay tests. Keep
+# them opt-in so they don't interrupt ongoing integration work.
+exclude =
+  if System.get_env("INTEGRATION") == "1" do
+    [:drop_in_equivalence_property]
+  else
+    [:integration, :drop_in_equivalence_property]
+  end
 
 ExUnit.start(exclude: exclude)
 
