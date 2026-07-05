@@ -49,7 +49,7 @@ defmodule AshMultiDatalayer do
 
   Options: `:tenant` (defaults to `nil`, the tenantless partition).
   """
-  @spec forget!(module(), Ash.Resource.record() | map(), keyword()) :: :ok
+  @spec forget!(module(), Ash.Resource.Record.t() | map(), keyword()) :: :ok
   def forget!(resource, pk_or_record, opts \\ []) do
     tenant = opts[:tenant]
     row_before = AshMultiDatalayer.forget_probe(resource, pk_or_record)

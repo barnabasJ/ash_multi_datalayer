@@ -18,7 +18,7 @@ defmodule AshMultiDatalayer.Backfill do
   only if every upsert succeeded; `{:error, layer, reason}` aborts at the
   first failure (callers must then skip coverage recording).
   """
-  @spec upsert_records([module()], module(), [Ash.Resource.record()], keyword()) ::
+  @spec upsert_records([module()], module(), [Ash.Resource.Record.t()], keyword()) ::
           :ok | {:error, module(), term()}
   def upsert_records(layers, resource, records, opts) do
     Enum.reduce_while(layers, :ok, fn layer, :ok ->
@@ -44,8 +44,8 @@ defmodule AshMultiDatalayer.Backfill do
     * `:fields` — the fields to write (defaults to the record's non-`nil`
       loaded attributes); the primary key is always included
   """
-  @spec upsert_record(module(), module(), Ash.Resource.record(), keyword()) ::
-          {:ok, Ash.Resource.record()} | {:error, term()}
+  @spec upsert_record(module(), module(), Ash.Resource.Record.t(), keyword()) ::
+          {:ok, Ash.Resource.Record.t()} | {:error, term()}
   def upsert_record(layer, resource, record, opts) do
     primary_key = Ash.Resource.Info.primary_key(resource)
     tenant = opts[:tenant]
@@ -80,7 +80,7 @@ defmodule AshMultiDatalayer.Backfill do
   Deletes a record (by primary key) from a layer. A row that's already
   absent is a success.
   """
-  @spec destroy_record(module(), module(), Ash.Resource.record(), keyword()) ::
+  @spec destroy_record(module(), module(), Ash.Resource.Record.t(), keyword()) ::
           :ok | {:error, term()}
   def destroy_record(layer, resource, record, opts) do
     tenant = opts[:tenant]

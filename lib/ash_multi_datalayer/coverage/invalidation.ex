@@ -35,7 +35,7 @@ defmodule AshMultiDatalayer.Coverage.Invalidation do
   drops the entry. Entries with no filter (universal coverage) match every
   row.
   """
-  @spec should_drop?(Entry.t(), Ash.Resource.record() | nil, Ash.Resource.record() | nil) ::
+  @spec should_drop?(Entry.t(), Ash.Resource.Record.t() | nil, Ash.Resource.Record.t() | nil) ::
           boolean()
   def should_drop?(%Entry{filter: nil}, row_before, row_after) do
     not (is_nil(row_before) and is_nil(row_after))
@@ -79,7 +79,7 @@ defmodule AshMultiDatalayer.Coverage.Invalidation do
   never skippable once the authoritative layer has committed (the kill
   switch only skips *propagation* — see `WriteDispatch`'s moduledoc).
   """
-  @spec on_write(module(), term(), Ash.Resource.record() | nil, Ash.Resource.record() | nil) ::
+  @spec on_write(module(), term(), Ash.Resource.Record.t() | nil, Ash.Resource.Record.t() | nil) ::
           non_neg_integer()
   def on_write(resource, tenant, row_before, row_after) do
     Coverage.bump_epoch(resource, tenant)
