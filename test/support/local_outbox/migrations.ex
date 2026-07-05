@@ -16,6 +16,15 @@ defmodule AshMultiDatalayer.Test.LocalOutbox.Migrations do
       add(:version, :integer, default: 1)
     end
 
+    # stale-check on a NON-JSON-native field (datetime) — the base image round-trips
+    # through the outbox `:map`/JSON, so its value comes back a string; regression
+    # guard that a clean flush does not falsely compare string vs %DateTime{}.
+    create table("lo_stamp_widgets", primary_key: false) do
+      add(:id, :uuid, primary_key: true)
+      add(:name, :string)
+      add(:seen_at, :utc_datetime_usec)
+    end
+
     create table("lo_outbox", primary_key: false) do
       add(:seq, :integer, primary_key: true)
       add(:write_ref, :uuid, null: false)
@@ -39,6 +48,7 @@ defmodule AshMultiDatalayer.Test.LocalOutbox.Migrations do
   def down do
     drop(table("lo_widgets"))
     drop(table("lo_stale_widgets"))
+    drop(table("lo_stamp_widgets"))
     drop(table("lo_outbox"))
   end
 end

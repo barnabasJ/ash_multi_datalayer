@@ -14,7 +14,15 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
   alias AshMultiDatalayer.Orchestrator.LocalOutbox.Target
   alias AshMultiDatalayer.Test.FailableLayer
 
-  alias AshMultiDatalayer.Test.LocalOutbox.{Domain, OutboxEntry, Remote, StaleWidget, Widget}
+  alias AshMultiDatalayer.Test.LocalOutbox.{
+    Domain,
+    OutboxEntry,
+    Remote,
+    StaleWidget,
+    StampWidget,
+    Widget
+  }
+
   alias AshMultiDatalayer.Test.LocalOutbox.Migrations, as: LoMigrations
   alias AshMultiDatalayer.Test.ObanSqlite.Migrations, as: ObanMigrations
   alias AshMultiDatalayer.Test.ObanSqlite.SkeletonRepo
@@ -46,7 +54,7 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
   end
 
   setup do
-    for t <- ~w(lo_widgets lo_stale_widgets lo_outbox oban_jobs) do
+    for t <- ~w(lo_widgets lo_stale_widgets lo_stamp_widgets lo_outbox oban_jobs) do
       Ecto.Adapters.SQL.query!(SkeletonRepo, "DELETE FROM #{t}", [])
     end
 
@@ -54,7 +62,7 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
     # wrapped-layer ETS table is not reliably reset by `Ash.DataLayer.Ets.stop/1`.
     FailableLayer.clear(Remote)
 
-    for res <- [Widget, StaleWidget] do
+    for res <- [Widget, StaleWidget, StampWidget] do
       {:ok, rows} = Target.read_all(res, :remote)
       Enum.each(rows, &Target.destroy(res, :remote, &1, domain: Domain))
     end
@@ -274,6 +282,56 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
       parked = Enum.filter(entries(), &(&1.state == :parked))
       assert [%{error_class: :conflict, remote_snapshot: snap}] = parked
       assert snap["version"] == 5
+    end
+
+    test "a clean flush on a DATETIME stale field does not falsely park (JSON round-trip)" do
+      # Regression: base_image round-trips through the outbox `:map`/JSON, so a
+      # :utc_datetime_usec comes back a string while the live remote value dumps to
+      # a %DateTime{}. Without normalisation the stale-check compared string vs
+      # struct and parked EVERY flush. An undiverged update must sync clean.
+      at = ~U[2026-07-05 12:00:00.000000Z]
+
+      s =
+        StampWidget
+        |> Ash.Changeset.for_create(:create, %{name: "s", seen_at: at}, domain: Domain)
+        |> Ash.create!()
+
+      drain()
+      assert [%{seen_at: ^at}] = remote(StampWidget)
+
+      # local update, remote seen_at UNCHANGED → no real conflict → must sync.
+      s
+      |> Ash.Changeset.for_update(:update, %{name: "s2"}, domain: Domain)
+      |> Ash.update!()
+
+      drain()
+
+      assert entries() |> Enum.filter(&(&1.state == :parked)) == []
+      assert Enum.all?(entries(), &(&1.state == :synced))
+      assert [%{name: "s2"}] = remote(StampWidget)
+    end
+
+    test "a diverged DATETIME stale field still parks as :conflict" do
+      s =
+        StampWidget
+        |> Ash.Changeset.for_create(:create, %{name: "s", seen_at: ~U[2026-07-05 12:00:00Z]},
+          domain: Domain
+        )
+        |> Ash.create!()
+
+      drain()
+
+      # a concurrent server write bumps seen_at out from under us.
+      Target.upsert(StampWidget, :remote, %{s | seen_at: ~U[2026-07-05 18:30:00Z]})
+
+      s
+      |> Ash.Changeset.for_update(:update, %{name: "s-local"}, domain: Domain)
+      |> Ash.update!()
+
+      drain()
+
+      assert [%{error_class: :conflict}] =
+               Enum.filter(entries(), &(&1.state == :parked))
     end
   end
 

@@ -164,8 +164,14 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
         :ok
 
       {:ok, remote} ->
-        expected = entry.base_image && entry.base_image[to_string(field)]
-        actual = dump_field(host, field, Map.get(remote, field))
+        # `base_image` was stored in the outbox's `:map` attribute and read back
+        # through a JSON round-trip, so its values are JSON scalars (a
+        # `DateTime` became an ISO string). Normalise the freshly-dumped remote
+        # value the same way before comparing — otherwise a stale-check on a
+        # `:utc_datetime_usec`/`:decimal` field would compare a string to a
+        # struct and park EVERY flush as a false conflict.
+        expected = json_scalar(entry.base_image && entry.base_image[to_string(field)])
+        actual = json_scalar(dump_field(host, field, Map.get(remote, field)))
         if expected == actual, do: :ok, else: {:conflict, Snapshot.dump(host, remote)}
 
       {:error, error} ->
@@ -178,6 +184,11 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
     {:ok, dumped} = Ash.Type.dump_to_embedded(attribute.type, value, attribute.constraints)
     dumped
   end
+
+  # Reduce a value to the JSON scalar the outbox `:map` round-trip would yield,
+  # so a base-image string compares equal to a freshly-dumped struct/number.
+  defp json_scalar(nil), do: nil
+  defp json_scalar(value), do: value |> Jason.encode!() |> Jason.decode!()
 
   defp normalize(:ok), do: :ok
   defp normalize({:ok, _record}), do: :ok
