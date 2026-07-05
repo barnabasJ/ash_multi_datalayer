@@ -88,6 +88,30 @@ defmodule AshMultiDatalayer.Integration.LayerFailureTest do
     assert [_] = AshMultiDatalayer.Coverage.entries(FailingPost, nil)
   end
 
+  test "a failing cache layer during read fall-through records no coverage (missing-test #1)" do
+    FailingPost
+    |> Ash.Changeset.for_create(:create, %{name: "warm", age: 25})
+    |> Ash.create!()
+
+    FailingEts.fail!(:upsert)
+
+    # Cold read: the source fetch succeeds and its rows are returned to the
+    # caller, but the backfill into FailingEts fails.
+    assert [%{age: 25}] = FailingPost |> Ash.Query.filter(name == "warm") |> Ash.read!()
+
+    # The code is believed correct (no coverage on a partial backfill) —
+    # this pins it: a cache-population failure must never masquerade as
+    # coverage over rows the cache doesn't actually have.
+    assert AshMultiDatalayer.Coverage.entries(FailingPost, nil) == []
+
+    FailingEts.clear!()
+
+    # The next identical read is still a miss (nothing was recorded) and
+    # returns the correct rows via a fresh source fetch.
+    assert [%{age: 25}] = FailingPost |> Ash.Query.filter(name == "warm") |> Ash.read!()
+    assert pg_reads() == 2
+  end
+
   test "a failed cache destroy also degrades to a miss" do
     record =
       FailingPost

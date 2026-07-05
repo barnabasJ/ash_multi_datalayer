@@ -80,6 +80,23 @@ defmodule AshMultiDatalayer.Test.Generators do
   end
 
   @doc """
+  A random non-empty subset of `TestPost`'s plain (non-PK) attributes, for
+  the field-modelling property (C1/C2's axis: coverage must track exactly
+  what a query touches, not just what it selects). The primary key is
+  always implicitly demanded by `Coverage.needed_fields/2` — this generator
+  models the SELECT clause itself, which never needs to include it.
+  """
+  def select_subset do
+    fixed_map(%{name: boolean(), age: boolean(), published_at: boolean()})
+    |> map(fn flags ->
+      case for {field, true} <- flags, do: field do
+        [] -> [:name]
+        fields -> fields
+      end
+    end)
+  end
+
+  @doc """
   Ground-truth row matching via the same runtime evaluator the data layers
   use. `{:ok, boolean}` or `:unknown`.
   """

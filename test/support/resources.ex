@@ -33,13 +33,26 @@ defmodule AshMultiDatalayer.Test.FailingEts do
     :persistent_term.put({__MODULE__, :fail}, operation)
   end
 
+  @doc """
+  Probabilistic failure mode: each call to `operation` independently fails
+  with probability `rate` (0.0..1.0) — for stress-testing propagation
+  failures under concurrent load, where a single global on/off switch can't
+  express "some fraction of writes fail".
+  """
+  def fail_rate!(operation, rate) when operation in [:upsert, :destroy] do
+    :persistent_term.put({__MODULE__, :fail_rate, operation}, rate)
+  end
+
   def clear! do
     :persistent_term.erase({__MODULE__, :fail})
+    :persistent_term.erase({__MODULE__, :fail_rate, :upsert})
+    :persistent_term.erase({__MODULE__, :fail_rate, :destroy})
     :ok
   end
 
   defp failing?(operation) do
-    :persistent_term.get({__MODULE__, :fail}, nil) == operation
+    :persistent_term.get({__MODULE__, :fail}, nil) == operation or
+      :rand.uniform() < :persistent_term.get({__MODULE__, :fail_rate, operation}, 0.0)
   end
 
   def upsert(resource, changeset, keys, identity \\ nil) do
