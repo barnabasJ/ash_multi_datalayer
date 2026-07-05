@@ -65,13 +65,15 @@ defmodule AshMultiDatalayer.Backfill do
         tenant: tenant,
         to_tenant: tenant
       })
-      |> Ash.Changeset.set_context(%{
-        private: %{
-          upsert_fields: fields,
-          touch_update_defaults?: false,
-          tenant: tenant
-        }
-      })
+      |> Ash.Changeset.set_context(
+        AshMultiDatalayer.RemoteContext.merge(%{
+          private: %{
+            upsert_fields: fields,
+            touch_update_defaults?: false,
+            tenant: tenant
+          }
+        })
+      )
 
     Ash.DataLayer.run_upsert(layer, resource, changeset, primary_key)
   end
@@ -94,7 +96,9 @@ defmodule AshMultiDatalayer.Backfill do
         tenant: tenant,
         to_tenant: tenant
       })
-      |> Ash.Changeset.set_context(%{private: %{tenant: tenant}})
+      |> Ash.Changeset.set_context(
+        AshMultiDatalayer.RemoteContext.merge(%{private: %{tenant: tenant}})
+      )
 
     case layer.destroy(resource, changeset) do
       :ok -> :ok

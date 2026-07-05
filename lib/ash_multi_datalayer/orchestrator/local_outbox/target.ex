@@ -31,6 +31,8 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Target do
       resource: resource,
       domain: opts[:domain] || Ash.Resource.Info.domain(resource),
       tenant: tenant,
+      select: full_select(resource),
+      context: AshMultiDatalayer.RemoteContext.resolve(),
       filter: pk_filter(resource, record_pk)
     }
 
@@ -48,10 +50,20 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Target do
     query = %Query{
       resource: resource,
       domain: opts[:domain] || Ash.Resource.Info.domain(resource),
-      tenant: opts[:tenant]
+      tenant: opts[:tenant],
+      select: full_select(resource),
+      context: AshMultiDatalayer.RemoteContext.resolve()
     }
 
     Delegate.run_on_layer(query, layer)
+  end
+
+  # A LocalOutbox read pulls the whole row (hydration writes it into the local
+  # authority; the stale-check needs the conflict field). Layers that ignore
+  # `select` (ETS) return full rows anyway; ones that honour it (AshRemote fetches
+  # only the requested wire fields) would otherwise return the primary key alone.
+  defp full_select(resource) do
+    resource |> Ash.Resource.Info.attributes() |> Enum.map(& &1.name)
   end
 
   @doc "Build a filter matching a record's primary key (from a string-keyed pk map)."
