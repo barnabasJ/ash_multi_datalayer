@@ -105,11 +105,13 @@ defmodule TodoClient.Live do
         </h2>
 
         <div style="display:flex; gap:.5rem; flex-wrap:wrap; margin-bottom:.75rem;">
-          <select phx-click={nil} name="browse_list" phx-change="browse-list" style="padding:.3rem;">
-            <option :for={list <- @lists} value={list.id} selected={@browse_list_id == list.id}>
-              {list.name}
-            </option>
-          </select>
+          <form phx-change="browse-list" style="display:contents;">
+            <select name="browse_list" style="padding:.3rem;">
+              <option :for={list <- @lists} value={list.id} selected={@browse_list_id == list.id}>
+                {list.name}
+              </option>
+            </select>
+          </form>
 
           <span style="display:inline-flex; border:1px solid #ccc; border-radius:.4rem; overflow:hidden;">
             <button
