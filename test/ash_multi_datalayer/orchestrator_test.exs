@@ -96,8 +96,13 @@ defmodule AshMultiDatalayer.OrchestratorTest do
                hd(Info.write_layer_modules(DefaultPost))
     end
 
-    test "can?/2 defers to the shell (returns :default)" do
-      assert ProvenCoverage.can?(DefaultPost, :read) == :default
+    test "can?/2 answers concretely (Phase 4a derivation)" do
+      # read feature — read_order intersection (both Ets layers support :read).
+      assert ProvenCoverage.can?(DefaultPost, :read) == true
+      # bypass-guard — joins escape the coverage proof.
+      assert ProvenCoverage.can?(DefaultPost, {:join, :inner}) == false
+      # M3 refusal.
+      assert ProvenCoverage.can?(DefaultPost, :aggregate_filter) == false
     end
 
     test "child_specs/1 is empty (lazy table owners)" do

@@ -81,11 +81,77 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
   @impl AshMultiDatalayer.Orchestrator
   def transaction_layer(resource), do: write_authority_layer(resource)
 
-  # Phase 1 transitional: the shell keeps its existing hardcoded `can?` falses
-  # and intersections verbatim (`:default` routes back to them). Phase 4a moves
-  # the real per-strategy derivation here (review-2 R6).
+  # Phase 4a: the real per-strategy capability derivation (behaviour ADR's
+  # feature classes). Concrete answers here; the shell's `:default` intersection
+  # is only a fallback for a strategy that declines to answer.
   @impl AshMultiDatalayer.Orchestrator
-  def can?(_resource, _feature), do: :default
+  # bypass-guards — hardcoded false even where a layer says true, because the
+  # feature would route work around orchestration inside a single layer (joined
+  # rows escape the coverage proof; bulk/atomic/query-mutations bypass the write
+  # dispatcher + invalidation). ash_sqlite advertises `update_query` — still false.
+  def can?(_resource, {:join, _}), do: false
+  def can?(_resource, {:lateral_join, _}), do: false
+  def can?(_resource, :combine), do: false
+  def can?(_resource, {:combine, _}), do: false
+  def can?(_resource, :update_query), do: false
+  def can?(_resource, :destroy_query), do: false
+  def can?(_resource, {:atomic, _}), do: false
+  def can?(_resource, :bulk_create), do: false
+  def can?(_resource, :async_engine), do: false
+
+  # aggregate filter/sort — clean loud refusal: filtering/sorting on a foldable
+  # aggregate would crash with `KeyError __ash_bindings__` (implementation-review
+  # M3). Refuse explicitly rather than surface the crash.
+  def can?(_resource, :aggregate_filter), do: false
+  def can?(_resource, :aggregate_sort), do: false
+
+  # relationship aggregates — supported when a fold or join mechanism is enabled.
+  def can?(resource, {:aggregate, kind}),
+    do: aggregates_supported?(resource) and kind in @foldable_aggregate_kinds
+
+  def can?(resource, {:aggregate_relationship, _}), do: aggregates_supported?(resource)
+
+  # authority-only — features that only ever execute on the source of truth, so
+  # the authority's answer is the honest one (not a pessimistic intersection that
+  # a cache layer's inability would poison):
+  #   * `:select` — the source builds the wire field list; a select-less cache
+  #     just returns full rows for Ash to narrow.
+  #   * `{:lock,_}` — a locked read routes to the source (run/2's lock branch); a
+  #     source that supports locking should not lose it to the cache (N10).
+  #   * `:transact` — matches `transaction/4`, which already delegates to the
+  #     write authority alone.
+  def can?(resource, :select), do: layer_can?(read_source_layer(resource), resource, :select)
+  def can?(resource, {:lock, _} = f), do: layer_can?(read_source_layer(resource), resource, f)
+
+  def can?(resource, :transact),
+    do: layer_can?(write_authority_layer(resource), resource, :transact)
+
+  # multitenancy — the all-layers intersection is load-bearing: a layer that
+  # cannot isolate tenants would leak data.
+  def can?(resource, :multitenancy),
+    do: layers_can?(Info.layer_modules(resource), resource, :multitenancy)
+
+  # write features — the write_order intersection (every layer receives the write).
+  def can?(resource, feature) when feature in [:create, :update, :destroy, :upsert],
+    do: layers_can?(Info.write_layer_modules(resource), resource, feature)
+
+  # read-expressiveness features — the read_order intersection.
+  def can?(resource, feature),
+    do: layers_can?(Info.read_layer_modules(resource), resource, feature)
+
+  # Relationship aggregates supported when at least one mechanism is enabled.
+  defp aggregates_supported?(resource),
+    do: Info.fold_aggregates?(resource) or Info.sql_join_aggregates?(resource)
+
+  defp layer_can?(nil, _resource, _feature), do: false
+
+  defp layer_can?(layer, resource, feature) do
+    Code.ensure_loaded?(layer) and function_exported?(layer, :can?, 2) and
+      layer.can?(resource, feature)
+  end
+
+  defp layers_can?([], _resource, _feature), do: false
+  defp layers_can?(layers, resource, feature), do: Enum.all?(layers, & &1.can?(resource, feature))
 
   # ProvenCoverage keeps today's lazy start — table owners spawn on first use,
   # supervised by `AshMultiDatalayer.TableSupervisor` (already in the base

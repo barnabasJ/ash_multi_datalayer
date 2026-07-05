@@ -39,11 +39,31 @@ defmodule AshMultiDatalayer.CapabilitiesTest do
       end
     end
 
-    test "transactions require every write layer to be transactional" do
-      # Ets in write_order kills :transact...
-      refute DataLayer.can?(TestPost, :transact)
-      # ...while a Postgres-only write_order supports it.
+    test "transactions follow the write AUTHORITY (Phase 4a), matching transaction/4" do
+      # Phase 4a: `:transact` is authority-only, not the write-order intersection —
+      # `transaction/4` already delegates to the write authority (hd write_order)
+      # alone, so the honest answer is the authority's. TestPost's authority is
+      # Postgres → transactions ARE supported (the old intersection said false only
+      # because Ets is also in write_order, which is inconsistent with what
+      # transaction/4 actually does).
+      assert DataLayer.can?(TestPost, :transact)
       assert DataLayer.can?(SingleLayerPost, :transact)
+    end
+  end
+
+  describe "authority-only + refusal features (Phase 4a)" do
+    test "locking follows the read authority (resurrected lock path, N10)" do
+      # TestPost's read authority (last read_order layer) is Postgres, which
+      # supports FOR UPDATE — a locked read routes to the source and is served.
+      assert DataLayer.can?(TestPost, {:lock, :for_update})
+      assert DataLayer.can?(SingleLayerPost, {:lock, :for_update})
+    end
+
+    test "aggregate_filter / aggregate_sort are refused loudly (M3)" do
+      # Filtering/sorting on a foldable aggregate would crash with
+      # KeyError __ash_bindings__; refuse explicitly instead.
+      refute DataLayer.can?(TestPost, :aggregate_filter)
+      refute DataLayer.can?(TestPost, :aggregate_sort)
     end
   end
 
