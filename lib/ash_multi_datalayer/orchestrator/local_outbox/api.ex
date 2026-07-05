@@ -35,18 +35,26 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
     |> read()
   end
 
-  @doc "`:synced` | `:pending` | `{:parked, entries}` for a write's record/ref."
-  def status(record_or_ref) do
-    {outbox, write_ref} = ref(record_or_ref)
+  @doc """
+  Per-record sync status: `:synced` | `:pending` | `{:parked, entries}`. Accepts
+  any host record (read from the local layer or freshly returned by a write) — it
+  looks up the record's outbox chain by primary key, so a local-first UI can poll
+  `status/1` for a "saving… / saved / sync failed" badge on every row.
+  """
+  def status(%_{} = record) do
+    host = record.__struct__
+    pk = Snapshot.record_pk(host, record)
 
     entries =
-      outbox
-      |> Ash.Query.for_read(:read)
-      |> Ash.Query.filter(write_ref == ^write_ref)
+      host
+      |> outbox()
+      |> base_query(host, tenant_of(record))
+      |> Ash.Query.filter(record_pk == ^pk)
+      |> Ash.Query.sort(seq: :asc)
       |> read()
 
     cond do
-      # Flush marks entries :synced (idiomatic update trigger) — a write is synced
+      # Flush marks entries :synced (idiomatic update trigger) — a record is synced
       # once none of its entries are still pending or parked.
       entries == [] or Enum.all?(entries, &(&1.state == :synced)) ->
         :synced
@@ -388,11 +396,6 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
     q = Ash.Query.filter(query, resource == ^key)
     if tenant, do: Ash.Query.filter(q, tenant == ^to_string(tenant)), else: q
   end
-
-  defp ref(%{__metadata__: %{outbox_ref: write_ref}} = record),
-    do: {outbox(record.__struct__), write_ref}
-
-  defp ref({outbox, write_ref}) when is_atom(outbox), do: {outbox, write_ref}
 
   defp read(query), do: Ash.read!(query, authorize?: false)
 

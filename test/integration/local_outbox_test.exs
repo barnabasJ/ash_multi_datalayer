@@ -127,6 +127,19 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
       drain()
       assert LocalOutbox.await(w, timeout: 200) == :synced
     end
+
+    test "status/1 works on a record READ from the local layer (not just a fresh write)" do
+      w = create!(name: "st")
+      # a record read back from the local layer carries no outbox_ref metadata,
+      # yet status/1 must still report its per-record sync state.
+      [read_back] = Ash.read!(Widget, domain: Domain)
+      assert read_back.id == w.id
+      assert LocalOutbox.status(read_back) == :pending
+
+      drain()
+      [synced] = Ash.read!(Widget, domain: Domain)
+      assert LocalOutbox.status(synced) == :synced
+    end
   end
 
   # --- per-PK FIFO + chain-block ----------------------------------------
