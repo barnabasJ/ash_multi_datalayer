@@ -347,6 +347,21 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
       assert [%{id: ^id, name: "external"}] = local()
     end
 
+    test "refresh UPDATES an existing (clean) local row when the remote changed" do
+      # a fully-synced local row; another client then changes the same row on the
+      # server. A refresh must overwrite the local copy with the newer remote one
+      # (the cross-client convergence path) — not just add/delete rows.
+      w = create!(name: "orig")
+      drain()
+      assert entries() |> Enum.all?(&(&1.state == :synced))
+
+      Target.upsert(Widget, :remote, %Widget{id: w.id, name: "changed-elsewhere", count: 9})
+
+      assert %{refreshed: 1} = LocalOutbox.refresh(Widget, :all)
+      assert [%{id: id, name: "changed-elsewhere"}] = local()
+      assert id == w.id
+    end
+
     test "refresh skips a dirty PK (non-empty outbox chain) and reports it" do
       w = create!(name: "dirty")
       # divergent replica row for the same PK, but the record has a pending entry.
