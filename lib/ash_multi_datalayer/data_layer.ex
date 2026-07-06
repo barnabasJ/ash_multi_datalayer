@@ -354,7 +354,17 @@ defmodule AshMultiDatalayer.DataLayer do
     if callback?(layer, :transaction, 4) do
       layer.transaction(resource, fun, timeout, reason)
     else
-      {:ok, fun.()}
+      # A layer without its own transaction callback has no real transaction
+      # to run `fun` in — but `rollback/2`'s own fallback (below) still
+      # signals failure the idiomatic Ash way, `throw({:rollback, term})`
+      # (mirroring `Ecto.Repo.transaction/2`). Nothing here caught that throw
+      # (M-8): it escaped as an uncaught `nocatch` crash instead of the
+      # `{:error, term}` a real transaction callback would return.
+      try do
+        {:ok, fun.()}
+      catch
+        :throw, {:rollback, term} -> {:error, term}
+      end
     end
   end
 

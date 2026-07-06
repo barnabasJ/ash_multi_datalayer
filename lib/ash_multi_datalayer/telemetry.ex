@@ -11,6 +11,8 @@ defmodule AshMultiDatalayer.Telemetry do
     * `[:read, :miss]` — a read that fell through (metadata `reason:` one of
       `:no_coverage_entry`, `:solver_unsupported`, `:fields_insufficient`,
       `:not_cacheable`, `:calc_sort_source_only`, `:ledger_unavailable`)
+    * `[:read, :forced]` — a read routed raw to a named layer via the
+      `read_from` context escape hatch (metadata `%{layer}`)
     * `[:read, :backfill]` — fetched rows upserted into earlier layers +
       the filter recorded in the ledger
     * `[:read, :divergence_detected]` — a sampled cache hit disagreed with

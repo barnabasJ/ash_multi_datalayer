@@ -41,12 +41,25 @@ defmodule AshMultiDatalayer.Notifiers.ExternalChange do
     # shape of a cross-client sync regression). Warn with the reaction and the
     # stacktrace so the failure is diagnosable, then still swallow.
     error ->
-      Logger.warning(
-        "ash_multi_datalayer: inbound reaction for #{inspect(resource)} failed and was " <>
-          "dropped (self-heals on the next read/gap sweep): #{Exception.message(error)}\n" <>
-          Exception.format_stacktrace(__STACKTRACE__)
-      )
-
+      warn_and_drop(resource, Exception.message(error), __STACKTRACE__)
       :ok
+  catch
+    # A `GenServer.call` timeout (or any other linked-process failure) inside
+    # a reaction exits, not raises — `rescue` alone never sees it, so it
+    # escaped and could crash the notifying socket (M-8's `ExternalChange`
+    # counterpart: same "never crash the caller" contract, wider failure
+    # class). Same warn-then-swallow posture for `:exit`/`:throw` as for a
+    # rescued raise.
+    kind, reason ->
+      warn_and_drop(resource, "#{kind}: #{inspect(reason)}", __STACKTRACE__)
+      :ok
+  end
+
+  defp warn_and_drop(resource, reason, stacktrace) do
+    Logger.warning(
+      "ash_multi_datalayer: inbound reaction for #{inspect(resource)} failed and was " <>
+        "dropped (self-heals on the next read/gap sweep): #{reason}\n" <>
+        Exception.format_stacktrace(stacktrace)
+    )
   end
 end

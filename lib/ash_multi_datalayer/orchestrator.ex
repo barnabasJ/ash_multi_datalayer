@@ -34,7 +34,6 @@ defmodule AshMultiDatalayer.Orchestrator do
     `:default` to fall back to the shell's intersection semantics).
   - **inbound** — `handle_external_change/2` / `handle_external_gap/2`: reactions
     to changes that bypassed this node's write path (notification bridges).
-    *Defined here so the behaviour surface is final; implemented in Phase 4.*
   - **lifecycle** — `validate_opts/2` (compile-time opt validation, invoked by
     the `ValidateOrchestrator` verifier) and `child_specs/1` (processes the
     strategy needs, started under `AshMultiDatalayer.Supervisor`).
