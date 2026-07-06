@@ -11,12 +11,19 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
   outbox resource share an Ecto repo (the SQLite client stack) — the co-commit
   that makes the durability invariant a construction. The predicate is repo
   identity, never `can?(:transact)` (ash_sqlite hardcodes that false).
+
+  `write_through: true` context is a DIFFERENT, synchronous write path (see
+  `write_through/3` below): every replica target is written FIRST, and the
+  local layer only commits once every target has durably accepted the write —
+  a replica failure fails the whole action with the local layer untouched
+  (M-2). No outbox entry — the caller gets a hard server-durability guarantee
+  for exactly this write.
   """
 
   require Ash.Query
 
   alias AshMultiDatalayer.Orchestrator.LocalOutbox
-  alias AshMultiDatalayer.Orchestrator.LocalOutbox.Snapshot
+  alias AshMultiDatalayer.Orchestrator.LocalOutbox.{Snapshot, Target}
   alias AshMultiDatalayer.Sync.Enqueue
 
   @doc false
@@ -33,8 +40,10 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
   # `write_through: true` context — the per-action kill-switch write path (RFC
   # "Targeted writes"): drain the record's pending PK chain inline, then write
   # every replica target synchronously *first*, then the local layer; a replica
-  # failure fails the whole action with nothing committed. No outbox entry — the
-  # caller gets a hard server-durability guarantee for exactly this write.
+  # failure fails the whole action with nothing committed (M-2 — this order is
+  # the moduledoc's spec; the local layer must never hold a value no target
+  # accepted). No outbox entry — the caller gets a hard server-durability
+  # guarantee for exactly this write.
   defp write_through?(changeset) do
     changeset.context |> Map.get(:multi_datalayer, %{}) |> Map.get(:write_through) == true
   end
@@ -45,9 +54,10 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
     record_pk = Snapshot.record_pk(resource, changeset.data)
 
     with :ok <- drain_chain_inline(resource, record_pk),
-         {:ok, record} <- local_write(local, resource, changeset, op),
-         :ok <- push_all_targets(resource, op_atom, record) do
-      finalize_write_through(op, record)
+         {:ok, record, fields} <- materialize(resource, changeset, op),
+         :ok <- push_all_targets(resource, op_atom, record, fields),
+         {:ok, local_record} <- local_write(local, resource, changeset, op) do
+      finalize_write_through(op, local_record)
     end
   end
 
@@ -71,8 +81,10 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
 
           {:cont, :ok}
 
-        {:conflict, _} = c ->
-          {:halt, {:error, c}}
+        {:conflict, remote} ->
+          {:halt,
+           {:error,
+            %AshMultiDatalayer.Orchestrator.LocalOutbox.ConflictError{remote_snapshot: remote}}}
 
         {:error, _} = e ->
           {:halt, e}
@@ -80,17 +92,96 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
     end)
   end
 
-  defp push_all_targets(resource, op_atom, record) do
+  # Materializes the record write_through pushes to targets — WITHOUT running
+  # the local write yet (M-2's reorder: targets first, local last). A destroy
+  # has no attributes to materialize; push by PK alone.
+  #
+  # For create/update: `Ash.Changeset.apply_attributes/1` folds
+  # `changeset.attributes` onto `changeset.data` (after `set_defaults`) —
+  # the arity-1/opts form; there is no form taking `data` separately. No
+  # force-back of lazy defaults is needed: the Ash action pipeline already
+  # calls `set_defaults(:create | :update, true)` before the data layer runs,
+  # evaluating lazy defaults exactly once and `force_change_attribute`-ing the
+  # result in, and every later `set_defaults` (including inside
+  # `apply_attributes`) is idempotent via the `changing_attribute?` guard —
+  # both the target push and the local write below see identical values.
+  #
+  # Guards fail closed: an atomic changeset (checked in BOTH `:atomics` and
+  # `:create_atomics` — create-time atomics live only in the latter, which
+  # `apply_attributes` cannot evaluate) or a `:create` whose primary key is
+  # still `nil` after materialization (a genuinely DB-generated key) are
+  # unsupported for write_through — say so in the error rather than silently
+  # diverging.
+  defp materialize(_resource, changeset, :destroy), do: {:ok, changeset.data, nil}
+
+  defp materialize(resource, changeset, _op) do
+    with :ok <- reject_atomics(changeset),
+         {:ok, record} <- Ash.Changeset.apply_attributes(changeset),
+         :ok <- reject_nil_create_pk(resource, changeset, record) do
+      {:ok, record, push_fields(resource, changeset, record)}
+    else
+      {:error, %Ash.Changeset{} = invalid} -> {:error, invalid}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp reject_atomics(changeset) do
+    if changeset.atomics == [] and changeset.create_atomics in [[], %{}] do
+      :ok
+    else
+      {:error,
+       "write_through does not support atomic creates/updates — the target push is built " <>
+         "from materialized attribute values (Ash.Changeset.apply_attributes/1 cannot evaluate " <>
+         "an atomic expression). Use the async (outbox) write path for this action instead."}
+    end
+  end
+
+  defp reject_nil_create_pk(resource, %{action_type: :create}, record) do
+    nil_pk_fields = resource |> Ash.Resource.Info.primary_key() |> Enum.filter(&is_nil(Map.get(record, &1)))
+
+    if nil_pk_fields == [] do
+      :ok
+    else
+      {:error,
+       "write_through create left primary key field(s) #{inspect(nil_pk_fields)} nil after " <>
+         "materialization — DB-generated primary keys (and other DB-generated fields) are not " <>
+         "supported for write_through creates; only Ash-level (including lazy) defaults are " <>
+         "pre-materialized. Use the async (outbox) write path for this resource/action instead."}
+    end
+  end
+
+  defp reject_nil_create_pk(_resource, _changeset, _record), do: :ok
+
+  # loaded/materialized fields ∪ explicitly changed fields ∪ the primary key —
+  # never `%Ash.NotLoaded{}`. On an update built from a partially-selected
+  # record, `apply_attributes` overlays changes onto `changeset.data`, so
+  # untouched UNselected fields remain NotLoaded; the push must never carry
+  # those (`Backfill.upsert_record` defaults to ALL resource attributes with
+  # no `:fields` option, which would write NotLoaded garbage to the target).
+  defp push_fields(resource, changeset, record) do
+    pk = MapSet.new(Ash.Resource.Info.primary_key(resource))
+    changed = MapSet.new(Map.keys(changeset.attributes))
+
+    loaded =
+      resource
+      |> Ash.Resource.Info.attributes()
+      |> Enum.map(& &1.name)
+      |> Enum.filter(&loaded?(Map.get(record, &1)))
+      |> MapSet.new()
+
+    pk |> MapSet.union(changed) |> MapSet.union(loaded) |> Enum.to_list()
+  end
+
+  defp loaded?(%Ash.NotLoaded{}), do: false
+  defp loaded?(_), do: true
+
+  defp push_all_targets(resource, op_atom, record, fields) do
     Enum.reduce_while(LocalOutbox.targets(resource), :ok, fn target, :ok ->
       result =
         if op_atom == :destroy do
-          normalize(
-            AshMultiDatalayer.Orchestrator.LocalOutbox.Target.destroy(resource, target, record)
-          )
+          normalize(Target.destroy(resource, target, record))
         else
-          normalize(
-            AshMultiDatalayer.Orchestrator.LocalOutbox.Target.upsert(resource, target, record)
-          )
+          normalize(Target.upsert(resource, target, record, fields: fields))
         end
 
       case result do
@@ -203,7 +294,18 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
 
   # --- co-commit transaction --------------------------------------------
 
-  defp in_transaction(nil, fun), do: fun.()
+  # No co-commit repo (belt-and-suspenders — `validate_opts` rejects this
+  # config at compile time, but a direct/test call to `Write.run/3` can still
+  # reach here): the local write and the enqueue are NOT atomic, so an
+  # enqueue failure would otherwise raise past an already-committed local
+  # write. Rescue it into the same `{:error, _}` shape a co-committed failure
+  # returns — the local write still stands (unrecoverable without a repo),
+  # but the caller gets a data-layer error instead of an uncaught raise.
+  defp in_transaction(nil, fun) do
+    fun.()
+  rescue
+    error -> {:error, error}
+  end
 
   defp in_transaction(repo, fun) do
     case repo.transaction(fn ->
@@ -220,8 +322,11 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
   # Same Ecto repo for the local layer and the outbox → co-commit. Detected via
   # `<Layer>.Info.repo/2`, the convention ash_sqlite/ash_postgres share (keeps the
   # shell data-layer agnostic — the strategy asks the layer, not a hardcoded SQL
-  # module).
-  defp co_commit_repo(resource, local_layer, outbox) do
+  # module). Public: `LocalOutbox.validate_opts/2` (A1-3) reuses this exact
+  # resolvability check at compile time to reject a config with no co-commit
+  # repo, instead of only discovering it at the first async write.
+  @doc false
+  def co_commit_repo(resource, local_layer, outbox) do
     outbox_layer = Ash.DataLayer.data_layer(outbox)
     local_repo = repo_of(local_layer, resource)
     outbox_repo = repo_of(outbox_layer, outbox)

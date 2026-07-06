@@ -6,6 +6,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   `AshMultiDatalayer.Orchestrator.LocalOutbox`.
   """
   require Ash.Query
+  require Logger
 
   alias AshMultiDatalayer.Backfill
   alias AshMultiDatalayer.Orchestrator.LocalOutbox
@@ -16,6 +17,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   # --- queryable state ---------------------------------------------------
 
   @doc "Pending entries for a host resource (optionally scoped to a tenant)."
+  @spec pending(Ash.Resource.t(), term()) :: [Ash.Resource.record()]
   def pending(host_resource, tenant \\ nil) do
     host_resource
     |> outbox()
@@ -26,6 +28,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   end
 
   @doc "Parked entries for a host resource (optionally scoped to a tenant)."
+  @spec parked(Ash.Resource.t(), term()) :: [Ash.Resource.record()]
   def parked(host_resource, tenant \\ nil) do
     host_resource
     |> outbox()
@@ -41,6 +44,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   looks up the record's outbox chain by primary key, so a local-first UI can poll
   `status/1` for a "saving… / saved / sync failed" badge on every row.
   """
+  @spec status(Ash.Resource.record()) :: :synced | :pending | {:parked, [Ash.Resource.record()]}
   def status(%_{} = record) do
     host = record.__struct__
     pk = Snapshot.record_pk(host, record)
@@ -72,6 +76,8 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   (`{:parked, entries}`), or the timeout elapses (`:timeout`). Polls the outbox —
   the initial read means no transition is missable (the await/2 race).
   """
+  @spec await(Ash.Resource.record(), keyword()) ::
+          :synced | {:parked, [Ash.Resource.record()]} | :timeout
   def await(record_or_ref, opts \\ []) do
     deadline = now_ms() + Keyword.get(opts, :timeout, 5_000)
     interval = Keyword.get(opts, :interval, 25)
@@ -99,6 +105,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   # --- resolution verbs (operate on an outbox entry record) --------------
 
   @doc "parked → pending, re-trigger the chain head (after the operator fixed the cause)."
+  @spec retry(Ash.Resource.record()) :: :ok
   def retry(entry) do
     outbox = entry.__struct__
 
@@ -115,6 +122,8 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   Drop an entry. Discarding a `:create` drops its whole PK chain (loudly, in the
   return); otherwise drops just this entry.
   """
+  @spec discard(Ash.Resource.record()) ::
+          {:ok, %{discarded: pos_integer(), dropped_chain: boolean()}}
   def discard(entry) do
     outbox = entry.__struct__
 
@@ -133,26 +142,42 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
     end
   end
 
-  @doc "Replica wins: write the replica row over the local layer, drop the chain."
+  @doc """
+  Replica wins: write the replica row over the local layer, drop the chain.
+
+  Propagates the local-write result (M-5): on failure, returns `{:error, _}`
+  and leaves the chain in place — the only record of the disagreement would
+  otherwise be destroyed while the local layer still holds the un-discarded
+  value.
+  """
+  @spec discard_local(Ash.Resource.record()) :: :ok | {:error, term()}
   def discard_local(entry) do
     host = host(entry)
     local = LocalOutbox.local_layer(host)
 
-    case Target.read_pk(host, last_target(host), entry.record_pk) do
-      {:ok, nil} ->
-        # gone remotely — remove locally too
-        record = Snapshot.load(host, entry.record_pk)
-        Backfill.destroy_record(local, host, record, backfill_opts(host))
+    result =
+      case Target.read_pk(host, last_target(host), entry.record_pk) do
+        {:ok, nil} ->
+          # gone remotely — remove locally too
+          record = Snapshot.load(host, entry.record_pk)
+          Backfill.destroy_record(local, host, record, backfill_opts(host))
 
-      {:ok, remote} ->
-        Backfill.upsert_record(local, host, remote, backfill_opts(host))
+        {:ok, remote} ->
+          Backfill.upsert_record(local, host, remote, backfill_opts(host))
+      end
+
+    case normalize(result) do
+      :ok ->
+        drop_chain(entry)
+        :ok
+
+      {:error, _} = error ->
+        error
     end
-
-    drop_chain(entry)
-    :ok
   end
 
   @doc "Re-flush as a blind PK-upsert/destroy, ignoring base_image (LWW for this entry)."
+  @spec force(Ash.Resource.record()) :: :ok | {:error, term()}
   def force(entry) do
     host = host(entry)
     outbox = entry.__struct__
@@ -178,9 +203,30 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
 
   @doc """
   The app resolved the conflict into a NEW write: apply `changeset` through the
-  full LocalOutbox write path (fresh entries), then drop the parked chain.
+  full LocalOutbox write path (fresh entries), then drop exactly the OLD
+  parked chain.
+
+  Sequence is load-bearing (M-1): capture the parked chain's entries FIRST —
+  the apply below creates fresh entries sharing the same
+  `(resource, record_pk, target)` key, so a key-scoped chain lookup taken
+  AFTER applying would also catch (and destroy) those fresh `:pending`
+  entries, losing the very replication `rebase/2` exists to preserve. Only
+  destroy the entries captured before the apply ran.
+
+  Failure postures (invariant 1, both halves): if the apply raises or errors,
+  nothing below runs — the parked chain is untouched and the caller holds the
+  error. If cleanup of the captured chain fails, nothing is destroyed (it runs
+  in one outbox-repo transaction) — the resolution is applied locally and its
+  fresh entries exist, held `:blocked` behind the still-parked head; the
+  caller gets a `RebaseCleanupError` naming that head so an operator can run
+  the recovery (`discard/1`) directly.
   """
+  @spec rebase(Ash.Resource.record(), Ash.Changeset.t()) ::
+          {:ok, Ash.Resource.record()} | {:error, term()}
   def rebase(entry, changeset) do
+    outbox = entry.__struct__
+    captured_chain = record_chain(entry)
+
     result =
       case changeset.action_type do
         :create -> Ash.create!(changeset)
@@ -188,16 +234,63 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
         :destroy -> Ash.destroy!(changeset)
       end
 
-    drop_chain(entry)
-    {:ok, result}
+    case destroy_captured_chain(outbox, captured_chain, entry) do
+      :ok ->
+        kick_next(entry)
+        {:ok, result}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  # Destroys exactly the chain captured before `rebase/2` applied its
+  # resolution changeset — never a fresh key-scoped `drop_chain/1`, which
+  # cannot distinguish the old chain from the apply's own fresh entries (the
+  # M-1 bug). All-or-nothing inside one outbox-repo transaction: an
+  # `Ash.destroy!` raise inside `Ash.DataLayer.transaction` rolls back
+  # (destroying nothing) and re-raises, which this rescues into a structured
+  # error. Destroys newest-seq-first (parked-head-last): on a repo-less
+  # outbox (no transaction, the defensive fallback only), a partial failure
+  # then still leaves the parked head — the blocker and the evidence — intact.
+  defp destroy_captured_chain(_outbox, [], _entry), do: :ok
+
+  defp destroy_captured_chain(outbox, captured_chain, entry) do
+    domain = domain(outbox)
+    ordered = Enum.sort_by(captured_chain, & &1.seq, :desc)
+
+    Ash.DataLayer.transaction(outbox, fn ->
+      Enum.each(
+        ordered,
+        &Ash.destroy!(&1, action: :discard, domain: domain, authorize?: false)
+      )
+    end)
+
+    :ok
+  rescue
+    error ->
+      head_seq = captured_chain |> Enum.map(& &1.seq) |> Enum.min(fn -> entry.seq end)
+
+      {:error,
+       %AshMultiDatalayer.Orchestrator.LocalOutbox.RebaseCleanupError{
+         cause: error,
+         resource: entry.resource,
+         record_pk: entry.record_pk,
+         target: entry.target,
+         head_seq: head_seq
+       }}
   end
 
   # --- sync control ------------------------------------------------------
 
+  @doc "Pause the outbox flush queue for a host resource."
+  @spec pause_sync(Ash.Resource.t()) :: :ok
   def pause_sync(host_resource) do
     Oban.pause_queue(instance(host_resource), queue: queue(host_resource))
   end
 
+  @doc "Resume the outbox flush queue and kick the pending backlog immediately."
+  @spec resume_sync(Ash.Resource.t()) :: :ok
   def resume_sync(host_resource) do
     :ok = Oban.resume_queue(instance(host_resource), queue: queue(host_resource))
     # Kick the backlog so it drains without waiting for the next sweep tick.
@@ -206,6 +299,8 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
     :ok
   end
 
+  @doc "Whether the outbox flush queue for a host resource is currently paused."
+  @spec sync_paused?(Ash.Resource.t()) :: boolean()
   def sync_paused?(host_resource) do
     case Oban.check_queue(instance(host_resource), queue: queue(host_resource)) do
       %{paused: paused} -> paused
@@ -223,6 +318,11 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   deleted locally. **Skips any PK whose outbox chain is non-empty** (the
   dirty-chain rule) — its convergence path is the outbound flush.
   """
+  @spec refresh(Ash.Resource.t(), :all | map(), term()) :: %{
+          refreshed: non_neg_integer(),
+          deleted: non_neg_integer(),
+          skipped_dirty: [map()]
+        }
   def refresh(host_resource, scope, tenant \\ nil) do
     local = LocalOutbox.local_layer(host_resource)
     target = last_target(host_resource)
@@ -276,6 +376,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   end
 
   @doc "Full hydration: guarded by an empty outbox, then `refresh(:all)`."
+  @spec hydrate(Ash.Resource.t(), term()) :: {:ok, map()} | {:error, :outbox_not_empty}
   def hydrate(host_resource, tenant \\ nil) do
     if outbox_nonempty?(host_resource, tenant) do
       {:error, :outbox_not_empty}
@@ -286,6 +387,8 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
 
   # --- notification bridge ----------------------------------------------
 
+  @doc "Routes an inbound change notification to a per-record `refresh/3`."
+  @spec handle_external_change(Ash.Resource.t(), Ash.Notifier.Notification.t()) :: :ok
   def handle_external_change(host_resource, %{data: data}) when not is_nil(data) do
     pk = Snapshot.record_pk(host_resource, data)
     _ = refresh(host_resource, pk, tenant_of(data))
@@ -294,6 +397,8 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
 
   def handle_external_change(_host_resource, _notification), do: :ok
 
+  @doc "Routes a gap notification (missed/unreliable delivery) to a full `refresh(:all)`."
+  @spec handle_external_gap(Ash.Resource.t(), term()) :: :ok
   def handle_external_gap(host_resource, tenant) do
     _ = refresh(host_resource, :all, tenant)
     :ok
@@ -301,6 +406,8 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
 
   # --- boot-time hydration ----------------------------------------------
 
+  @doc "Boot-time hydration child specs for every `:if_empty`/`:on_start` resource."
+  @spec child_specs([Ash.Resource.t()]) :: [Supervisor.child_spec()]
   def child_specs(resources) do
     to_hydrate = Enum.filter(resources, &(LocalOutbox.hydrate_mode(&1) in [:if_empty, :on_start]))
 
@@ -318,8 +425,23 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
       :if_empty -> hydrate(resource)
       _ -> :ok
     end
+
+    :ok
   rescue
-    _ -> :ok
+    # Mirrors ExternalChange's warn-then-swallow contract: a failed boot
+    # hydration must not crash the supervision tree (a stale/empty local
+    # authority self-heals on the next refresh/gap sweep), but it must not be
+    # *silent* either — an operator needs to know the local layer booted
+    # without its seed data.
+    error ->
+      Logger.warning(
+        "ash_multi_datalayer: boot hydration for #{inspect(resource)} failed and was " <>
+          "skipped (the local layer boots without its seed data; self-heals on the next " <>
+          "refresh/hydrate): #{Exception.message(error)}\n" <>
+          Exception.format_stacktrace(__STACKTRACE__)
+      )
+
+      :ok
   end
 
   # --- internals ---------------------------------------------------------
@@ -426,7 +548,21 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
 
   defp outbox(host_resource), do: LocalOutbox.outbox_resource(host_resource)
   defp domain(resource), do: Ash.Resource.Info.domain(resource)
-  defp host(entry), do: String.to_existing_atom(entry.resource)
+  defp host(entry) do
+    outbox = entry.__struct__
+
+    case AshMultiDatalayer.Orchestrator.LocalOutbox.HostResolver.resolve(
+           outbox,
+           entry.resource
+         ) do
+      {:ok, host} ->
+        host
+
+      :error ->
+        raise "unresolvable LocalOutbox host resource for outbox entry " <>
+                "(resource: #{inspect(entry.resource)}) — this app no longer defines it"
+    end
+  end
   defp queue(host_resource), do: SyncInfo.queue(outbox(host_resource))
   defp instance(host_resource), do: SyncInfo.oban_instance(outbox(host_resource))
   defp read_order(host_resource), do: AshMultiDatalayer.DataLayer.Info.read_order(host_resource)

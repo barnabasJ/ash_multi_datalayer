@@ -155,7 +155,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox do
         {:error, "LocalOutbox requires oban + ash_oban (optional deps) to be available."}
 
       true ->
-        validate_shape(dsl_or_resource)
+        validate_shape(dsl_or_resource, opts)
     end
   end
 
@@ -165,7 +165,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox do
 
   defp oban_loaded?, do: Code.ensure_loaded?(Oban) and Code.ensure_loaded?(AshOban)
 
-  defp validate_shape(dsl_or_resource) do
+  defp validate_shape(dsl_or_resource, opts) do
     read_order = Info.read_order(dsl_or_resource)
     write_order = Info.write_order(dsl_or_resource)
 
@@ -182,7 +182,38 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox do
         {:error, "LocalOutbox requires at least one replication target in `write_order`."}
 
       true ->
-        :ok
+        validate_co_commit(dsl_or_resource, opts)
+    end
+  end
+
+  # M-4: an async write with no co-commit repo commits the local write
+  # durably and then raises (instead of returning `{:error, _}`) when the
+  # outbox enqueue fails — a silently orphaned local write. Reject the
+  # config at compile time rather than let it degrade at the first failure.
+  defp validate_co_commit(dsl_or_resource, opts) do
+    local_layer = hd(Info.write_layer_modules(dsl_or_resource))
+    outbox = Keyword.fetch!(opts, :outbox_resource)
+
+    case Code.ensure_compiled(outbox) do
+      {:module, ^outbox} ->
+        if AshMultiDatalayer.Orchestrator.LocalOutbox.Write.co_commit_repo(
+             dsl_or_resource,
+             local_layer,
+             outbox
+           ) do
+          :ok
+        else
+          {:error,
+           "LocalOutbox requires the local layer (#{inspect(local_layer)}) and " <>
+             "`outbox_resource:` (#{inspect(outbox)}) to share a co-commit Ecto repo — " <>
+             "an async write's local commit and outbox enqueue must be one transaction, or a " <>
+             "failed enqueue silently orphans the local write. Configure both on the same repo."}
+        end
+
+      {:error, reason} ->
+        {:error,
+         "LocalOutbox's `outbox_resource:` (#{inspect(outbox)}) could not be compiled/loaded " <>
+           "(#{inspect(reason)})."}
     end
   end
 
