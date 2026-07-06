@@ -91,6 +91,7 @@ defmodule AshMultiDatalayer.Test.Resources do
       resource AshMultiDatalayer.Test.Resources.TestPost
       resource AshMultiDatalayer.Test.Resources.SingleLayerPost
       resource AshMultiDatalayer.Test.Resources.MirrorPost
+      resource AshMultiDatalayer.Test.Resources.MirrorAuthor
       resource AshMultiDatalayer.Test.Resources.FailingPost
       resource AshMultiDatalayer.Test.Resources.CappedPost
       resource AshMultiDatalayer.Test.Resources.SampledPost
@@ -655,6 +656,51 @@ defmodule AshMultiDatalayer.Test.Resources do
       attribute :age, :integer, public?: true
       attribute :score, :decimal, public?: true
       attribute :published_at, :date, public?: true
+      attribute :author_id, :uuid, public?: true
+    end
+
+    calculations do
+      calculate :adult?, :boolean, expr(age >= 18) do
+        public? true
+      end
+    end
+
+    actions do
+      defaults [:read, :destroy, create: :*, update: :*]
+    end
+  end
+
+  defmodule MirrorAuthor do
+    @moduledoc false
+    use Ash.Resource,
+      domain: Domain,
+      data_layer: AshPostgres.DataLayer
+
+    postgres do
+      table "mdl_authors"
+      repo(AshMultiDatalayer.TestRepo)
+    end
+
+    attributes do
+      uuid_primary_key :id
+      attribute :name, :string, public?: true
+    end
+
+    relationships do
+      has_many :posts, AshMultiDatalayer.Test.Resources.MirrorPost,
+        public?: true,
+        destination_attribute: :author_id
+    end
+
+    aggregates do
+      count :post_count, :posts do
+        public? true
+      end
+
+      count :adult_post_count, :posts do
+        public? true
+        filter expr(age >= 18)
+      end
     end
 
     actions do
