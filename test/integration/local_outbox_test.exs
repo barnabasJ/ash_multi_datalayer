@@ -347,6 +347,19 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
       assert [%{id: ^id, name: "external"}] = local()
     end
 
+    test "the ExternalChange notifier drives a LocalOutbox refresh (inbound realtime)" do
+      # a realtime transport replays another client's write as a local Ash
+      # notification; the strategy-agnostic notifier must route it to the
+      # orchestrator's handle_external_change → refresh that PK into local.
+      id = Ash.UUID.generate()
+      Target.upsert(Widget, :remote, %Widget{id: id, name: "pushed-by-peer", count: 3})
+
+      notification = %Ash.Notifier.Notification{resource: Widget, data: %Widget{id: id}}
+      assert :ok = AshMultiDatalayer.Notifiers.ExternalChange.notify(notification)
+
+      assert [%{id: ^id, name: "pushed-by-peer"}] = local()
+    end
+
     test "refresh UPDATES an existing (clean) local row when the remote changed" do
       # a fully-synced local row; another client then changes the same row on the
       # server. A refresh must overwrite the local copy with the newer remote one
