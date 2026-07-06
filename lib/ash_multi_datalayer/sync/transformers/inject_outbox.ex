@@ -81,7 +81,7 @@ defmodule AshMultiDatalayer.Sync.Transformers.InjectOutbox do
     |> attr(:attribute,
       name: :error_class,
       type: :atom,
-      constraints: [one_of: [:transient_exhausted, :rejected, :conflict]],
+      constraints: [one_of: [:transient_exhausted, :rejected, :conflict, :auth]],
       public?: true
     )
     |> attr(:attribute, name: :last_error, type: :map, public?: true)

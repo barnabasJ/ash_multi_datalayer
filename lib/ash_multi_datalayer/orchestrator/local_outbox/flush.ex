@@ -11,8 +11,11 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
        parked ancestor → hold (the chain is blocked until that head is resolved).
     2. **Push** the entry to `target` via `Backfill`, honouring `conflict_detection`.
     3. **Mark** the entry `:synced` and kick the next pending chain entry
-       (post-commit); a semantic **rejection**/**conflict** parks in-action, a
-       transient error raises (Oban retries → `on_error` parks).
+       (post-commit); a semantic **rejection**/**conflict** parks in-action, an
+       **auth** failure (`Forbidden`) parks in-action too — immediately, no
+       retries burned, since a token doesn't un-expire by retrying — and
+       everything else raises as transient (Oban retries → `on_error` parks
+       as `:transient_exhausted`).
 
   Deliberately **no** offline/transport error class: a target may be ETS/Mnesia
   with no network at all. A failed push retries then parks; the application pauses
@@ -23,7 +26,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
   require Ash.Query
 
   alias AshMultiDatalayer.Orchestrator.LocalOutbox
-  alias AshMultiDatalayer.Orchestrator.LocalOutbox.{Snapshot, Target}
+  alias AshMultiDatalayer.Orchestrator.LocalOutbox.{HostResolver, Snapshot, Target}
   alias AshMultiDatalayer.Sync.Enqueue
 
   @impl true
@@ -35,20 +38,33 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
     outbox = changeset.resource
     domain = Ash.Resource.Info.domain(outbox)
     entry = changeset.data
-    host = String.to_existing_atom(entry.resource)
 
-    case chain_position(outbox, domain, entry) do
-      :head ->
-        apply_result(changeset, outbox, domain, host, entry, push(host, entry))
+    case HostResolver.resolve(outbox, entry.resource) do
+      {:ok, host} ->
+        case chain_position(outbox, domain, entry) do
+          :head ->
+            apply_result(changeset, outbox, domain, host, entry, push(host, entry))
 
-      :racing ->
-        # A pending ancestor is still ahead; try again shortly (zero budget burn).
-        raise AshOban.Errors.SnoozeJob, snooze_for: reorder_snooze()
+          :racing ->
+            # A pending ancestor is still ahead; try again shortly (zero budget burn).
+            raise AshOban.Errors.SnoozeJob, snooze_for: reorder_snooze()
 
-      :blocked ->
-        # A parked ancestor blocks the chain; hold without change. Resolving that
-        # head re-kicks this chain.
-        changeset
+          :blocked ->
+            # A parked ancestor blocks the chain; hold without change. Resolving that
+            # head re-kicks this chain.
+            changeset
+        end
+
+      :error ->
+        # A stale outbox row naming a resource this app no longer defines (a
+        # deploy/boot-ordering artifact, M-11) — park immediately rather than
+        # burn retries chasing a resource that can never resolve.
+        park(
+          changeset,
+          :rejected,
+          %{"reason" => "unresolvable LocalOutbox host resource: #{entry.resource}"},
+          nil
+        )
     end
   end
 
@@ -96,6 +112,12 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
     case classify(error) do
       :rejected ->
         park(changeset, :rejected, error_map(error), nil)
+
+      :auth ->
+        # A token/credential problem never un-expires by retrying — park
+        # immediately, no retry-budget burn (M-6). `retry/1` re-flushes once
+        # the operator fixes the underlying credentials.
+        park(changeset, :auth, error_map(error), nil)
 
       :transient ->
         # Retry via Oban backoff; `on_error :park` fires on exhaustion.
@@ -194,16 +216,21 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
   defp normalize({:ok, _record}), do: :ok
   defp normalize({:error, error}), do: {:error, error}
 
-  # --- error classification (semantic rejection vs transient) -----------
+  # --- error classification (semantic rejection vs auth vs transient) ---
 
   @doc false
-  # No offline class (targets can be networkless). Only two classes: a semantic
-  # rejection the replica will never accept (park now), and everything else
-  # (transient — retry, then park on exhaustion).
+  # No offline class (targets can be networkless). Three classes: a semantic
+  # rejection the replica will never accept (park now), an auth/credential
+  # failure that will never fix itself by retrying (park now, `:auth` — M-6:
+  # a token does not un-expire by retrying, and burning the retry budget
+  # before parking masks the likely-production failure as flakiness), and
+  # everything else (transient — retry, then park on exhaustion).
   def classify({:rejected, _}), do: :rejected
   def classify({:transient, _}), do: :transient
   def classify(%Ash.Error.Invalid{}), do: :rejected
   def classify(%{class: :invalid}), do: :rejected
+  def classify(%Ash.Error.Forbidden{}), do: :auth
+  def classify(%{class: :forbidden}), do: :auth
   def classify(_error), do: :transient
 
   defp error_map({_tag, reason}), do: %{"reason" => inspect(reason)}
