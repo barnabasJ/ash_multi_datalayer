@@ -67,9 +67,9 @@ Switch a resource to use `AshMultiDatalayer.DataLayer` as a drop-in for
    install underlying DSL sections automatically (Spark resolves extensions at
    `use` time), so you list a layer's extension yourself when its DSL section
    has required options — AshPostgres does (`table`, `repo`). Layers whose
-   sections work from defaults (like `Ash.DataLayer.Ets`) need no entry; add
-   one only if you want to configure them. If you forget a required extension,
-   the `ValidateLayers` verifier tells you exactly what to add.
+   sections work from defaults (like `Ash.DataLayer.Ets`) need no entry; add one
+   only if you want to configure them. If you forget a required extension, the
+   `ValidateLayers` verifier tells you exactly what to add.
 
 That's it. Reads now consult the ETS cache first and fall through to Postgres on
 a miss (backfilling the cache — backfill is always on for multi-layer
@@ -90,9 +90,9 @@ changes.
    often: missing `:assume_single_node` ack, a missing underlying extension, or
    `field_policies` incompatibility).
 5. Run `mix ash_multi_datalayer.generate_migrations` (or `mix ash.codegen`,
-   which the library hooks into) — it produces the same migrations as before
-   the switch. Don't use the stock `mix ash_postgres.generate_migrations`
-   directly: it discovers resources by data-layer equality and silently skips
+   which the library hooks into) — it produces the same migrations as before the
+   switch. Don't use the stock `mix ash_postgres.generate_migrations` directly:
+   it discovers resources by data-layer equality and silently skips
    multi-datalayer resources.
 6. Run your existing tests — nothing should change yet (because `read_order`
    defaults to fall-through but the cache is empty on first boot).
@@ -116,6 +116,61 @@ coverage — and therefore backfill — entirely.
 `:l1` and `:l2` are just names you picked. Use different names if it reads
 better for your use case (e.g. `:fast` / `:slow`).
 
+### How to pick a strategy (orchestrator)
+
+The layer list says _where_ the data lives; the **orchestrator** says _how_
+reads and writes are routed across those layers. It is a behaviour
+(`AshMultiDatalayer.Orchestrator`) resolved per resource, so the same data layer
+supports more than one policy:
+
+| Strategy                       | Reads                                            | Writes                                                                                | Use it for                                         |
+| ------------------------------ | ------------------------------------------------ | ------------------------------------------------------------------------------------- | -------------------------------------------------- |
+| **`ProvenCoverage`** (default) | fall through `read_order`, backfilling on a miss | propagate across `write_order`                                                        | a read-through cache in front of a source of truth |
+| **`LocalOutbox`**              | served entirely from a **local** layer (0 RPC)   | commit locally + co-commit an outbox entry an Oban worker flushes to the target later | offline-first / local-authoritative apps           |
+
+`ProvenCoverage` is implied when you only set `read_order`/`write_order`. Opt
+into `LocalOutbox` explicitly:
+
+```elixir
+multi_data_layer do
+  orchestrator {AshMultiDatalayer.Orchestrator.LocalOutbox,
+    outbox_resource: MyApp.Sync.OutboxEntry,
+    conflict_detection: {:stale_check, :updated_at},
+    hydrate: :manual}
+
+  layer :local, AshSqlite.DataLayer
+  layer :remote, AshRemote.DataLayer
+  read_order [:local]           # every read is local — no network on the hot path
+  write_order [:local, :remote] # local is authoritative; :remote is the replication target
+end
+```
+
+Generate the outbox resource and its migration with
+`mix ash_multi_datalayer.gen.outbox`. A flush whose target row moved since this
+client last saw the `conflict_detection` field is **parked** as a `:conflict`
+carrying a three-way snapshot (local / base / remote); resolve it with
+`LocalOutbox.force/1` (mine wins), `discard_local/1` (theirs win), `retry/1`, or
+`rebase/2`. Pause/resume the queue with `LocalOutbox.pause_sync/1` /
+`resume_sync/1` (the "go offline" toggle), and poll per-record state with
+`LocalOutbox.status/1`.
+
+### How inbound changes reach a client (realtime)
+
+Both strategies converge on inbound changes through one seam:
+`Orchestrator.handle_external_change/2`. Add the strategy-agnostic notifier
+`AshMultiDatalayer.Notifiers.ExternalChange` to a resource whose transport
+replays server-side changes as Ash notifications (e.g. `AshRemote.Realtime`),
+and each change is routed to the resource's strategy:
+
+- **`ProvenCoverage`** invalidates the covered rows → the next read refetches.
+- **`LocalOutbox`** refreshes that row into the local authority, **skipping any
+  PK with unflushed local edits** (the dirty-chain rule) → an online replica
+  converges instantly, while an offline client's pending edits are preserved to
+  surface as a conflict on resume.
+
+One notification stream, two strategy-appropriate reactions. Pair it with an
+app-level notifier that tells your LiveViews to re-render.
+
 ### How to disable the cache at runtime without a deploy
 
 When something goes wrong in production, flip the kill-switch:
@@ -133,8 +188,8 @@ When something goes wrong in production, flip the kill-switch:
    ```
 
 All reads for that resource now route only to the last layer in `read_order`,
-and writes only to the first layer in `write_order` — both the source of truth
-— skipping the cache layer entirely. Ledger invalidation still runs on writes
+and writes only to the first layer in `write_order` — both the source of truth —
+skipping the cache layer entirely. Ledger invalidation still runs on writes
 while disabled, so re-enabling can't serve coverage recorded before the switch
 was flipped. Re-enable with `AshMultiDatalayer.enable!/1`.
 
@@ -177,20 +232,20 @@ cache hit rate is lower than expected.
 ```
 
 Every event carries metadata
-`%{resource, tenant, filter_fingerprint, read_order, write_order}`.
-Measurements (and extra metadata) are per-event:
+`%{resource, tenant, filter_fingerprint, read_order, write_order}`. Measurements
+(and extra metadata) are per-event:
 
-| Event                          | Measurements                     | Extra metadata                                                                                      |
-| ------------------------------ | -------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `[:read, :hit]`                | `%{duration_us, ledger_size}`    | —                                                                                                    |
-| `[:read, :miss]`               | `%{duration_us, ledger_size}`    | `reason: :no_coverage_entry \| :solver_unsupported \| :fields_insufficient \| :not_cacheable \| :ledger_unavailable` |
-| `[:read, :backfill]`           | `%{duration_us, ledger_size}`    | `count` (rows backfilled)                                                                            |
-| `[:read, :divergence_detected]`| `%{cache_count, primary_count}`  | `pk_delta`                                                                                           |
-| `[:write, :applied]`           | `%{duration_us, ledger_size}`    | `operation`, `dropped_count`                                                                         |
-| `[:write, :failed_at_layer]`   | `%{}`                            | `operation`, `layer`, `reason`                                                                       |
-| `[:ledger, :invalidated]`      | `%{count, ledger_size}`          | —                                                                                                    |
-| `[:ledger, :evicted]`          | `%{ledger_size}`                 | —                                                                                                    |
-| `[:ledger, :full]`             | `%{ledger_size}`                 | —                                                                                                    |
+| Event                           | Measurements                    | Extra metadata                                                                                                       |
+| ------------------------------- | ------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `[:read, :hit]`                 | `%{duration_us, ledger_size}`   | —                                                                                                                    |
+| `[:read, :miss]`                | `%{duration_us, ledger_size}`   | `reason: :no_coverage_entry \| :solver_unsupported \| :fields_insufficient \| :not_cacheable \| :ledger_unavailable` |
+| `[:read, :backfill]`            | `%{duration_us, ledger_size}`   | `count` (rows backfilled)                                                                                            |
+| `[:read, :divergence_detected]` | `%{cache_count, primary_count}` | `pk_delta`                                                                                                           |
+| `[:write, :applied]`            | `%{duration_us, ledger_size}`   | `operation`, `dropped_count`                                                                                         |
+| `[:write, :failed_at_layer]`    | `%{}`                           | `operation`, `layer`, `reason`                                                                                       |
+| `[:ledger, :invalidated]`       | `%{count, ledger_size}`         | —                                                                                                                    |
+| `[:ledger, :evicted]`           | `%{ledger_size}`                | —                                                                                                                    |
+| `[:ledger, :full]`              | `%{ledger_size}`                | —                                                                                                                    |
 
 See the [technical deep-dive](../technical/ash-multi-datalayer.md) for the full
 schema.
@@ -206,10 +261,10 @@ end
 ```
 
 Defaults are 10 000 entries and 0.0 — the sampler is **off by default** and
-opt-in. It is a probabilistic canary (a dev tool, or opt-in production
-tracing), not a guarantee, and it costs an extra lower-layer request per
-sampled read. Raise the cap when you hit `[:ledger, :full]` telemetry; turn the
-sampler on (e.g. `0.01`) when divergence detection is operationally important.
+opt-in. It is a probabilistic canary (a dev tool, or opt-in production tracing),
+not a guarantee, and it costs an extra lower-layer request per sampled read.
+Raise the cap when you hit `[:ledger, :full]` telemetry; turn the sampler on
+(e.g. `0.01`) when divergence detection is operationally important.
 
 ### What gets cached (and what never does)
 
@@ -221,24 +276,24 @@ coverage of its filter:
   (locks additionally bypass coverage entirely, missing with reason
   `:not_cacheable`).
 
-Reads that **load calculations** get a *computed-value merge read* (see the
+Reads that **load calculations** get a _computed-value merge read_ (see the
 20260703 ADR): when the row filter is covered, the rows are served from the
 cache and ONE narrow query (`primary_key in [...]`, selecting only the PK plus
 the calculations) fetches the computed values from the source of truth and
-merges them in — hits carry `computed_values: :merged` metadata. Computed
-values are never cached; they are fetched fresh on every read that loads them.
-If a cached row has no source counterpart (an out-of-band delete), the merge
-is abandoned and the whole query falls through fresh (miss reason
-`:stale_cache`). The rows fetched by a calculation-carrying miss are
-backfilled and recorded like any other read.
+merges them in — hits carry `computed_values: :merged` metadata. Computed values
+are never cached; they are fetched fresh on every read that loads them. If a
+cached row has no source counterpart (an out-of-band delete), the merge is
+abandoned and the whole query falls through fresh (miss reason `:stale_cache`).
+The rows fetched by a calculation-carrying miss are backfilled and recorded like
+any other read.
 
 **Resource (relationship) aggregates are loudly unsupported** on multi-layer
-resources: SQL layers build the related subquery via the destination
-resource's data layer — which is this library — so the aggregate would be
-silently `NotLoaded`. `can?({:aggregate, _})` is `false`, making Ash raise at
-query build instead. Self-aggregation (`Ash.count/2` etc.) works and routes to
-the source of truth; remote-style aggregates (e.g. ash_remote's, which arrive
-as calculations) are unaffected.
+resources: SQL layers build the related subquery via the destination resource's
+data layer — which is this library — so the aggregate would be silently
+`NotLoaded`. `can?({:aggregate, _})` is `false`, making Ash raise at query build
+instead. Self-aggregation (`Ash.count/2` etc.) works and routes to the source of
+truth; remote-style aggregates (e.g. ash_remote's, which arrive as calculations)
+are unaffected.
 
 Limited/offset probes **are** still served from previously recorded unlimited
 coverage — the cache layer applies sort/limit/offset itself. Field coverage is
