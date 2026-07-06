@@ -130,6 +130,18 @@ defmodule AshMultiDatalayer.Coverage.Invalidation do
   # immediately after. Accepted for the single code path (pass-3 S3): with
   # a remote earlier layer this is a second network round trip per local
   # write; a future strategy with a different topology must revisit it.
+  #
+  # M-7 (doc-only by decision, whole-repo review): eviction here and
+  # `WriteDispatch.propagate/5`'s re-upsert of the fresh record are two
+  # separate steps, not one atomic swap — a reader landing in the window
+  # between them sees the row PHYSICALLY ABSENT from an earlier layer, even
+  # though it existed before this update and will exist again immediately
+  # after. This is an absence ANOMALY (a state that never logically existed),
+  # not staleness (a state that WAS true once) — the epoch/ledger protocol
+  # this module implements guards against serving a stale value, not against
+  # this kind of transient, self-healing miss. Revisit upsert-in-place for
+  # updates (evict only on destroy/PK-change) only if this shows up in
+  # practice; today's fix is documentation, not a behavior change.
   defp evict_physical_row(_resource, _tenant, nil), do: :ok
 
   defp evict_physical_row(resource, tenant, row_before) do
@@ -161,6 +173,61 @@ defmodule AshMultiDatalayer.Coverage.Invalidation do
     end
 
     :ok
+  end
+
+  @doc """
+  Batched ghost eviction from a read-path reconcile pass (M-3). Reconcile
+  physically finds rows in an earlier cache layer that a fresh source fetch
+  did not return — but pre-fix, that destroy carried no epoch/ledger
+  awareness at all, so a covering entry recorded concurrently by another
+  reader (whose fetch legitimately included the row, postdating whatever
+  write created it) survived pointing at a now-missing row: a lasting,
+  silent missing-row cache hit (pass-2 C1's race).
+
+  Reuses `on_write/4`'s exact machinery as a destroy-style invalidation for
+  every ghost — `should_drop?(entry, ghost, nil)`, `row_after: nil` because
+  each ghost is being evicted, not replaced — but batched: bump the epoch
+  ONCE per reconcile pass (not once per ghost, pass-3 S1) and scan
+  `Coverage.entries/2` ONCE, dropping any entry covering ANY ghost. A
+  concurrent `Coverage.record/5` now sees the bumped epoch and aborts, exactly
+  like every other cache mutation — closing the race `on_write/4` already
+  closes for ordinary writes.
+
+  Physical eviction of the ghost rows themselves stays in the caller (the
+  read path already knows which specific layer each ghost was found on;
+  `evict_physical_row/3` sweeps ALL earlier layers, which would be wrong
+  here — a ghost on one cache layer says nothing about that row's validity
+  on another).
+
+  Known accepted consequence (pass-1 W3): the reconcile-initiating reader's
+  OWN `Coverage.record/5` call also sees `epoch_moved?` (this bump) and skips
+  recording — that reader's fetch predates its own reconcile's ledger
+  surgery. Intentional and conservative: the next identical read is a clean
+  miss that refetches and records fresh coverage.
+  """
+  @spec on_evict(module(), term(), [Ash.Resource.Record.t()]) :: non_neg_integer()
+  def on_evict(_resource, _tenant, []), do: 0
+
+  def on_evict(resource, tenant, ghosts) do
+    Coverage.bump_epoch(resource, tenant)
+
+    dropped =
+      resource
+      |> Coverage.entries(tenant)
+      |> Enum.filter(fn entry -> Enum.any?(ghosts, &should_drop?(entry, &1, nil)) end)
+
+    Enum.each(dropped, &Coverage.drop(resource, tenant, &1.id))
+
+    count = length(dropped)
+
+    if count > 0 do
+      Telemetry.ledger(:invalidated, resource, tenant, %{
+        count: count,
+        ledger_size: Coverage.size(resource, tenant)
+      })
+    end
+
+    count
   end
 
   @doc """

@@ -33,6 +33,7 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
   alias AshMultiDatalayer.Backfill
   alias AshMultiDatalayer.Capability
   alias AshMultiDatalayer.Coverage
+  alias AshMultiDatalayer.Coverage.Invalidation
   alias AshMultiDatalayer.DataLayer.Info
   alias AshMultiDatalayer.DataLayer.Query
   alias AshMultiDatalayer.Delegate
@@ -783,22 +784,34 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
       lock: nil
     }
 
-    Enum.each(
-      earlier_layers,
-      &reconcile_layer(&1, reconcile_query, resource, query, pk, fetched_pks)
-    )
+    # Scan every earlier layer FIRST, collecting `{layer, ghost_row}` pairs,
+    # before evicting anything (pass-3 S1): a single batched
+    # `Invalidation.on_evict/3` call bumps the epoch once and scans the
+    # ledger once for the whole reconcile pass, instead of once per ghost —
+    # and joins the epoch protocol doing it (M-3), unlike a bare per-ghost
+    # `evict_ghost/4` (which has no epoch/ledger awareness at all).
+    ghosts =
+      Enum.flat_map(
+        earlier_layers,
+        &scan_layer_ghosts(&1, reconcile_query, resource, query, pk, fetched_pks)
+      )
+
+    unless ghosts == [] do
+      Invalidation.on_evict(resource, query.tenant, Enum.map(ghosts, &elem(&1, 1)))
+      Enum.each(ghosts, fn {layer, ghost_row} -> evict_ghost(layer, resource, ghost_row, query) end)
+    end
   end
 
   defp reconcile_filter(%Query{filter: filter}, nil), do: filter
   defp reconcile_filter(%Query{filter: filter}, :universe), do: filter
   defp reconcile_filter(%Query{filter: filter}, {:ok, region}), do: and_filter(filter, region)
 
-  defp reconcile_layer(layer, reconcile_query, resource, original_query, pk, fetched_pks) do
+  defp scan_layer_ghosts(layer, reconcile_query, resource, original_query, pk, fetched_pks) do
     case Delegate.run_on_layer(reconcile_query, layer) do
       {:ok, cached_rows} ->
         cached_rows
         |> Enum.reject(&MapSet.member?(fetched_pks, Map.fetch!(&1, pk)))
-        |> Enum.each(&evict_ghost(layer, resource, &1, original_query))
+        |> Enum.map(&{layer, &1})
 
       {:error, reason} ->
         # Neither failing the read (it already succeeded) nor skipping the
@@ -814,6 +827,8 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
         Telemetry.read(:backfill_aborted, resource, original_query, %{}, %{
           reason: :reconcile_scan_failed
         })
+
+        []
     end
   end
 

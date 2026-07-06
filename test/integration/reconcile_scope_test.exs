@@ -47,24 +47,35 @@ defmodule AshMultiDatalayer.Integration.ReconcileScopeTest do
     FailingEts.clear!()
 
     # A later recording over the ghost's region: the source correctly
-    # excludes it, and reconcile deletes the physical residue.
-    assert [] = FailingPost |> Ash.Query.filter(name == "ghost-a") |> Ash.read!()
-
-    # Convergence, not luck: the FOLLOW-UP read is a coverage hit and still
-    # correctly empty.
+    # excludes it, and reconcile deletes the physical residue — via
+    # `Invalidation.on_evict/3` (A3/M-3), which bumps the epoch as part of
+    # the same batch that drops covering ledger entries, exactly like every
+    # other cache mutation.
     parent = self()
     handler = "reconcile-scope-a-#{System.unique_integer([:positive])}"
 
-    :telemetry.attach(
+    :telemetry.attach_many(
       handler,
-      [:ash_multi_datalayer, :read, :hit],
-      fn _event, _measurements, _metadata, _config -> send(parent, :mdl_hit) end,
+      [[:ash_multi_datalayer, :read, :hit], [:ash_multi_datalayer, :read, :miss]],
+      fn event, _measurements, _metadata, _config -> send(parent, {:mdl_read, List.last(event)}) end,
       nil
     )
 
     try do
       assert [] = FailingPost |> Ash.Query.filter(name == "ghost-a") |> Ash.read!()
-      assert_received :mdl_hit
+
+      # Known accepted consequence (A3, pass-1 W3): THIS read's own reconcile
+      # just evicted the ghost, bumping the epoch — its own `Coverage.record/5`
+      # call (epoch0 captured before the bump) now sees `epoch_moved?` and
+      # skips recording. So the very NEXT read is a clean MISS, not a hit: it
+      # refetches (still correctly empty) and records fresh, clean coverage.
+      assert [] = FailingPost |> Ash.Query.filter(name == "ghost-a") |> Ash.read!()
+      assert_received {:mdl_read, :miss}
+
+      # Convergence, not luck: only the THIRD read is a genuine coverage hit,
+      # and still correctly empty.
+      assert [] = FailingPost |> Ash.Query.filter(name == "ghost-a") |> Ash.read!()
+      assert_received {:mdl_read, :hit}
     after
       :telemetry.detach(handler)
     end
