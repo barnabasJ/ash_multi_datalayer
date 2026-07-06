@@ -5,10 +5,17 @@ defmodule AshMultiDatalayer.Test.BlockingLayer do
   message from the arming test process — for deterministically reproducing
   read/write races without sleeps.
 
-  The park happens **after** delegating: `run_query` captures the target's
-  result first, parks, then returns the captured result. Parking before
-  delegating would fetch post-write values on resume and the race would not
-  reproduce (fix-plan review-2 F12).
+  The park happens **after** delegating by default (`park: :after`, the
+  implicit default): `run_query` captures the target's result first, parks,
+  then returns the captured result. Parking before delegating would fetch
+  post-write values on resume and the race would not reproduce (fix-plan
+  review-2 F12) — this is exactly right for a reader racing a concurrent
+  write that must observe its OWN stale snapshot.
+
+  The opposite ordering (`park: :before`) is for the inverse shape: a reader
+  that must observe values written **during** its pause (e.g. reconcile's
+  ghost-eviction race, M-3) — it parks first, then delegates on release, so
+  the real fetch runs after whatever the test does while it's parked.
 
   Usage — fully message-based, no polling:
 
@@ -24,6 +31,7 @@ defmodule AshMultiDatalayer.Test.BlockingLayer do
 
   defmacro __using__(opts) do
     wraps = Macro.expand(Keyword.fetch!(opts, :wraps), __CALLER__)
+    park_mode = Keyword.get(opts, :park, :after)
     Code.ensure_compiled!(wraps)
 
     defs =
@@ -41,12 +49,23 @@ defmodule AshMultiDatalayer.Test.BlockingLayer do
 
     run_query_def =
       if function_exported?(wraps, :run_query, 2) do
-        quote do
-          def run_query(query, resource) do
-            result = unquote(wraps).run_query(query, resource)
-            AshMultiDatalayer.Test.BlockingLayer.maybe_park(__MODULE__)
-            result
-          end
+        case park_mode do
+          :after ->
+            quote do
+              def run_query(query, resource) do
+                result = unquote(wraps).run_query(query, resource)
+                AshMultiDatalayer.Test.BlockingLayer.maybe_park(__MODULE__)
+                result
+              end
+            end
+
+          :before ->
+            quote do
+              def run_query(query, resource) do
+                AshMultiDatalayer.Test.BlockingLayer.maybe_park(__MODULE__)
+                unquote(wraps).run_query(query, resource)
+              end
+            end
         end
       end
 

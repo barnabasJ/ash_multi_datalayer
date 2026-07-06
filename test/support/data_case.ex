@@ -36,6 +36,7 @@ defmodule AshMultiDatalayer.DataCase do
     reset_resource!(AshMultiDatalayer.Test.Resources.SampledPost)
     reset_resource!(AshMultiDatalayer.Test.Resources.LocalEvalOffPost)
     reset_resource!(AshMultiDatalayer.Test.Resources.RaceTestPost)
+    reset_resource!(AshMultiDatalayer.Test.Resources.ReconcileRaceTestPost)
 
     :ok
   end

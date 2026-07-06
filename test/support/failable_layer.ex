@@ -3,8 +3,10 @@ defmodule AshMultiDatalayer.Test.FailableLayer do
   A LocalOutbox replication-target stand-in: delegates every `Ash.DataLayer`
   callback to a wrapped layer (default `Ash.DataLayer.Ets`, so pushes are
   inspectable), but can be armed to fail `upsert`/`destroy` with a tagged error
-  (`:rejected` → parks immediately; `:transient` → retries then parks) or to
-  raise a conflict — for deterministic flush-triage tests without a real network.
+  (`:rejected` → parks immediately; `:transient` → retries then parks;
+  `:forbidden` → an `%Ash.Error.Forbidden{}`, parks immediately as `:auth`) or
+  to raise a conflict — for deterministic flush-triage tests without a real
+  network.
 
       use AshMultiDatalayer.Test.FailableLayer, wraps: Ash.DataLayer.Ets
 
@@ -30,14 +32,31 @@ defmodule AshMultiDatalayer.Test.FailableLayer do
         end
       end
 
+    # Data layers disagree on `upsert`'s arity (`Ash.DataLayer.Ets` takes an
+    # `identity`, `AshSqlite.DataLayer` doesn't) — call whichever `wraps`
+    # actually implements, never a hardcoded arity.
+    upsert_def =
+      if function_exported?(wraps, :upsert, 4) do
+        quote do
+          def upsert(resource, changeset, keys, identity \\ nil) do
+            AshMultiDatalayer.Test.FailableLayer.guard(__MODULE__, fn ->
+              unquote(wraps).upsert(resource, changeset, keys, identity)
+            end)
+          end
+        end
+      else
+        quote do
+          def upsert(resource, changeset, keys) do
+            AshMultiDatalayer.Test.FailableLayer.guard(__MODULE__, fn ->
+              unquote(wraps).upsert(resource, changeset, keys)
+            end)
+          end
+        end
+      end
+
     quote do
       (unquote_splicing(passthrough))
-
-      def upsert(resource, changeset, keys, identity \\ nil) do
-        AshMultiDatalayer.Test.FailableLayer.guard(__MODULE__, fn ->
-          unquote(wraps).upsert(resource, changeset, keys, identity)
-        end)
-      end
+      unquote(upsert_def)
 
       def destroy(resource, changeset) do
         AshMultiDatalayer.Test.FailableLayer.guard(__MODULE__, fn ->
@@ -55,7 +74,7 @@ defmodule AshMultiDatalayer.Test.FailableLayer do
     :ok
   end
 
-  @doc "Arm the layer to fail the next writes with `spec` (`:rejected` | `:transient`)."
+  @doc "Arm the layer to fail the next writes with `spec` (`:rejected` | `:transient` | `:forbidden`)."
   def fail(layer, spec), do: :ets.insert(@table, {layer, spec})
 
   @doc "Disarm the layer — writes delegate normally."
@@ -66,6 +85,7 @@ defmodule AshMultiDatalayer.Test.FailableLayer do
     case :ets.lookup(@table, layer) do
       [{^layer, :rejected}] -> {:error, {:rejected, "target rejected the write"}}
       [{^layer, :transient}] -> {:error, {:transient, "target transiently unavailable"}}
+      [{^layer, :forbidden}] -> {:error, %Ash.Error.Forbidden{}}
       _ -> delegate.()
     end
   end

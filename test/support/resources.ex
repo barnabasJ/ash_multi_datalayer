@@ -19,6 +19,16 @@ defmodule AshMultiDatalayer.Test.BlockingEts do
   use AshMultiDatalayer.Test.BlockingLayer, wraps: Ash.DataLayer.Ets
 end
 
+defmodule AshMultiDatalayer.Test.ReconcileBlockingEts do
+  @moduledoc """
+  Ets cache layer that parks `run_query` **before** delegating — for the M-3
+  reconcile ghost-eviction race, where the reconcile scan must observe rows
+  written by another process during the pause (see
+  `AshMultiDatalayer.Test.BlockingLayer`'s `park: :before` mode).
+  """
+  use AshMultiDatalayer.Test.BlockingLayer, wraps: Ash.DataLayer.Ets, park: :before
+end
+
 defmodule AshMultiDatalayer.Test.FailingEts do
   @moduledoc """
   Delegates to `Ash.DataLayer.Ets` but fails upserts/destroys on demand —
@@ -97,6 +107,7 @@ defmodule AshMultiDatalayer.Test.Resources do
       resource AshMultiDatalayer.Test.Resources.SampledPost
       resource AshMultiDatalayer.Test.Resources.LocalEvalOffPost
       resource AshMultiDatalayer.Test.Resources.RaceTestPost
+      resource AshMultiDatalayer.Test.Resources.ReconcileRaceTestPost
       resource AshMultiDatalayer.Test.Resources.TestAuthor
       # Relationship-aggregate data-layer permutation matrix (parent × child):
       resource AshMultiDatalayer.Test.Resources.PgPost
@@ -616,6 +627,44 @@ defmodule AshMultiDatalayer.Test.Resources do
     multi_data_layer do
       layer(:l1, AshMultiDatalayer.Test.BlockingEts)
       layer(:l2, AshMultiDatalayer.Test.BlockingPostgres)
+
+      read_order([:l1, :l2])
+      write_order([:l2, :l1])
+    end
+
+    postgres do
+      table "mdl_posts"
+      repo(AshMultiDatalayer.TestRepo)
+    end
+
+    attributes do
+      uuid_primary_key :id
+      attribute :name, :string, public?: true
+      attribute :age, :integer, public?: true
+      attribute :score, :decimal, public?: true
+      attribute :published_at, :date, public?: true
+    end
+
+    actions do
+      defaults [:read, :destroy, create: :*, update: :*]
+    end
+  end
+
+  defmodule ReconcileRaceTestPost do
+    @moduledoc """
+    Same shape as `RaceTestPost`, but its cache layer parks `run_query`
+    **before** delegating (`ReconcileBlockingEts`) — for the M-3
+    reconcile-ghost-eviction race, which needs the cache scan to observe a
+    row written during the pause, not before it. Shares `mdl_posts`.
+    """
+    use Ash.Resource,
+      domain: Domain,
+      data_layer: AshMultiDatalayer.DataLayer,
+      extensions: [AshPostgres.DataLayer]
+
+    multi_data_layer do
+      layer(:l1, AshMultiDatalayer.Test.ReconcileBlockingEts)
+      layer(:l2, AshMultiDatalayer.Test.CountingPostgres)
 
       read_order([:l1, :l2])
       write_order([:l2, :l1])
