@@ -24,6 +24,8 @@ defmodule AshMultiDatalayer.Notifiers.ExternalChange do
   """
   use Ash.Notifier
 
+  require Logger
+
   alias AshMultiDatalayer.DataLayer.Info
 
   @impl Ash.Notifier
@@ -34,6 +36,17 @@ defmodule AshMultiDatalayer.Notifiers.ExternalChange do
   rescue
     # An inbound reaction must never crash the notifying transaction/socket; a
     # dropped refresh/invalidation self-heals on the next read or gap sweep.
-    _ -> :ok
+    # But it must not be *silent* — a persistently-failing reaction would look
+    # like working realtime while every push is quietly dropped (the exact
+    # shape of a cross-client sync regression). Warn with the reaction and the
+    # stacktrace so the failure is diagnosable, then still swallow.
+    error ->
+      Logger.warning(
+        "ash_multi_datalayer: inbound reaction for #{inspect(resource)} failed and was " <>
+          "dropped (self-heals on the next read/gap sweep): #{Exception.message(error)}\n" <>
+          Exception.format_stacktrace(__STACKTRACE__)
+      )
+
+      :ok
   end
 end
