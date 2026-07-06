@@ -375,6 +375,31 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
       assert id == w.id
     end
 
+    test "refresh(pk) mirrors a peer's destroy — removes the local row when the remote is gone" do
+      # a synced local row (as if hydrated), then destroyed by another client.
+      id = Ash.UUID.generate()
+      Target.upsert(Widget, :remote, %Widget{id: id, name: "gonna-go", count: 1})
+      assert %{refreshed: 1} = LocalOutbox.refresh(Widget, :all)
+      assert [%{id: ^id}] = local()
+
+      # peer destroys it on the remote target
+      Target.destroy(Widget, :remote, %Widget{id: id}, domain: Domain)
+      refute Enum.any?(remote(), &(&1.id == id))
+
+      # a per-record inbound refresh (what handle_external_change runs) must remove
+      # it locally — previously it was a no-op and the row lingered.
+      assert %{deleted: 1} = LocalOutbox.refresh(Widget, %{"id" => id})
+      refute Enum.any?(local(), &(&1.id == id))
+    end
+
+    test "refresh(pk) does NOT delete a dirty local row even if the remote is gone" do
+      # local create not yet flushed (dirty), remote has no such row.
+      w = create!(name: "mine-unflushed")
+      # the dirty-rule wins: no delete, the unflushed local write survives.
+      assert %{deleted: 0} = LocalOutbox.refresh(Widget, %{"id" => w.id})
+      assert [%{name: "mine-unflushed"}] = local()
+    end
+
     test "refresh skips a dirty PK (non-empty outbox chain) and reports it" do
       w = create!(name: "dirty")
       # divergent replica row for the same PK, but the record has a pending entry.

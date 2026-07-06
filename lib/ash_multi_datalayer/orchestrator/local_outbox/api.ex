@@ -243,11 +243,36 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
       end)
 
     deleted =
-      if do_delete?,
-        do: reconcile_deletes(host_resource, local, remote_rows, tenant, opts),
-        else: 0
+      cond do
+        # `:all` scope is authoritative over the whole set — reconcile removals.
+        do_delete? ->
+          reconcile_deletes(host_resource, local, remote_rows, tenant, opts)
+
+        # A single-PK refresh whose remote row is GONE mirrors a peer's destroy:
+        # remove it locally (unless the PK is dirty — our own unflushed write wins).
+        # Without this, an inbound destroy notification (handle_external_change →
+        # refresh(pk)) left the deleted row lingering on other online clients.
+        is_map(scope) and remote_rows == [] and not dirty?(host_resource, scope, tenant) ->
+          delete_local_pk(host_resource, local, scope, tenant, opts)
+
+        true ->
+          0
+      end
 
     %{refreshed: refreshed, deleted: deleted, skipped_dirty: Enum.reverse(skipped)}
+  end
+
+  # Destroy a single locally-held row by primary key (a peer's destroy arrived via
+  # a per-record notification, so there is no remote row to compare against).
+  defp delete_local_pk(host_resource, local, pk, tenant, opts) do
+    case Target.read_pk(host_resource, hd(read_order(host_resource)), pk, tenant: tenant) do
+      {:ok, nil} ->
+        0
+
+      {:ok, local_row} ->
+        :ok = normalize_backfill(Backfill.destroy_record(local, host_resource, local_row, opts))
+        1
+    end
   end
 
   @doc "Full hydration: guarded by an empty outbox, then `refresh(:all)`."
