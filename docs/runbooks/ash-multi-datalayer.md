@@ -1,6 +1,6 @@
 # `ash_multi_datalayer` — Runbook
 
-**Owner**: Barnabas Jovanovics **Last verified**: 2026-07-03 (v1 implemented —
+**Owner**: Barnabas Jovanovics **Last verified**: 2026-07-06 (v1 implemented —
 no production deployment yet) **On-call escalation**: Project maintainer /
 GitHub issues
 
@@ -148,8 +148,13 @@ Postgres-side manual update that bypassed Ash).
 **Steps**:
 
 ```elixir
-# For a specific tenant:
-AshMultiDatalayer.Coverage.invalidate(MyApp.Post, tenant_id)
+# For specific rows (per-row purge — evicts the cached row and drops the
+# coverage entries that claim it):
+AshMultiDatalayer.forget!(MyApp.Post, pk_or_record, tenant: tenant_id)
+
+# For the whole resource (NOT tenant-scoped — drops every ledger entry for
+# all tenants; cached rows are then unreachable and repopulate on read):
+AshMultiDatalayer.Coverage.reset(MyApp.Post)
 
 # Or disable + re-enable (also wipes in-flight state):
 AshMultiDatalayer.disable!(MyApp.Post)
@@ -175,6 +180,55 @@ end
 Then recompile and deploy.
 
 **Verification**: `[:ledger, :evicted]` rate should drop.
+
+### LocalOutbox: inspect and resolve sync state
+
+The operations above are ProvenCoverage-specific. For resources whose
+`orchestrator` is `AshMultiDatalayer.Orchestrator.LocalOutbox` (local-first
+writes, background flush via Oban), the operational surface is:
+
+```elixir
+alias AshMultiDatalayer.Orchestrator.LocalOutbox
+
+# What is waiting / stuck?
+LocalOutbox.pending(MyApp.Todo)          # entries not yet flushed
+LocalOutbox.parked(MyApp.Todo)           # conflicts / exhausted retries
+LocalOutbox.status(record_or_ref)        # one record's sync state
+LocalOutbox.await(record_or_ref)         # block until flushed (dev/test)
+
+# Resolve a parked entry:
+LocalOutbox.retry(entry)                 # try again (e.g. after fixing auth)
+LocalOutbox.force(entry)                 # push local version, overwrite remote
+LocalOutbox.discard(entry)               # drop the local write, keep remote
+LocalOutbox.discard_local(entry)         # also revert the local layer's row
+LocalOutbox.rebase(entry, changeset)     # resolve with a new changeset
+
+# Pause/resume outbound flushes (e.g. during a backend incident):
+LocalOutbox.pause_sync(MyApp.Todo)
+LocalOutbox.resume_sync(MyApp.Todo)
+
+# Re-pull remote state / seed an empty local layer:
+LocalOutbox.refresh(MyApp.Todo, :all)
+LocalOutbox.hydrate(MyApp.Todo)
+```
+
+**Park classes** (`entry.error_class`) — check this before choosing a
+resolution verb:
+
+| `error_class`         | Meaning                                                     | Typical resolution                                                          |
+| ---------------------- | ------------------------------------------------------------ | ---------------------------------------------------------------------------- |
+| `:conflict`            | Target row moved since this client's `base_image`             | Inspect `entry.remote_snapshot`, then `force/1`, `discard_local/1`, or `rebase/2` |
+| `:rejected`            | The target permanently rejected the write (validation, etc.) | Fix the underlying data/action, then `retry/1`, or `discard/1` to give up    |
+| `:auth`                | Forbidden/credential failure — parked **immediately**, no retries burned | Fix credentials, then `retry/1` (the entry re-flushes)              |
+| `:transient_exhausted` | Transient failures (network, timeouts) exhausted their retry budget | `retry/1` once the target is reachable again                        |
+
+An `:auth` park is the one class that never burns retries getting there — a
+target returning `Forbidden` parks on the FIRST flush attempt, since a token
+does not un-expire by retrying (masking it as `:transient_exhausted` would
+delay diagnosis of what's usually a production credential/expiry issue).
+
+Also watch the Oban `:flush` queue health — a stalled queue means writes
+accumulate locally as `:pending` and nothing replicates.
 
 ## Troubleshooting
 
@@ -245,9 +299,9 @@ the action boundary.
 
 **Severity**: P1 — this is the "the cache is wrong" alarm.
 
-Note: the divergence sampler defaults to `0.0` (off). This alert only exists
-for resources that have opted in via `divergence_sampler` — silence from a
-resource with the sampler off is not evidence of health.
+Note: the divergence sampler defaults to `0.0` (off). This alert only exists for
+resources that have opted in via `divergence_sampler` — silence from a resource
+with the sampler off is not evidence of health.
 
 **Likely cause**: solver bug (cache claimed coverage it shouldn't have) or
 invalidation bug (a write should have dropped this entry).
@@ -281,8 +335,10 @@ the primary commit succeeded. Data is safe in primary; cache may be stale.
 
 ```elixir
 # The next read for the affected PK will fall through and backfill.
-# If you need cache coherence immediately:
-AshMultiDatalayer.Coverage.invalidate(MyApp.Post, tenant_id)
+# If you need cache coherence immediately, purge the affected rows:
+AshMultiDatalayer.forget!(MyApp.Post, pk_or_record, tenant: tenant_id)
+# or reset the whole resource (all tenants):
+AshMultiDatalayer.Coverage.reset(MyApp.Post)
 ```
 
 **Root cause investigation**: the failed-layer log will include the operation +
@@ -301,8 +357,8 @@ cap suggested.
 
 ```elixir
 AshMultiDatalayer.disable!(MyApp.Post)
-# Then flush:
-AshMultiDatalayer.Coverage.invalidate(MyApp.Post, nil)
+# Then flush the ledger (all tenants):
+AshMultiDatalayer.Coverage.reset(MyApp.Post)
 ```
 
 **Root cause investigation**:
@@ -344,8 +400,8 @@ gracefully for read-only scenarios.
 **Steps**:
 
 1. Follow your normal Postgres recovery.
-2. During the outage, `:cache_first` reads that hit coverage keep working —
-   don't disable the cache (it's the only thing still serving reads).
+2. During the outage, reads whose filters are covered keep working — don't
+   disable the cache (it's the only thing still serving reads).
 3. After recovery, run divergence-sampler sweeps if writes were buffered
    upstream.
 
@@ -411,4 +467,4 @@ deploy.
 
 ---
 
-**Last verified**: 2026-07-03
+**Last verified**: 2026-07-06

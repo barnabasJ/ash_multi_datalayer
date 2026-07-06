@@ -146,13 +146,31 @@ end
 ```
 
 Generate the outbox resource and its migration with
-`mix ash_multi_datalayer.gen.outbox`. A flush whose target row moved since this
-client last saw the `conflict_detection` field is **parked** as a `:conflict`
-carrying a three-way snapshot (local / base / remote); resolve it with
-`LocalOutbox.force/1` (mine wins), `discard_local/1` (theirs win), `retry/1`, or
-`rebase/2`. Pause/resume the queue with `LocalOutbox.pause_sync/1` /
+`mix ash_multi_datalayer.gen.outbox`. A flush parks on one of three
+`error_class` values: a target row that moved since this client last saw it
+(`conflict_detection`) parks as `:conflict` carrying a three-way snapshot
+(local / base / remote); a semantic rejection the target will never accept
+parks as `:rejected`; an auth/credential failure (`Ash.Error.Forbidden` or
+`class: :forbidden`) parks **immediately** as `:auth` — no retry-budget burn,
+since a token doesn't un-expire by retrying. Resolve a park with
+`LocalOutbox.force/1` (mine wins), `discard_local/1` (theirs win), `retry/1`
+(re-flush after fixing the cause — the `:auth` recovery path), or `rebase/2`
+(apply a new resolution changeset; the parked chain is dropped only after the
+new write succeeds, so a failed resolution leaves the original conflict
+intact). Pause/resume the queue with `LocalOutbox.pause_sync/1` /
 `resume_sync/1` (the "go offline" toggle), and poll per-record state with
 `LocalOutbox.status/1`.
+
+Individual actions can also bypass the strategy's routing via query/changeset
+context. `context: %{multi_datalayer: %{read_from: :remote}}` routes one read
+raw to the named layer, side-effect-free (no coverage recording, backfill, or
+outbox interaction — useful for compare-reads); it emits `[:read, :forced]`
+telemetry. `context: %{multi_datalayer: %{write_through: true}}` makes one
+LocalOutbox write synchronous and reorders it to match the "durable on the
+server or error" guarantee: every replica target is written **first**, and
+the local layer commits only once every target has durably accepted the
+write — a replica failure fails the whole action with the local layer
+untouched. No outbox entry is created either way.
 
 ### How inbound changes reach a client (realtime)
 
@@ -217,7 +235,9 @@ cache hit rate is lower than expected.
   "my-app-ash-mdl",
   [
     [:ash_multi_datalayer, :read, :hit],
+    [:ash_multi_datalayer, :read, :partial],
     [:ash_multi_datalayer, :read, :miss],
+    [:ash_multi_datalayer, :read, :forced],
     [:ash_multi_datalayer, :read, :backfill],
     [:ash_multi_datalayer, :read, :divergence_detected],
     [:ash_multi_datalayer, :write, :applied],
@@ -235,17 +255,19 @@ Every event carries metadata
 `%{resource, tenant, filter_fingerprint, read_order, write_order}`. Measurements
 (and extra metadata) are per-event:
 
-| Event                           | Measurements                    | Extra metadata                                                                                                       |
-| ------------------------------- | ------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `[:read, :hit]`                 | `%{duration_us, ledger_size}`   | —                                                                                                                    |
-| `[:read, :miss]`                | `%{duration_us, ledger_size}`   | `reason: :no_coverage_entry \| :solver_unsupported \| :fields_insufficient \| :not_cacheable \| :ledger_unavailable` |
-| `[:read, :backfill]`            | `%{duration_us, ledger_size}`   | `count` (rows backfilled)                                                                                            |
-| `[:read, :divergence_detected]` | `%{cache_count, primary_count}` | `pk_delta`                                                                                                           |
-| `[:write, :applied]`            | `%{duration_us, ledger_size}`   | `operation`, `dropped_count`                                                                                         |
-| `[:write, :failed_at_layer]`    | `%{}`                           | `operation`, `layer`, `reason`                                                                                       |
-| `[:ledger, :invalidated]`       | `%{count, ledger_size}`         | —                                                                                                                    |
-| `[:ledger, :evicted]`           | `%{ledger_size}`                | —                                                                                                                    |
-| `[:ledger, :full]`              | `%{ledger_size}`                | —                                                                                                                    |
+| Event                           | Measurements                    | Extra metadata                                                                                                                                 |
+| ------------------------------- | ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `[:read, :hit]`                 | `%{duration_us, ledger_size}`   | —                                                                                                                                              |
+| `[:read, :partial]`             | `%{duration_us, ledger_size}`   | `cached`, `fetched` (row counts — covered part served from cache, only the remainder fetched)                                                  |
+| `[:read, :miss]`                | `%{duration_us, ledger_size}`   | `reason: :no_coverage_entry \| :solver_unsupported \| :fields_insufficient \| :not_cacheable \| :calc_sort_source_only \| :ledger_unavailable` |
+| `[:read, :forced]`              | `%{}`                           | `layer` (a read forced to a specific layer via the `read_from` context escape hatch)                                                           |
+| `[:read, :backfill]`            | `%{duration_us, ledger_size}`   | `count` (rows backfilled)                                                                                                                      |
+| `[:read, :divergence_detected]` | `%{cache_count, primary_count}` | `pk_delta`                                                                                                                                     |
+| `[:write, :applied]`            | `%{duration_us, ledger_size}`   | `operation`, `dropped_count`                                                                                                                   |
+| `[:write, :failed_at_layer]`    | `%{}`                           | `operation`, `layer`, `reason`                                                                                                                 |
+| `[:ledger, :invalidated]`       | `%{count, ledger_size}`         | —                                                                                                                                              |
+| `[:ledger, :evicted]`           | `%{ledger_size}`                | —                                                                                                                                              |
+| `[:ledger, :full]`              | `%{ledger_size}`                | —                                                                                                                                              |
 
 See the [technical deep-dive](../technical/ash-multi-datalayer.md) for the full
 schema.
@@ -276,24 +298,39 @@ coverage of its filter:
   (locks additionally bypass coverage entirely, missing with reason
   `:not_cacheable`).
 
-Reads that **load calculations** get a _computed-value merge read_ (see the
-20260703 ADR): when the row filter is covered, the rows are served from the
-cache and ONE narrow query (`primary_key in [...]`, selecting only the PK plus
-the calculations) fetches the computed values from the source of truth and
-merges them in — hits carry `computed_values: :merged` metadata. Computed values
-are never cached; they are fetched fresh on every read that loads them. If a
-cached row has no source counterpart (an out-of-band delete), the merge is
-abandoned and the whole query falls through fresh (miss reason `:stale_cache`).
-The rows fetched by a calculation-carrying miss are backfilled and recorded like
-any other read.
+Reads that **load calculations** are handled in two tiers. With
+`local_evaluation?` (on by default), a calculation the cache layer can evaluate
+is computed **locally from the covered rows** — no source round-trip at all.
+Calculations the cache cannot evaluate (e.g. `remote(...)` expressions), or ones
+listed in `local_evaluation_overrides`, fall back to the _computed-value merge
+read_ (see the 20260703 ADR): the rows are served from the cache and ONE narrow
+query (`primary_key in [...]`, selecting only the PK plus the calculations)
+fetches the computed values from the source of truth and merges them in — hits
+carry `computed_values: :merged` metadata. Merged computed values are never
+cached; they are fetched fresh on every read that loads them. If a cached row
+has no source counterpart (an out-of-band delete), the merge is abandoned and
+the whole query falls through fresh (miss reason `:stale_cache`). The rows
+fetched by a calculation-carrying miss are backfilled and recorded like any
+other read.
 
-**Resource (relationship) aggregates are loudly unsupported** on multi-layer
-resources: SQL layers build the related subquery via the destination resource's
-data layer — which is this library — so the aggregate would be silently
-`NotLoaded`. `can?({:aggregate, _})` is `false`, making Ash raise at query build
-instead. Self-aggregation (`Ash.count/2` etc.) works and routes to the source of
-truth; remote-style aggregates (e.g. ash_remote's, which arrive as calculations)
-are unaffected.
+**Resource (relationship) aggregates are supported** via two mechanisms, both on
+by default:
+
+- `fold_aggregates?` — foldable kinds (`count`, `sum`, `avg`, `min`, `max`,
+  `first`, `list`, `exists`) are **folded from cached related rows** when the
+  ledger proves the related rows are covered (0 source reads), and from the
+  source otherwise. `fold_aggregate_overrides` lists aggregate names that are
+  never folded locally.
+- `sql_join_aggregates?` — when the aggregate's source and destination live in
+  the same SQL repo, the related subquery is passed through to SQL directly
+  (`SqlPassthrough`). `sql_join_aggregate_overrides` is the per-aggregate escape
+  hatch.
+
+Only when **both** toggles are off does the library refuse loudly
+(`AggregatesNotSupported` at query build) rather than return a silently
+`NotLoaded` aggregate. Self-aggregation (`Ash.count/2` etc.) works and routes to
+the source of truth; remote-style aggregates (e.g. ash_remote's, which arrive as
+calculations) are unaffected.
 
 Limited/offset probes **are** still served from previously recorded unlimited
 coverage — the cache layer applies sort/limit/offset itself. Field coverage is
@@ -473,4 +510,4 @@ For developers who want to understand how this works:
 
 ---
 
-**Last Updated**: 2026-07-03
+**Last Updated**: 2026-07-06
