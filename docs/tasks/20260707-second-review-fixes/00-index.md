@@ -180,7 +180,7 @@ is H5/#19 work and uses the real tenant, not the partition key.
 | --- | --------------------------------------------------------------------------------------------------------- | ---------- | ------ |
 | H1  | [Bundled remote-calculation fetch runs unauthenticated](h1-remote-calc-fetch-unauthenticated.md)          | ash_remote | OPEN   |
 | H2  | [Non-PK upsert identity ignored + accept-list truncation](h2-non-pk-upsert-identity-accept-truncation.md) | ash_remote | OPEN   |
-| H3  | [`refresh/3` TOCTOU vs co-committed local write](h3-refresh-toctou.md)                                    | MDL        | OPEN   |
+| H3  | [`refresh/3` TOCTOU vs co-committed local write](h3-refresh-toctou.md)                                    | MDL        | DONE   |
 | H4  | [`write_through` drain race + post-target-push divergence](h4-write-through-drain-race-divergence.md)     | MDL        | OPEN   |
 | H5  | [LocalOutbox tenant model: `nil` = "IS NULL" vs "unscoped"](h5-localoutbox-nil-tenant-model.md)           | MDL        | DONE   |
 | P6  | [Lost-kick recovery semantics (#4): sweeper unproven](p6-lost-kick-recovery.md)                           | MDL        | OPEN   |
@@ -193,7 +193,7 @@ is H5/#19 work and uses the real tenant, not the partition key.
 | M2  | [Context-tenancy invalidation uses raw metadata tenant](m2-context-tenancy-raw-metadata-tenant.md)                                           | MDL        | DONE   |
 | M3  | [External update passes after-image as `row_before`](m3-external-update-after-image-row-before.md)                                           | MDL        | OPEN   |
 | M4  | [`discard_local/1` destroys freshly re-read chain, skips head guard](m4-discard-local-chain-destroy.md)                                      | MDL        | OPEN   |
-| M5  | [Refresh/delete reconciliation not atomic with dirty check](m5-refresh-delete-reconciliation-not-atomic.md) — subsumed by H3, closes with it | MDL        | OPEN   |
+| M5  | [Refresh/delete reconciliation not atomic with dirty check](m5-refresh-delete-reconciliation-not-atomic.md) — subsumed by H3, closes with it | MDL        | DONE   |
 | M6  | [Destroy-flush of already-gone row parks as `:rejected`](m6-destroy-flush-already-gone-parks.md)                                             | MDL        | OPEN   |
 | M7  | [Query calculations/aggregates decoded uncast](m7-query-calc-aggregate-decode-uncast.md)                                                     | ash_remote | OPEN   |
 | M8  | [Changeset-less multitenant broadcast unjoinable](m8-changeset-less-multitenant-broadcast.md)                                                | ash_remote | OPEN   |

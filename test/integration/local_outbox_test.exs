@@ -526,6 +526,64 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
     end
   end
 
+  # --- H3: refresh/3's dirty-check + backfill is atomic vs a co-committed write
+
+  describe "H3: refresh's atomic dirty-check + backfill uses a real DB lock" do
+    test "the same repo + mode: :immediate refresh/3 uses genuinely excludes a concurrent writer (not Ash.DataLayer.transaction, a no-op on AshSqlite)" do
+      _w = create!(name: "orig")
+      drain()
+
+      repo =
+        AshMultiDatalayer.Orchestrator.LocalOutbox.Write.co_commit_repo(
+          Widget,
+          AshSqlite.DataLayer,
+          OutboxEntry
+        )
+
+      assert repo, "Widget/OutboxEntry must share a co-commit repo for this test to be meaningful"
+
+      test_pid = self()
+
+      # Hold exactly the write lock refresh/3's atomic dirty-check+backfill
+      # takes (same repo, same `mode: :immediate`) — proves it is a REAL
+      # cross-process SQLite lock. `Ash.DataLayer.transaction` (which the
+      # task explicitly rules out) is a no-op on AshSqlite and would NOT
+      # exclude a concurrent writer this way.
+      holder =
+        Task.async(fn ->
+          repo.transaction(
+            fn ->
+              send(test_pid, :locked)
+
+              receive do
+                :release -> :ok
+              end
+            end,
+            mode: :immediate
+          )
+        end)
+
+      assert_receive :locked, 1000
+
+      writer =
+        Task.async(fn ->
+          repo.transaction(fn -> :attempted_write end, mode: :immediate)
+        end)
+
+      # The writer must be BLOCKED behind the held lock, not interleaved.
+      assert Task.yield(writer, 300) == nil
+
+      send(holder.pid, :release)
+      assert {:ok, {:ok, :ok}} = {:ok, Task.await(holder)}
+      assert {:ok, :attempted_write} = Task.await(writer, 3000)
+    end
+
+    # The local-read-failure-surfaces-as-{:error,_} repro (H3's #18-sibling)
+    # needs a resource whose local layer can be armed to fail reads —
+    # `FailableLocalWidget`, aliased in `local_outbox_resolution_test.exs`
+    # alongside its M-5 siblings; see that file's H3 describe block.
+  end
+
   # --- H5: multitenant tenant model (`nil` = "IS NULL" vs "unscoped") -----
 
   describe "H5: multitenant boot hydration / resume / dirty-chain scans" do

@@ -21,13 +21,29 @@ defmodule AshMultiDatalayer.Test.FailableLayer do
 
     passthrough =
       for {name, arity} <- Ash.DataLayer.behaviour_info(:callbacks),
-          name not in [:upsert, :destroy],
+          name not in [:upsert, :destroy, :run_query],
           function_exported?(wraps, name, arity) do
         args = Macro.generate_arguments(arity, __MODULE__)
 
         quote do
           def unquote(name)(unquote_splicing(args)) do
             unquote(wraps).unquote(name)(unquote_splicing(args))
+          end
+        end
+      end
+
+    # H3: opt-in read failure — `run_query` normally always passes through
+    # (armed writes must not also break reads other tests rely on, e.g. a
+    # target read inside `check_stale/2` while `upsert`/`destroy` is armed to
+    # fail); `fail_reads/2` is a SEPARATE, explicit arm so it never surprises
+    # existing write-failure tests.
+    run_query_def =
+      if function_exported?(wraps, :run_query, 2) do
+        quote do
+          def run_query(query, resource) do
+            AshMultiDatalayer.Test.FailableLayer.guard_read(__MODULE__, fn ->
+              unquote(wraps).run_query(query, resource)
+            end)
           end
         end
       end
@@ -56,6 +72,7 @@ defmodule AshMultiDatalayer.Test.FailableLayer do
 
     quote do
       (unquote_splicing(passthrough))
+      unquote(run_query_def)
       unquote(upsert_def)
 
       def destroy(resource, changeset) do
@@ -87,6 +104,25 @@ defmodule AshMultiDatalayer.Test.FailableLayer do
       [{^layer, :transient}] -> {:error, {:transient, "target transiently unavailable"}}
       [{^layer, :forbidden}] -> {:error, %Ash.Error.Forbidden{}}
       _ -> delegate.()
+    end
+  end
+
+  @doc """
+  Arm the layer to fail its NEXT read (`run_query`) with `reason` — separate
+  from `fail/2` (writes) so arming one never surprises a test relying on the
+  other still working (H3: proving a local-read failure during LocalOutbox
+  refresh reconciliation surfaces as `{:error, _}`, not a raise/`MatchError`).
+  """
+  def fail_reads(layer, reason), do: :ets.insert(@table, {{layer, :reads}, reason})
+
+  @doc "Disarm the layer's read failure — reads delegate normally again."
+  def clear_reads(layer), do: :ets.delete(@table, {layer, :reads})
+
+  @doc false
+  def guard_read(layer, delegate) do
+    case :ets.lookup(@table, {layer, :reads}) do
+      [{_, reason}] -> {:error, reason}
+      [] -> delegate.()
     end
   end
 end

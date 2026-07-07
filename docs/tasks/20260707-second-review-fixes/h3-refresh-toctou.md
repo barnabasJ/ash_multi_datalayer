@@ -1,6 +1,22 @@
 # H3 — `refresh/3` TOCTOU vs the co-committed local write (#13)
 
-- **Status**: OPEN
+- **Status**: DONE — the dirty-check + backfill/destroy per PK now run inside a
+  real `Ecto.Repo.transaction(fn -> ... end, mode: :immediate)` on the co-commit
+  repo (`Write.co_commit_repo/3`) — SQLite takes the write lock at `BEGIN`,
+  before the dirty-check read, so a racing co-committed user write either fully
+  commits first or blocks until this transaction ends;
+  `Ash.DataLayer.transaction` (a no-op on AshSqlite) is not used. Falls back to
+  a plain (non-atomic) run when no co-commit repo is configured, matching
+  `Write.in_transaction/2`'s existing posture, rather than crashing.
+  `reconcile_deletes`/`delete_local_pk` return `{:error, _}` instead of
+  raising/`MatchError` on a local read failure; `refresh/3` itself now returns
+  `{:error, _}` (never buries it in `%{deleted: ...}`) — `hydrate/2` updated to
+  not double-wrap. Repro: (1) a genuine cross-process lock proof (holder blocks
+  a real concurrent `mode: :immediate` writer — same repo/mode `refresh/3` uses,
+  unlike the no-op `Ash.DataLayer.transaction`); (2) both read-failure paths,
+  using a new opt-in `FailableLayer.fail_reads/2` (additive, existing
+  write-failure tests unaffected) — both raise/MatchError on unfixed code
+  (confirmed). `INTEGRATION=1 mix test` green (292).
 - **Severity**: High (lost update on the authority)
 - **Repo**: MDL (ash_multi_datalayer)
 - **Verification**: VERIFIED

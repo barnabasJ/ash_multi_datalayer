@@ -369,12 +369,23 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   the local layer; records present locally but absent remotely within scope are
   deleted locally. **Skips any PK whose outbox chain is non-empty** (the
   dirty-chain rule) — its convergence path is the outbound flush.
+
+  H3: the dirty-check and the local write it gates run inside ONE real
+  co-commit `Ecto.Repo.transaction/2` per PK, opened `mode: :immediate` so
+  SQLite takes the write lock at `BEGIN` — before the dirty-check read, not
+  after. A concurrent co-committed user write (`Write.async_run/3`'s own
+  `in_transaction/2`) either fully commits (and is then visibly dirty/absent
+  to this check) or hasn't started (and can't land between the check and the
+  backfill) — never both interleaved. `Ash.DataLayer.transaction` is NOT
+  used here: it is a no-op on `AshSqlite.DataLayer`.
+
+  Returns the bare stats map on success, or `{:error, reason}` if a helper's
+  read/write fails — never raises, and never buries a failure inside a
+  "successful" map.
   """
-  @spec refresh(Ash.Resource.t(), :all | map(), term()) :: %{
-          refreshed: non_neg_integer(),
-          deleted: non_neg_integer(),
-          skipped_dirty: [map()]
-        }
+  @spec refresh(Ash.Resource.t(), :all | map(), term()) ::
+          %{refreshed: non_neg_integer(), deleted: non_neg_integer(), skipped_dirty: [map()]}
+          | {:error, term()}
   def refresh(host_resource, scope, tenant \\ nil) do
     local = LocalOutbox.local_layer(host_resource)
     target = last_target(host_resource)
@@ -392,11 +403,9 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
         Enum.reduce(remote_rows, {0, []}, fn row, {n, skipped} ->
           pk = Snapshot.record_pk(host_resource, row)
 
-          if dirty?(host_resource, pk, tenant) do
-            {n, [pk | skipped]}
-          else
-            :ok = Backfill.upsert_record(local, host_resource, row, opts) |> normalize_backfill()
-            {n + 1, skipped}
+          case atomic_backfill_if_clean(host_resource, local, pk, row, opts, tenant) do
+            :skipped -> {n, [pk | skipped]}
+            :ok -> {n + 1, skipped}
           end
         end)
 
@@ -410,42 +419,121 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
           # remove it locally (unless the PK is dirty — our own unflushed write wins).
           # Without this, an inbound destroy notification (handle_external_change →
           # refresh(pk)) left the deleted row lingering on other online clients.
-          is_map(scope) and remote_rows == [] and not dirty?(host_resource, scope, tenant) ->
-            delete_local_pk(host_resource, local, scope, real_tenant, opts)
+          is_map(scope) and remote_rows == [] ->
+            delete_local_pk(host_resource, local, scope, real_tenant, tenant, opts)
 
           true ->
-            0
+            {:ok, 0}
         end
 
-      %{refreshed: refreshed, deleted: deleted, skipped_dirty: Enum.reverse(skipped)}
+      case deleted do
+        {:ok, count} ->
+          %{refreshed: refreshed, deleted: count, skipped_dirty: Enum.reverse(skipped)}
+
+        {:error, _} = error ->
+          error
+      end
     end
+  end
+
+  # H3: dirty-check + backfill for ONE PK, atomic via a real `:immediate`
+  # co-commit transaction (see `refresh/3`'s moduledoc). `scan_tenant` may be
+  # the unscoped sentinel (dirty-check scans every partition); `co_commit_repo`
+  # resolution doesn't need a tenant at all.
+  defp atomic_backfill_if_clean(host_resource, local, pk, row, opts, scan_tenant) do
+    run_atomic(host_resource, fn ->
+      if dirty?(host_resource, pk, scan_tenant) do
+        :skipped
+      else
+        :ok = Backfill.upsert_record(local, host_resource, row, opts) |> normalize_backfill()
+        :ok
+      end
+    end)
   end
 
   # Destroy a single locally-held row by primary key (a peer's destroy arrived via
   # a per-record notification, so there is no remote row to compare against).
-  # `tenant` here is always the REAL target-layer value (translated by the
-  # caller) — never the unscoped scan sentinel.
-  defp delete_local_pk(host_resource, local, pk, tenant, opts) do
-    case Target.read_pk(host_resource, hd(read_order(host_resource)), pk, tenant: tenant) do
-      {:ok, nil} ->
-        0
+  # `real_tenant` is always the REAL target-layer value (never the unscoped
+  # scan sentinel); `scan_tenant` may be the sentinel (dirty-check scope).
+  # H3: dirty-check + destroy run in the same atomic `:immediate` transaction
+  # as `atomic_backfill_if_clean/6`.
+  defp delete_local_pk(host_resource, local, pk, real_tenant, scan_tenant, opts) do
+    result =
+      run_atomic(host_resource, fn ->
+        if dirty?(host_resource, pk, scan_tenant) do
+          0
+        else
+          case Target.read_pk(host_resource, hd(read_order(host_resource)), pk,
+                 tenant: real_tenant
+               ) do
+            {:ok, nil} ->
+              0
 
-      {:ok, local_row} ->
-        :ok = normalize_backfill(Backfill.destroy_record(local, host_resource, local_row, opts))
-        1
+            {:ok, local_row} ->
+              :ok =
+                normalize_backfill(Backfill.destroy_record(local, host_resource, local_row, opts))
 
-      {:error, reason} ->
-        raise "local read failed during refresh delete reconciliation: #{inspect(reason)}"
+              1
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+        end
+      end)
+
+    case result do
+      {:error, _} = error -> error
+      count -> {:ok, count}
     end
   end
 
+  # H3: runs `fun` (returning a plain result, or `{:error, reason}` — never
+  # raising) atomically against a concurrent co-committed write, via a real
+  # `mode: :immediate` Ecto transaction on the shared repo — SQLite takes the
+  # write lock at `BEGIN`, before `fun`'s dirty-check read, so a racing
+  # `Write.async_run/3` transaction either fully commits first (visible to
+  # the dirty-check) or blocks until this one finishes (never interleaves).
+  # `Ash.DataLayer.transaction` is NOT used: it is a no-op on
+  # `AshSqlite.DataLayer`. Falls back to running `fun` un-wrapped when no
+  # co-commit repo is configured (best-effort, same posture
+  # `Write.in_transaction/2` already takes for a nil repo) rather than
+  # crashing — this only degrades the race-closing guarantee for a
+  # mis-configured host, never correctness for the common (single-caller)
+  # case.
+  defp run_atomic(host_resource, fun) do
+    case co_commit_repo(host_resource) do
+      nil ->
+        fun.()
+
+      repo ->
+        case repo.transaction(fn -> fun.() end, mode: :immediate) do
+          {:ok, {:error, _} = error} -> error
+          {:ok, result} -> result
+          {:error, _} = error -> error
+        end
+    end
+  end
+
+  defp co_commit_repo(host_resource) do
+    AshMultiDatalayer.Orchestrator.LocalOutbox.Write.co_commit_repo(
+      host_resource,
+      LocalOutbox.local_layer(host_resource),
+      LocalOutbox.outbox_resource(host_resource)
+    )
+  end
+
   @doc "Full hydration: guarded by an empty outbox, then `refresh(:all)`."
-  @spec hydrate(Ash.Resource.t(), term()) :: {:ok, map()} | {:error, :outbox_not_empty}
+  @spec hydrate(Ash.Resource.t(), term()) :: {:ok, map()} | {:error, term()}
   def hydrate(host_resource, tenant \\ nil) do
     if outbox_nonempty?(host_resource, tenant) do
       {:error, :outbox_not_empty}
     else
-      {:ok, refresh(host_resource, :all, tenant)}
+      # H3: refresh/3 itself now returns `{:error, _}` on failure — do not
+      # blindly wrap it in `{:ok, _}`.
+      case refresh(host_resource, :all, tenant) do
+        {:error, _} = error -> error
+        stats -> {:ok, stats}
+      end
     end
   end
 
@@ -533,20 +621,42 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   # `real_tenant` (never the scan sentinel) drives the target-layer read;
   # `scan_tenant` (may be the sentinel) drives the dirty-chain check — the
   # same dual-use split as `refresh/3`.
+  # H3: same #18 no-crash contract as `delete_local_pk/6` — a local read
+  # failure returns `{:error, _}` instead of a `MatchError`. Each candidate
+  # row's dirty-check + destroy is atomic (same `:immediate` co-commit
+  # transaction pattern), closing the same TOCTOU window per PK.
   defp reconcile_deletes(host_resource, local, remote_rows, real_tenant, scan_tenant, opts) do
     remote_pks = MapSet.new(remote_rows, &Snapshot.record_pk(host_resource, &1))
 
-    {:ok, local_rows} =
-      Target.read_all(host_resource, hd(read_order(host_resource)), tenant: real_tenant)
+    case Target.read_all(host_resource, hd(read_order(host_resource)), tenant: real_tenant) do
+      {:ok, local_rows} ->
+        count =
+          local_rows
+          |> Enum.reject(&MapSet.member?(remote_pks, Snapshot.record_pk(host_resource, &1)))
+          |> Enum.reduce(0, fn row, n ->
+            pk = Snapshot.record_pk(host_resource, row)
 
-    local_rows
-    |> Enum.reject(fn row ->
-      pk = Snapshot.record_pk(host_resource, row)
-      MapSet.member?(remote_pks, pk) or dirty?(host_resource, pk, scan_tenant)
-    end)
-    |> Enum.reduce(0, fn row, n ->
-      :ok = Backfill.destroy_record(local, host_resource, row, opts) |> normalize_backfill()
-      n + 1
+            case atomic_destroy_if_clean(host_resource, local, pk, row, opts, scan_tenant) do
+              :skipped -> n
+              :ok -> n + 1
+            end
+          end)
+
+        {:ok, count}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp atomic_destroy_if_clean(host_resource, local, pk, row, opts, scan_tenant) do
+    run_atomic(host_resource, fn ->
+      if dirty?(host_resource, pk, scan_tenant) do
+        :skipped
+      else
+        :ok = Backfill.destroy_record(local, host_resource, row, opts) |> normalize_backfill()
+        :ok
+      end
     end)
   end
 

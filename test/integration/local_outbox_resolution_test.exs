@@ -397,6 +397,54 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxResolutionTest do
     end
   end
 
+  # --- H3: refresh/3 propagates a local read failure instead of raising -----
+
+  describe "H3: refresh/3 surfaces a local read failure as {:error, _}, never a raise/MatchError" do
+    setup do
+      FailableLayer.clear_reads(FailableSqlite)
+      on_exit(fn -> FailableLayer.clear_reads(FailableSqlite) end)
+      :ok
+    end
+
+    test "single-PK delete reconciliation (delete_local_pk)" do
+      w =
+        FailableLocalWidget
+        |> Ash.Changeset.for_create(:create, %{name: "will-be-deleted-remotely"}, domain: Domain)
+        |> Ash.create!()
+
+      drain()
+      Target.destroy(FailableLocalWidget, :remote, w, domain: Domain)
+
+      # #18-sibling: pre-fix, `delete_local_pk/5`'s hard `{:ok, local_row} =`
+      # match on a failing `Target.read_pk` raises instead of returning
+      # `{:error, _}` — a peer's destroy notification (routed through this
+      # exact single-PK `refresh/3` path) could crash the notifying process.
+      FailableLayer.fail_reads(FailableSqlite, {:rejected, "local read failed"})
+
+      assert {:error, _} = LocalOutbox.refresh(FailableLocalWidget, %{"id" => w.id})
+    end
+
+    test "the :all-scope delete reconciliation (reconcile_deletes)" do
+      w =
+        FailableLocalWidget
+        |> Ash.Changeset.for_create(:create, %{name: "still-local"}, domain: Domain)
+        |> Ash.create!()
+
+      drain()
+
+      # #18-sibling: pre-fix, `reconcile_deletes/5`'s hard `{:ok, local_rows} =`
+      # match on a failing `Target.read_all` raises a `MatchError` instead of
+      # returning `{:error, _}`.
+      FailableLayer.fail_reads(FailableSqlite, {:rejected, "local read failed"})
+
+      assert {:error, _} = LocalOutbox.refresh(FailableLocalWidget, :all)
+
+      FailableLayer.clear_reads(FailableSqlite)
+      local_ids = local(FailableLocalWidget) |> Enum.map(& &1.id)
+      assert w.id in local_ids
+    end
+  end
+
   # --- B7: resolution verbs on a stale handle to an already-:synced entry ----
 
   describe "B7: resolution verbs are idempotent no-ops on an already-:synced entry" do

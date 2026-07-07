@@ -1,8 +1,9 @@
 # M5 — `refresh` / delete reconciliation not atomic with the dirty check (plan fidelity)
 
-- **Status**: OPEN — **subsumed by [H3](h3-refresh-toctou.md)** (pass-3b review
-  §B): closes automatically when H3 closes; do not work independently. Kept as
-  the plan-fidelity breadcrumb for A5 item 4 / W1.
+- **Status**: DONE — closed by [H3](h3-refresh-toctou.md): H3's fix uses the
+  real co-commit `repo.transaction(mode: :immediate)`, and its test suite
+  includes the explicit "not `Ash.DataLayer.transaction`" lock-proof assertion
+  this task required.
 - **Severity**: Medium (plan-mandated mechanism absent)
 - **Repo**: MDL (ash_multi_datalayer)
 - **Verification**: VERIFIED
