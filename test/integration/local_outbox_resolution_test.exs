@@ -15,6 +15,7 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxResolutionTest do
   @moduletag :integration
   @moduletag :oban_sqlite
 
+  alias AshMultiDatalayer.Backfill
   alias AshMultiDatalayer.Orchestrator.LocalOutbox
   alias AshMultiDatalayer.Orchestrator.LocalOutbox.{Flush, Sweeper, Target}
   alias AshMultiDatalayer.Test.FailableLayer
@@ -488,6 +489,86 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxResolutionTest do
     after
       FailableLayer.clear(FailableTarget)
       FailableLayer.clear_reads(FailableTarget)
+    end
+  end
+
+  # --- M6: destroy-flush of an already-gone row must not park ---------------
+
+  describe "M6: destroy_record maps an already-absent row to :ok, not an error" do
+    test "a local StaleRecord (zero-row delete) maps to :ok" do
+      w =
+        FailableLocalWidget
+        |> Ash.Changeset.for_create(:create, %{name: "gone"}, domain: Domain)
+        |> Ash.create!()
+
+      # Delete it directly against the SQLite layer, bypassing the outbox.
+      assert :ok = Backfill.destroy_record(FailableSqlite, FailableLocalWidget, w, domain: Domain)
+
+      # Unfixed: the row is already gone, so this second delete hits a
+      # zero-row StaleRecord and destroy_record returns {:error, _}.
+      assert :ok = Backfill.destroy_record(FailableSqlite, FailableLocalWidget, w, domain: Domain)
+    end
+
+    test "a remote NotFound-class error maps to :ok" do
+      w =
+        FailableLocalWidget
+        |> Ash.Changeset.for_create(:create, %{name: "gone-remote"}, domain: Domain)
+        |> Ash.create!()
+
+      FailableLayer.fail(FailableTarget, :not_found)
+
+      assert :ok = Backfill.destroy_record(FailableTarget, FailableLocalWidget, w, domain: Domain)
+    after
+      FailableLayer.clear(FailableTarget)
+    end
+
+    test "a genuine destroy rejection still surfaces as an error" do
+      w =
+        FailableLocalWidget
+        |> Ash.Changeset.for_create(:create, %{name: "still-invalid"}, domain: Domain)
+        |> Ash.create!()
+
+      FailableLayer.fail(FailableTarget, :rejected)
+
+      assert {:error, _} =
+               Backfill.destroy_record(FailableTarget, FailableLocalWidget, w, domain: Domain)
+    after
+      FailableLayer.clear(FailableTarget)
+    end
+
+    test "end-to-end: a destroy flush against an already-gone remote row marks :synced, not :rejected" do
+      w =
+        FailableLocalWidget
+        |> Ash.Changeset.for_create(:create, %{name: "gone-e2e"}, domain: Domain)
+        |> Ash.create!()
+
+      drain()
+
+      # The target row is already gone (a prior flush attempt succeeded
+      # there, simulated directly) before this entry's own destroy-flush
+      # ever runs — the same "already absent" condition a retry-after-crash
+      # would hit. NOTE: this target is ETS-backed (FailableTarget wraps
+      # Ash.DataLayer.Ets), which does not error on a missing-key destroy —
+      # so unlike the two unit tests above, this specific scenario does
+      # NOT fail on unfixed code (ETS never reaches destroy_record's error
+      # branch at all). Kept as end-to-end wiring confirmation that the
+      # fixed destroy_record's :ok result flows correctly through
+      # Flush.push -> classify -> :synced, not as an independent repro.
+      Target.destroy(FailableLocalWidget, :remote, w, domain: Domain)
+
+      Ash.destroy!(w)
+      drain()
+
+      [destroy_entry] =
+        OutboxEntry
+        |> Ash.read!(domain: Domain, authorize?: false)
+        |> Enum.filter(&(&1.op == :destroy))
+
+      # Against a REAL SQLite or remote target, unfixed code would hit
+      # {:error, %StaleRecord{}} (or a not_found-class error), classify/1
+      # would map it to :rejected, and the entry would park — demanding an
+      # discard/1 for a destroy that already took effect.
+      assert destroy_entry.state == :synced
     end
   end
 

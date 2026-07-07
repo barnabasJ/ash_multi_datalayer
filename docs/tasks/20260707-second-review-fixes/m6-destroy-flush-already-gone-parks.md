@@ -1,6 +1,20 @@
 # M6 — Destroy-flush of an already-gone row parks as `:rejected`
 
-- **Status**: OPEN
+- **Status**: DONE — `Backfill.destroy_record/4` now maps "row already absent"
+  to `:ok` before it ever reaches `Flush`'s `classify/1`: a new
+  `already_absent?/1` recognizes both `%Ash.Error.Changes.StaleRecord{}` (a
+  zero-row local delete) and `%Ash.Error.Query.NotFound{}` (ash_remote's
+  translation of a server-side "already gone" response), unwrapping
+  `%{errors: [...]}` wrappers the same way `AshMultiDatalayer.not_found?/1`
+  already does. Genuine destroy failures (a real rejection, not "already gone")
+  still surface as errors and still park. New `FailableLayer` `:not_found`
+  fail-spec exercises the remote-NotFound class without a real ash_remote
+  round-trip. 2 direct `Backfill.destroy_record/4` repros (one per error class)
+  fail on unfixed code (confirmed); a 3rd end-to-end test through the real
+  `Flush`/outbox pipeline does NOT discriminate fixed vs. unfixed (the
+  ETS-backed test target never errors on a missing-key destroy in the first
+  place) — kept as wiring confirmation only, noted honestly rather than
+  miscounted as a repro. `INTEGRATION=1 mix test` green (311, up from 307).
 - **Severity**: Medium (blocks PK chain; demands operator intervention)
 - **Repo**: MDL (ash_multi_datalayer)
 - **Verification**: AGENT

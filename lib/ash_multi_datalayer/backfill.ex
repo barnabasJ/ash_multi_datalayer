@@ -103,10 +103,30 @@ defmodule AshMultiDatalayer.Backfill do
     case layer.destroy(resource, changeset) do
       :ok -> :ok
       {:ok, _} -> :ok
-      {:error, :no_rollback, reason} -> {:error, reason}
-      {:error, reason} -> {:error, reason}
+      {:error, :no_rollback, reason} -> destroy_result(reason)
+      {:error, reason} -> destroy_result(reason)
     end
   end
+
+  # M6: "row already absent" — a zero-row local delete (StaleRecord) or a
+  # remote-layer NotFound — is a success per this function's own contract:
+  # the destroy already effectively happened. Left as an error, a retried
+  # destroy-flush (the worker crashed after the row was gone but before
+  # marking the outbox entry :synced) parks :rejected and blocks the PK
+  # chain, demanding an operator discard/1 for a destroy that already took
+  # effect.
+  defp destroy_result(reason) do
+    if already_absent?(reason), do: :ok, else: {:error, reason}
+  end
+
+  defp already_absent?(%Ash.Error.Changes.StaleRecord{}), do: true
+  defp already_absent?(%Ash.Error.Query.NotFound{}), do: true
+
+  defp already_absent?(%{errors: errors}) when is_list(errors),
+    do: Enum.any?(errors, &already_absent?/1)
+
+  defp already_absent?(errors) when is_list(errors), do: Enum.any?(errors, &already_absent?/1)
+  defp already_absent?(_other), do: false
 
   defp maybe_set_tenant(changeset, nil), do: changeset
   defp maybe_set_tenant(changeset, tenant), do: Ash.Changeset.set_tenant(changeset, tenant)

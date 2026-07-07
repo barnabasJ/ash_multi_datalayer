@@ -91,7 +91,12 @@ defmodule AshMultiDatalayer.Test.FailableLayer do
     :ok
   end
 
-  @doc "Arm the layer to fail the next writes with `spec` (`:rejected` | `:transient` | `:forbidden`)."
+  @doc """
+  Arm the layer to fail the next writes with `spec` (`:rejected` |
+  `:transient` | `:forbidden` | `:not_found` — M6: mirrors a remote-layer
+  NotFound-class destroy failure, e.g. `AshRemote.DataLayer`'s translation
+  of a server-side "already gone" response).
+  """
   def fail(layer, spec), do: :ets.insert(@table, {layer, spec})
 
   @doc "Disarm the layer — writes delegate normally."
@@ -105,6 +110,7 @@ defmodule AshMultiDatalayer.Test.FailableLayer do
       [{^layer, :rejected}] -> {:error, {:rejected, "target rejected the write"}}
       [{^layer, :transient}] -> {:error, {:transient, "target transiently unavailable"}}
       [{^layer, :forbidden}] -> {:error, %Ash.Error.Forbidden{}}
+      [{^layer, :not_found}] -> {:error, %Ash.Error.Query.NotFound{}}
       _ -> delegate.()
     end
   end
