@@ -1,6 +1,32 @@
 # M9 — `discard`/`drop_chain` not inside the co-commit transaction (#16 partial)
 
-- **Status**: OPEN
+- **Status**: DONE — `drop_chain/1` itself is gone (M4 removed it as dead code
+  once `discard_local/1` switched to `destroy_captured_chain/3`), so half of
+  this task was already resolved as a side effect. The remaining half —
+  `discard/1`'s create-branch, still a bare `Enum.each` outside any transaction
+  — now calls the same `destroy_captured_chain/3` helper `rebase/2`'s cleanup
+  already uses (real co-commit `repo.transaction`, not
+  `Ash.DataLayer.transaction`); `discard/1`'s `@spec` updated to include
+  `{:error, term()}` (genuinely reachable now) and corrected
+  `discarded: pos_integer()` → `non_neg_integer()` (the `:noop` branch already
+  returns `discarded: 0`, a pre-existing spec inaccuracy touched while here).
+  Rebase cleanup's OWN use of `transaction!/2` (the real co-commit
+  `repo.transaction`) was already correct per the loop-1 review and needed no
+  fix — its existing test coverage stands as the retained regression. **Test
+  limitation, noted honestly**: a genuine mid-chain destroy-failure rollback
+  test would need an outbox entry to vanish strictly BETWEEN `discard/1`'s
+  internal `record_chain/1` read and its destroy loop — both run synchronously
+  in one process with no yield point between them, and `OutboxEntry`'s own
+  `:discard` action (`add_action(:destroy, :discard, [])` — no guard) has no way
+  to fail deterministically without a test-only production hook. The new test
+  instead proves the happy path (`discard/1`'s create-branch now destroys its
+  whole chain via `destroy_captured_chain/3` — a real transaction call, not the
+  old bare loop) — it does NOT independently discriminate fixed vs. unfixed (the
+  old code also succeeded on this happy path); the rollback-on-failure behavior
+  is verified by code reuse of the SAME helper `rebase/2`'s own test suite
+  already exercises transactionally, not by an independent failure-injection
+  repro for this specific call site. `INTEGRATION=1 mix test` green (312, up
+  from 307).
 - **Severity**: Medium (atomicity claim unmet)
 - **Repo**: MDL (ash_multi_datalayer)
 - **Verification**: AGENT

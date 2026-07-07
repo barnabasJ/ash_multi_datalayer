@@ -112,6 +112,44 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxResolutionTest do
   defp remote(resource \\ Widget), do: elem(Target.read_all(resource, :remote), 1)
   defp local(resource \\ Widget), do: elem(Target.read_all(resource, :local), 1)
 
+  # --- M9: discard/1's create-branch must destroy its chain atomically ------
+
+  # A genuinely mid-chain destroy failure (proving the rollback, not just
+  # the happy path) would need an entry to vanish strictly BETWEEN
+  # discard/1's internal record_chain/1 read and its destroy loop — both
+  # run synchronously in one process with no yield point between them, and
+  # OutboxEntry's own :discard action (add_action(:destroy, :discard, [])
+  # — no guard) has no hook to fail it deterministically without a
+  # test-only production change. destroy_captured_chain/3's rollback
+  # behavior on a genuine failure is what rebase/2's OWN test suite above
+  # already exercises (same shared helper); this describe block instead
+  # proves the missing half — that discard/1's create-branch now calls it
+  # at all (a real co-commit repo.transaction) instead of the old bare,
+  # unwrapped Enum.each.
+  describe "M9: discard/1's create-branch runs inside the real co-commit transaction" do
+    test "discards every chain entry (create + subsequent pending writes) via one transaction" do
+      FailableLayer.fail(Remote, :rejected)
+
+      w = create!(name: "m9", count: 1)
+      drain()
+      update!(w, %{name: "m9-2"})
+
+      [head, tail] = entries() |> Enum.sort_by(& &1.seq)
+      assert head.state == :parked
+      assert head.op == :create
+
+      assert {:ok, %{discarded: 2, dropped_chain: true}} = LocalOutbox.discard(head)
+      # Both outbox entries are gone — discard/1 only drops the
+      # replication chain; the local authoritative record is untouched.
+      assert entries() == []
+      assert Enum.any?(local(), &(&1.id == w.id))
+
+      _ = tail
+    after
+      FailableLayer.clear(Remote)
+    end
+  end
+
   # --- M-1: rebase/2 ---------------------------------------------------------
 
   describe "M-1: rebase/2 must not destroy the entries created by its own resolution write" do

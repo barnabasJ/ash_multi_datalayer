@@ -1,6 +1,26 @@
 # M8 — Changeset-less multitenant broadcast is unjoinable
 
-- **Status**: OPEN
+- **Status**: DONE — `broadcast/3` now calls `resolve_tenant/2`: a changeset
+  carries the authoritative tenant regardless of strategy (as before);
+  changeset-less on an `:attribute`-strategy resource reads the tenant directly
+  off `notification.data`'s multitenancy attribute (closes the common case — the
+  notification now reaches the correct tenant topic); changeset-less on
+  `:context`-strategy has nowhere to recover the tenant from (it never lives on
+  the record) — `:unresolvable`, and the notifier does NOT publish to the
+  unjoinable untenanted topic. The fallback is a concrete, observable, testable
+  signal per the done-when's requirement (not docs-only): a `Logger.warning`
+  plus a
+  `:telemetry.execute([:ash_remote, :server, :notifier, :unresolvable_tenant], %{count: 1}, %{resource:, action:})`
+  event. New `PubSubFixture.AttrTenantThing`/`CtxTenantThing` fixtures + 3 repro
+  tests (attribute-derives-and-delivers, context-never-delivers-but-signals,
+  non-multitenant-unaffected) using the existing `TestPubSub` broadcast-capture
+  harness and a hand-built changeset-less `%Ash.Notifier.Notification{}` (Ash's
+  own action pipeline always attaches one; a changeset-less notification is a
+  real but externally-triggered shape — e.g. a manual `Ash.Notifier.notify/1`
+  call or certain bulk paths). 2 of 3 fail on unfixed code (confirmed: no
+  delivery AND no signal for the context case; wrong/unjoinable topic for the
+  attribute case). `mix test` green (200/202 — the 2 remaining failures are the
+  same pre-existing, unrelated `ChangeNotifierTest` issue noted in M7).
 - **Severity**: Medium (lost realtime notifications)
 - **Repo**: ash_remote
 - **Verification**: AGENT

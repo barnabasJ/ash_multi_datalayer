@@ -136,7 +136,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   return); otherwise drops just this entry.
   """
   @spec discard(Ash.Resource.record()) ::
-          {:ok, %{discarded: pos_integer(), dropped_chain: boolean()}}
+          {:ok, %{discarded: non_neg_integer(), dropped_chain: boolean()}} | {:error, term()}
   def discard(entry) do
     case ensure_resolvable_head(entry) do
       # B7: already `:synced` — nothing pending/parked to discard.
@@ -149,12 +149,17 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
         if entry.op == :create do
           chain = record_chain(entry)
 
-          Enum.each(
-            Enum.sort_by(chain, & &1.seq, :desc),
-            &Ash.destroy!(&1, action: :discard, domain: domain(outbox), authorize?: false)
-          )
-
-          {:ok, %{discarded: length(chain), dropped_chain: true}}
+          # M9: was a bare Enum.each outside any transaction — a mid-drop
+          # crash left a partially destroyed chain (the atomicity claim
+          # this whole path is supposed to make). Reuses the same real
+          # co-commit `transaction!/2` wrapper rebase/2's cleanup already
+          # uses via `destroy_captured_chain/3` — same failure posture
+          # (all-or-nothing; a rescued crash returns a structured error
+          # naming the still-intact head instead of raising).
+          case destroy_captured_chain(outbox, chain, entry) do
+            :ok -> {:ok, %{discarded: length(chain), dropped_chain: true}}
+            {:error, _} = error -> error
+          end
         else
           Ash.destroy!(entry, action: :discard, domain: domain(outbox), authorize?: false)
           kick_next(entry)

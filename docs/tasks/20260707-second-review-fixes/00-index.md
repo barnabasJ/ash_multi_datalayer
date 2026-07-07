@@ -195,9 +195,9 @@ is H5/#19 work and uses the real tenant, not the partition key.
 | M4  | [`discard_local/1` destroys freshly re-read chain, skips head guard](m4-discard-local-chain-destroy.md)                                      | MDL        | DONE   |
 | M5  | [Refresh/delete reconciliation not atomic with dirty check](m5-refresh-delete-reconciliation-not-atomic.md) — subsumed by H3, closes with it | MDL        | DONE   |
 | M6  | [Destroy-flush of already-gone row parks as `:rejected`](m6-destroy-flush-already-gone-parks.md)                                             | MDL        | DONE   |
-| M7  | [Query calculations/aggregates decoded uncast](m7-query-calc-aggregate-decode-uncast.md)                                                     | ash_remote | OPEN   |
-| M8  | [Changeset-less multitenant broadcast unjoinable](m8-changeset-less-multitenant-broadcast.md)                                                | ash_remote | OPEN   |
-| M9  | [`discard`/`drop_chain` not inside co-commit transaction](m9-discard-drop-chain-not-transactional.md)                                        | MDL        | OPEN   |
+| M7  | [Query calculations/aggregates decoded uncast](m7-query-calc-aggregate-decode-uncast.md)                                                     | ash_remote | DONE   |
+| M8  | [Changeset-less multitenant broadcast unjoinable](m8-changeset-less-multitenant-broadcast.md)                                                | ash_remote | DONE   |
+| M9  | [`discard`/`drop_chain` not inside co-commit transaction](m9-discard-drop-chain-not-transactional.md)                                        | MDL        | DONE   |
 | M10 | [`hydrate/2` wraps `{:error, _}` refresh in `{:ok, ...}`](m10-hydrate-wraps-error.md)                                                        | MDL        | OPEN   |
 | M11 | [Client decoder crashes on `nil`/single-object responses](m11-decoder-crashes-nil-single-object.md)                                          | ash_remote | OPEN   |
 | P1  | [Source-computed aggregate guard bypassed on non-merged paths](p1-aggregate-guard-bypass.md)                                                 | MDL        | OPEN   |

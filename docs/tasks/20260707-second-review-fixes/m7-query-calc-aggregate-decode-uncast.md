@@ -1,6 +1,22 @@
 # M7 — Query calculations/aggregates decoded uncast (#25)
 
-- **Status**: OPEN
+- **Status**: DONE — all 4 `place/4` clauses (`:calculation`/`:aggregate`, each
+  with a `load`-aliased and a default-map variant) now cast through a shared
+  `cast_typed/3`, using the `type`/`constraints` already present on the
+  `%Ash.Query.Calculation{}`/`%Ash.Query.Aggregate{}` struct Ash core hands to
+  `add_calculation`/`add_aggregate` — no resource-level DSL lookup needed (works
+  for ad-hoc/dynamically-loaded targets too, unlike `cast_calculation/3`'s
+  name-lookup, which now delegates to the same helper). Nil type or a cast
+  failure falls back to the raw wire value — never raises. 4 unit-level repros
+  (one per `place/4` clause) exercise `Decoder.decode_record/3` directly with
+  hand-built typed calc/aggregate structs — deliberately NOT an RPC round-trip,
+  since ash_remote's ad-hoc query-time calc/aggregate protocol support turned
+  out not to reliably resolve `.type` for every construction path (a separate,
+  pre-existing concern outside this task); all 4 fail on unfixed code
+  (confirmed). New `Comment.rating :decimal` field + `Todo.avg_comment_rating`
+  aggregate + `Todo.deadline_echo` calc fixtures. Full `mix test` green (197/199
+  — the 2 remaining failures are a pre-existing, unrelated `ChangeNotifierTest`
+  issue confirmed present on unfixed code too, out of this task's scope).
 - **Severity**: Medium (typed matches break; cache layers poisoned)
 - **Repo**: ash_remote
 - **Verification**: VERIFIED
