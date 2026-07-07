@@ -287,6 +287,20 @@ defmodule AshMultiDatalayer.Test.LocalOutbox.FailableLocalWidget do
 
   actions do
     defaults([:read, :destroy, create: :*, update: :*])
+
+    # M1: exercises LocalOutbox.Write.async_run's {:upsert, keys, identity}
+    # path with a FailableSqlite armed to return
+    # `{:ok, {:upsert_skipped, query, callback}}` (mirrors an
+    # upsert_condition-skipped upsert without needing a real one here).
+    create :upsert_by_name do
+      accept([:name])
+      upsert?(true)
+      upsert_identity(:unique_name)
+    end
+  end
+
+  identities do
+    identity(:unique_name, [:name])
   end
 end
 

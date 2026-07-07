@@ -1,6 +1,18 @@
 # H1 — Bundled remote-calculation fetch runs unauthenticated (#8)
 
-- **Status**: OPEN
+- **Status**: DONE — `fetch_remote_calculations/5` now accepts `:actor`/
+  `:context` opts and builds request headers via the same `request_headers/1`
+  ordinary reads use; `RemoteCalculation.fetched_ values/4` passes
+  `context.actor`/`context.source_context` through. The memo key now includes
+  `context.actor` and the explicit `ash_remote.headers` (not just
+  tenant/PK/specs), closing the actor-leak/header-leak across same-process
+  loads. New backend `Document.is_owner` calc (`owner_id == actor(:id)`,
+  genuinely actor-dependent — can't be mirrored into a plain `expr(...)`) +
+  hand-written `RemoteCalculation` proxy on the client exercise the
+  bundled-fetch path specifically. 4 new repro tests fail on unfixed code
+  (confirmed: unauthenticated bundled fetch is silently denied instead of
+  scoped, and same-process cross-actor/cross-header memo reuse leaks a value).
+  Full `mix test` green (190, up from 185).
 - **Severity**: High (auth bypass / wrong-actor values)
 - **Repo**: ash_remote
 - **Verification**: AGENT (traced by review agent, not independently

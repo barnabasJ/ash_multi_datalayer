@@ -55,7 +55,7 @@ defmodule AshMultiDatalayer.Test.FailableLayer do
       if function_exported?(wraps, :upsert, 4) do
         quote do
           def upsert(resource, changeset, keys, identity \\ nil) do
-            AshMultiDatalayer.Test.FailableLayer.guard(__MODULE__, fn ->
+            AshMultiDatalayer.Test.FailableLayer.guard_upsert(__MODULE__, fn ->
               unquote(wraps).upsert(resource, changeset, keys, identity)
             end)
           end
@@ -63,7 +63,7 @@ defmodule AshMultiDatalayer.Test.FailableLayer do
       else
         quote do
           def upsert(resource, changeset, keys) do
-            AshMultiDatalayer.Test.FailableLayer.guard(__MODULE__, fn ->
+            AshMultiDatalayer.Test.FailableLayer.guard_upsert(__MODULE__, fn ->
               unquote(wraps).upsert(resource, changeset, keys)
             end)
           end
@@ -123,6 +123,26 @@ defmodule AshMultiDatalayer.Test.FailableLayer do
     case :ets.lookup(@table, {layer, :reads}) do
       [{_, reason}] -> {:error, reason}
       [] -> delegate.()
+    end
+  end
+
+  @doc """
+  Arm the layer's NEXT upsert to return `{:ok, {:upsert_skipped, query,
+  callback}}` (M1: mirrors ash_sqlite/ash_postgres surfacing a
+  condition-skipped upsert without a real `upsert_condition` fixture) —
+  separate from `fail/2` so arming one never interferes with the other.
+  """
+  def skip_upsert(layer, query \\ nil, callback \\ fn -> {:ok, nil} end),
+    do: :ets.insert(@table, {{layer, :upsert_skip}, {query, callback}})
+
+  @doc "Disarm the layer's upsert-skip — upserts delegate/guard normally again."
+  def clear_skip_upsert(layer), do: :ets.delete(@table, {layer, :upsert_skip})
+
+  @doc false
+  def guard_upsert(layer, delegate) do
+    case :ets.lookup(@table, {layer, :upsert_skip}) do
+      [{_, {query, callback}}] -> {:ok, {:upsert_skipped, query, callback}}
+      [] -> guard(layer, delegate)
     end
   end
 end

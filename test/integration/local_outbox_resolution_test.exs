@@ -582,6 +582,56 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxResolutionTest do
     end
   end
 
+  # --- M1: {:upsert_skipped, ...} must not crash the LocalOutbox write path -
+
+  describe "M1: a condition-skipped upsert through LocalOutbox does not crash" do
+    setup do
+      on_exit(fn -> FailableLayer.clear_skip_upsert(FailableSqlite) end)
+      :ok
+    end
+
+    # A skip tuple's `callback`, when Ash core invokes it (only under
+    # `return_skipped_upsert?: true`), must return the resource's OWN
+    # struct, not `nil` — a plain `{:ok, nil}` stand-in trips an UNRELATED
+    # `Ash.Actions.Helpers.restrict_field_access/2` clause mismatch that has
+    # nothing to do with M1, so echo a plausible existing row instead.
+    defp echo_callback(name),
+      do: fn -> {:ok, %FailableLocalWidget{id: Ash.UUID.generate(), name: name}} end
+
+    test "async_run surfaces the skip tuple instead of crashing in enqueue_entries" do
+      FailableLayer.skip_upsert(FailableSqlite, nil, echo_callback("skip-me"))
+
+      # Unfixed: `local_write` returns `{:ok, {:upsert_skipped, _, _}}`,
+      # `async_run`'s `with {:ok, record} <- local_write(...)` binds `record`
+      # to the tuple, and `enqueue_entries/7` crashes calling
+      # `Snapshot.record_pk(resource, record)` — `Map.get` on a tuple.
+      assert {:ok, %FailableLocalWidget{name: "skip-me"}} =
+               FailableLocalWidget
+               |> Ash.Changeset.for_create(:upsert_by_name, %{name: "skip-me"}, domain: Domain)
+               |> Ash.create(
+                 upsert?: true,
+                 upsert_identity: :unique_name,
+                 return_skipped_upsert?: true,
+                 authorize?: false
+               )
+    end
+
+    test "a skipped upsert does not enqueue an outbox entry for a write that didn't happen" do
+      FailableLayer.skip_upsert(FailableSqlite, nil, echo_callback("skip-me-2"))
+
+      FailableLocalWidget
+      |> Ash.Changeset.for_create(:upsert_by_name, %{name: "skip-me-2"}, domain: Domain)
+      |> Ash.create(
+        upsert?: true,
+        upsert_identity: :unique_name,
+        return_skipped_upsert?: true,
+        authorize?: false
+      )
+
+      assert OutboxEntry |> Ash.read!(domain: Domain, authorize?: false) == []
+    end
+  end
+
   # --- B7: resolution verbs on a stale handle to an already-:synced entry ----
 
   describe "B7: resolution verbs are idempotent no-ops on an already-:synced entry" do

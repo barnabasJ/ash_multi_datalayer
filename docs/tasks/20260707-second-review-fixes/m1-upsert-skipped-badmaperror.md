@@ -1,6 +1,22 @@
 # M1 — `{:ok, {:upsert_skipped, query, callback}}` crashes with `BadMapError`
 
-- **Status**: OPEN
+- **Status**: DONE — both crash sites fixed: `WriteDispatch.dispatch/4`
+  (ProvenCoverage; hit via `TenantKey.changeset/3` extracting the tenant from an
+  attribute-multitenant record) and
+  `LocalOutbox.Write.async_run/3`/`enqueue_entries/7` (via
+  `Snapshot.record_pk/2`) now pattern-match the skip tuple BEFORE record-shaped
+  extraction and return it unchanged — no outbox entry, no
+  invalidation/propagation/telemetry for a write that didn't happen (mirrors
+  `WriteDispatch.upsert/4`'s pre-existing correct posture at its own
+  entrypoint). `in_transaction/2` generalized (passes through whatever non-error
+  tuple its `fun` returns) instead of hardcoding the 2-tuple `{record, entries}`
+  shape, so the new `{:skipped, skipped}` result flows through the co-commit
+  transaction unchanged. New `AttrPost.upsert_if_newer` (real Postgres
+  `upsert_condition`, attribute-multitenant) and
+  `FailableLocalWidget.upsert_by_name` + `FailableLayer.skip_upsert/3`
+  (LocalOutbox, synthetic skip — a real `upsert_condition` fixture isn't needed
+  to prove the crash site) repros. 3 tests fail on unfixed code (confirmed:
+  BadMapError). `INTEGRATION=1 mix test` green (301, up from 298).
 - **Severity**: Medium (crash on a legitimate upsert path)
 - **Repo**: MDL (ash_multi_datalayer)
 - **Verification**: VERIFIED

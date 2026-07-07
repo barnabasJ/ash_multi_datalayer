@@ -45,9 +45,29 @@ defmodule AshMultiDatalayer.Test.Tenancy.AttrPost do
     attribute :org_id, :string, public?: true
     attribute :organization_id, :string, public?: true
     attribute :title, :string, public?: true
+    attribute :version, :integer, public?: true, default: 0
+  end
+
+  identities do
+    identity :unique_title, [:org_id, :title]
   end
 
   actions do
     defaults [:read, :destroy, create: :*, update: :*]
+
+    # M1: a real condition-skipped upsert (ash_postgres returns
+    # `{:ok, {:upsert_skipped, query, callback}}` when the row exists but
+    # `upsert_condition` is false) through this attribute-multitenant
+    # ProvenCoverage resource — WriteDispatch.dispatch/4 crashed calling
+    # TenantKey.changeset/3 (which extracts the tenant FROM the record's
+    # attributes) on that tuple.
+    create :upsert_if_newer do
+      accept [:org_id, :title]
+      argument :version, :integer, allow_nil?: false
+      change set_attribute(:version, arg(:version))
+      upsert? true
+      upsert_identity :unique_title
+      upsert_condition expr(version < ^arg(:version))
+    end
   end
 end

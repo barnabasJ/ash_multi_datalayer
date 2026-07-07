@@ -217,4 +217,29 @@ defmodule AshMultiDatalayer.Integration.TenantPartitionTest do
     assert warm!(tenant_query) == []
     assert pg_reads() == 2
   end
+
+  # M1: ash_postgres returns `{:ok, {:upsert_skipped, query, callback}}` for
+  # a condition-skipped upsert — `record` here is NOT a struct. Unfixed
+  # WriteDispatch.dispatch/4 passed it straight to
+  # `TenantKey.changeset(resource, changeset, record)` (attribute-multitenant
+  # resources extract the tenant FROM the record), which crashed with
+  # `BadMapError` AFTER the (no-op) write already "succeeded" — instead of
+  # the clean `StaleRecord` error Ash core surfaces by default for a skipped
+  # upsert (`return_skipped_upsert?: true`, which would hand back the
+  # existing row via the skip tuple's callback, hits an unrelated
+  # pre-existing ash_postgres/explicitly-delegated-layer callback-plumbing
+  # issue not in M1's scope — this test only needs the tuple to survive
+  # `dispatch/4` intact, which the clean StaleRecord error already proves).
+  test "M1: a condition-skipped upsert on an attribute-multitenant resource surfaces a clean StaleRecord error, not a crash" do
+    create!(%{org_id: "acme", title: "one", version: 5})
+
+    assert {:error, %Ash.Error.Invalid{errors: [%Ash.Error.Changes.StaleRecord{}]}} =
+             AttrPost
+             |> Ash.Changeset.for_create(:upsert_if_newer, %{
+               org_id: "acme",
+               title: "one",
+               version: 1
+             })
+             |> Ash.create()
+  end
 end

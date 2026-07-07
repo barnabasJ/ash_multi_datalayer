@@ -178,8 +178,8 @@ is H5/#19 work and uses the real tenant, not the partition key.
 
 | ID  | Task                                                                                                      | Repo       | Status |
 | --- | --------------------------------------------------------------------------------------------------------- | ---------- | ------ |
-| H1  | [Bundled remote-calculation fetch runs unauthenticated](h1-remote-calc-fetch-unauthenticated.md)          | ash_remote | OPEN   |
-| H2  | [Non-PK upsert identity ignored + accept-list truncation](h2-non-pk-upsert-identity-accept-truncation.md) | ash_remote | OPEN   |
+| H1  | [Bundled remote-calculation fetch runs unauthenticated](h1-remote-calc-fetch-unauthenticated.md)          | ash_remote | DONE   |
+| H2  | [Non-PK upsert identity ignored + accept-list truncation](h2-non-pk-upsert-identity-accept-truncation.md) | ash_remote | DONE   |
 | H3  | [`refresh/3` TOCTOU vs co-committed local write](h3-refresh-toctou.md)                                    | MDL        | DONE   |
 | H4  | [`write_through` drain race + post-target-push divergence](h4-write-through-drain-race-divergence.md)     | MDL        | DONE   |
 | H5  | [LocalOutbox tenant model: `nil` = "IS NULL" vs "unscoped"](h5-localoutbox-nil-tenant-model.md)           | MDL        | DONE   |
@@ -189,7 +189,7 @@ is H5/#19 work and uses the real tenant, not the partition key.
 
 | ID  | Task                                                                                                                                         | Repo       | Status |
 | --- | -------------------------------------------------------------------------------------------------------------------------------------------- | ---------- | ------ |
-| M1  | [`{:upsert_skipped, ...}` crashes with `BadMapError`](m1-upsert-skipped-badmaperror.md)                                                      | MDL        | OPEN   |
+| M1  | [`{:upsert_skipped, ...}` crashes with `BadMapError`](m1-upsert-skipped-badmaperror.md)                                                      | MDL        | DONE   |
 | M2  | [Context-tenancy invalidation uses raw metadata tenant](m2-context-tenancy-raw-metadata-tenant.md)                                           | MDL        | DONE   |
 | M3  | [External update passes after-image as `row_before`](m3-external-update-after-image-row-before.md)                                           | MDL        | OPEN   |
 | M4  | [`discard_local/1` destroys freshly re-read chain, skips head guard](m4-discard-local-chain-destroy.md)                                      | MDL        | OPEN   |

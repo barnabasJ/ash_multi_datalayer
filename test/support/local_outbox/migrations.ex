@@ -41,6 +41,8 @@ defmodule AshMultiDatalayer.Test.LocalOutbox.Migrations do
       add(:name, :string)
     end
 
+    create unique_index("lo_failable_local_widgets", [:name])
+
     create table("lo_mt_widgets", primary_key: false) do
       add(:id, :uuid, primary_key: true)
       add(:org_id, :string)

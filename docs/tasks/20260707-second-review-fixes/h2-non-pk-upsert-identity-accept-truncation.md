@@ -1,6 +1,20 @@
 # H2 — Non-PK upsert identity ignored + accept-list truncation (#24)
 
-- **Status**: OPEN
+- **Status**: DONE — `upsert/3` now uses `keys` (falling back to the primary key
+  only when `keys` is nil/empty) to build the lookup filter, in both the initial
+  lookup and the create-collision retry (same `remote_identity_row/3`, so both
+  paths are structurally guaranteed to agree — not independently re-verified
+  under real concurrency, given the cost of deterministically forcing the race).
+  The upsert-resolved update now addresses the FOUND row's actual primary key
+  (`Map.get(found_row, key)`), never one rebuilt from the incoming changeset's
+  attributes. A replicated write (marked via a private context flag set only
+  when `put_write_action/3,4` itself resolves the default action — never for a
+  caller-supplied one) converges every attribute present on the changeset
+  regardless of the resolved action's `accept`, excluding the primary key (which
+  is wire-protocol metadata, never "input"); an ordinary action-driven update
+  still respects its own `accept`. New `Client.User`/`Backend.User` identity +
+  narrow-accept `:update` fixture; 4 repro tests, 3 fail on unfixed code
+  (confirmed). Full `mix test` green (194, up from 190).
 - **Severity**: High (silent replica divergence)
 - **Repo**: ash_remote
 - **Verification**: AGENT

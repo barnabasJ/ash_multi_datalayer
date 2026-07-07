@@ -293,9 +293,24 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
 
     committed =
       in_transaction(repo, fn ->
-        with {:ok, record} <- local_write(local, resource, changeset, op) do
-          entries = enqueue_entries(outbox, resource, changeset, op, record, targets, write_ref)
-          {:ok, record, entries}
+        case local_write(local, resource, changeset, op) do
+          # M1: an upsert_condition-skipped upsert wrote nothing locally —
+          # `{:upsert_skipped, query, callback}` isn't a record, so it must
+          # never reach `Snapshot.record_pk`/`TenantKey.changeset`
+          # (enqueue_entries) or `finalize/3`'s `.__metadata__` access.
+          # Surface it unchanged, the same posture WriteDispatch already
+          # takes for ProvenCoverage.
+          {:ok, {:upsert_skipped, _query, _callback} = skipped} ->
+            {:skipped, skipped}
+
+          {:ok, record} ->
+            entries =
+              enqueue_entries(outbox, resource, changeset, op, record, targets, write_ref)
+
+            {:ok, record, entries}
+
+          {:error, _} = error ->
+            error
         end
       end)
 
@@ -309,6 +324,9 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
         # `:pending` chain head with no live job.
         Enum.each(entries, &Enqueue.flush_and_log(outbox, &1))
         finalize(op, record, write_ref)
+
+      {:skipped, skipped} ->
+        {:ok, skipped}
 
       {:error, error} ->
         {:error, error}
@@ -409,11 +427,11 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
   defp in_transaction(repo, fun) do
     case repo.transaction(fn ->
            case fun.() do
-             {:ok, record, entries} -> {record, entries}
              {:error, error} -> repo.rollback(error)
+             result -> result
            end
          end) do
-      {:ok, {record, entries}} -> {:ok, record, entries}
+      {:ok, result} -> result
       {:error, error} -> {:error, error}
     end
   end

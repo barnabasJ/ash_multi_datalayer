@@ -78,26 +78,40 @@ defmodule AshMultiDatalayer.WriteDispatch do
     [authoritative | rest] = Info.write_layer_modules(resource)
     started = System.monotonic_time()
 
-    with {:ok, record} <- normalize_result(authoritative_write.(authoritative)) do
-      tenant = TenantKey.changeset(resource, changeset, record)
-      dropped = invalidate(resource, tenant, changeset, operation, record)
+    case normalize_result(authoritative_write.(authoritative)) do
+      # M1: an upsert_condition-skipped upsert wrote nothing — `record` here
+      # is a `{:upsert_skipped, query, callback}` tuple, not a record.
+      # `TenantKey.changeset/3` (attribute-multitenant resources extract the
+      # tenant FROM the record's attributes) would `Map.get` on the tuple
+      # and crash AFTER the authoritative write already ran. Surface it
+      # unchanged instead — no invalidation/propagation for a write that
+      # didn't happen.
+      {:ok, {:upsert_skipped, _query, _callback} = skipped} ->
+        {:ok, skipped}
 
-      if KillSwitch.enabled?(resource) do
-        propagate(rest, resource, changeset, operation, record, tenant)
-      end
+      {:ok, record} ->
+        tenant = TenantKey.changeset(resource, changeset, record)
+        dropped = invalidate(resource, tenant, changeset, operation, record)
 
-      Telemetry.write(
-        :applied,
-        resource,
-        tenant,
-        %{
-          duration_us: Telemetry.duration_us(started),
-          ledger_size: Coverage.size(resource, tenant)
-        },
-        %{operation: operation, dropped_count: dropped}
-      )
+        if KillSwitch.enabled?(resource) do
+          propagate(rest, resource, changeset, operation, record, tenant)
+        end
 
-      {:ok, record}
+        Telemetry.write(
+          :applied,
+          resource,
+          tenant,
+          %{
+            duration_us: Telemetry.duration_us(started),
+            ledger_size: Coverage.size(resource, tenant)
+          },
+          %{operation: operation, dropped_count: dropped}
+        )
+
+        {:ok, record}
+
+      {:error, _} = error ->
+        error
     end
   end
 
