@@ -1,11 +1,17 @@
 # B3 — `tenant_from_filter/2` is dead code — attribute-tenancy invalidation inert
 
-- **Status**: OPEN — **two-phase (pass-7)**: Phase 1 lands the canonical tenant
-  function (before H5/M2/L3/P4 are worked); B3 then stays OPEN and closes only
-  in Phase 2, after the tenant-unit consumers are updated and the
-  **four-bucketing-call-site** cross-cutting assertion passes (loop-3: four, not
-  five — target calls are excluded, see the assertion below). "Lands first" ≠
-  "closes first".
+- **Status**: DONE — `TenantKey.canonical/2` lands (nil -> `unscoped/0`
+  sentinel, `to_string/1` for int/atom, `Ash.ToTenant` for structs);
+  `tenant_from_filter/2` rewritten as a structural `Normaliser` DNF walk (exact
+  attribute identity, zero-row-safe, conservative on multi-disjunct/ opaque).
+  Four bucketing call sites (`coverage_tenant/2`, `notification_tenant/2` both
+  clauses, LocalOutbox `write.ex` enqueue+drain,
+  `Invalidation.on_write/2`/`drop_all/2`) all canonicalize via this one function
+  — confirmed by the cross-cutting repro (write invalidates the exact partition
+  a prior read recorded; zero-row; multi-predicate/or/in; org_id vs
+  organization_id collision). H5/M2/L3/P4 consume it. `INTEGRATION=1 mix test`
+  green (279, up from 267 baseline). Committed `ash_multi_datalayer`
+  (tenant-unit phase).
 - **Severity**: Blocker (permanent stale cache)
 - **Repo**: MDL (ash_multi_datalayer)
 - **Verification**: VERIFIED

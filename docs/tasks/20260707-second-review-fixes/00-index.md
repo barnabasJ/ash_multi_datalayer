@@ -166,9 +166,9 @@ is H5/#19 work and uses the real tenant, not the partition key.
 
 | ID  | Task                                                                                                          | Repo       | Status |
 | --- | ------------------------------------------------------------------------------------------------------------- | ---------- | ------ |
-| B1  | [RPC exfiltrates private calcs/aggregates + field-policy 500](b1-rpc-private-calc-aggregate-exfiltration.md)  | ash_remote | OPEN   |
-| B2  | [Aggregate-filter code injection at codegen](b2-aggregate-filter-codegen-injection.md)                        | ash_remote | OPEN   |
-| B3  | [`tenant_from_filter/2` dead code — attribute-tenancy invalidation inert](b3-tenant-from-filter-dead-code.md) | MDL        | OPEN   |
+| B1  | [RPC exfiltrates private calcs/aggregates + field-policy 500](b1-rpc-private-calc-aggregate-exfiltration.md)  | ash_remote | DONE   |
+| B2  | [Aggregate-filter code injection at codegen](b2-aggregate-filter-codegen-injection.md)                        | ash_remote | DONE   |
+| B3  | [`tenant_from_filter/2` dead code — attribute-tenancy invalidation inert](b3-tenant-from-filter-dead-code.md) | MDL        | DONE   |
 | B4  | [ExternalChange origin marker matches no real notification](b4-external-change-origin-marker-mismatch.md)     | MDL        | OPEN   |
 | B5  | [`validate_aggregate_overrides` compile regression](b5-validate-aggregate-overrides-regression.md)            | MDL        | OPEN   |
 | B6  | [Stale-check payload compare skips JSON normalization](b6-stale-check-json-normalization.md)                  | MDL        | OPEN   |
@@ -182,7 +182,7 @@ is H5/#19 work and uses the real tenant, not the partition key.
 | H2  | [Non-PK upsert identity ignored + accept-list truncation](h2-non-pk-upsert-identity-accept-truncation.md) | ash_remote | OPEN   |
 | H3  | [`refresh/3` TOCTOU vs co-committed local write](h3-refresh-toctou.md)                                    | MDL        | OPEN   |
 | H4  | [`write_through` drain race + post-target-push divergence](h4-write-through-drain-race-divergence.md)     | MDL        | OPEN   |
-| H5  | [LocalOutbox tenant model: `nil` = "IS NULL" vs "unscoped"](h5-localoutbox-nil-tenant-model.md)           | MDL        | OPEN   |
+| H5  | [LocalOutbox tenant model: `nil` = "IS NULL" vs "unscoped"](h5-localoutbox-nil-tenant-model.md)           | MDL        | DONE   |
 | P6  | [Lost-kick recovery semantics (#4): sweeper unproven](p6-lost-kick-recovery.md)                           | MDL        | OPEN   |
 
 ## Medium
@@ -190,7 +190,7 @@ is H5/#19 work and uses the real tenant, not the partition key.
 | ID  | Task                                                                                                                                         | Repo       | Status |
 | --- | -------------------------------------------------------------------------------------------------------------------------------------------- | ---------- | ------ |
 | M1  | [`{:upsert_skipped, ...}` crashes with `BadMapError`](m1-upsert-skipped-badmaperror.md)                                                      | MDL        | OPEN   |
-| M2  | [Context-tenancy invalidation uses raw metadata tenant](m2-context-tenancy-raw-metadata-tenant.md)                                           | MDL        | OPEN   |
+| M2  | [Context-tenancy invalidation uses raw metadata tenant](m2-context-tenancy-raw-metadata-tenant.md)                                           | MDL        | DONE   |
 | M3  | [External update passes after-image as `row_before`](m3-external-update-after-image-row-before.md)                                           | MDL        | OPEN   |
 | M4  | [`discard_local/1` destroys freshly re-read chain, skips head guard](m4-discard-local-chain-destroy.md)                                      | MDL        | OPEN   |
 | M5  | [Refresh/delete reconciliation not atomic with dirty check](m5-refresh-delete-reconciliation-not-atomic.md) — subsumed by H3, closes with it | MDL        | OPEN   |
@@ -203,7 +203,7 @@ is H5/#19 work and uses the real tenant, not the partition key.
 | P1  | [Source-computed aggregate guard bypassed on non-merged paths](p1-aggregate-guard-bypass.md)                                                 | MDL        | OPEN   |
 | P2  | [Verifier rejections don't block plain `mix compile`](p2-verifier-compile-posture.md)                                                        | MDL        | OPEN   |
 | P3  | [Uncomputable-calc guard misses `distinct`/`distinct_sort`](p3-distinct-uncomputable-guard.md)                                               | MDL        | OPEN   |
-| P4  | [`global? true` invalidation never crosses partitions](p4-global-tenant-invalidation.md)                                                     | MDL        | OPEN   |
+| P4  | [`global? true` invalidation never crosses partitions](p4-global-tenant-invalidation.md)                                                     | MDL        | DONE   |
 
 ## Low
 
@@ -211,7 +211,7 @@ is H5/#19 work and uses the real tenant, not the partition key.
 | --- | ---------------------------------------------------------------------------------------------------------------------------------- | ---------- | ------ |
 | L1  | [Composite-PK crash in aggregate fold paths](l1-composite-pk-aggregate-paths.md)                                                   | MDL        | OPEN   |
 | L2  | [Aggregate fold leaves `%Ash.NotLoaded{}` (flaky live test)](l2-aggregate-fold-notloaded.md)                                       | MDL        | OPEN   |
-| L3  | [`write_through` inline drain misses creates; nil tenant on attribute-tenancy creates](l3-write-through-drain-create-pk-tenant.md) | MDL        | OPEN   |
+| L3  | [`write_through` inline drain misses creates; nil tenant on attribute-tenancy creates](l3-write-through-drain-create-pk-tenant.md) | MDL        | IN PROGRESS |
 | L4  | [String/CiString range subsumption still byte-ordered](l4-string-range-subsumption-collation.md)                                   | MDL        | OPEN   |
 | L5  | [Sweeper `{:global, ...}` name fails second-node boot; RejectMultiNode config](l5-sweeper-global-name-multinode.md)                | MDL        | OPEN   |
 | L6  | [Codegen LOWs: identifier validation, path traversal, FK fidelity](l6-codegen-lows.md)                                             | ash_remote | OPEN   |

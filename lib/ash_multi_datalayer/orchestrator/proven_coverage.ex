@@ -190,13 +190,18 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
     :ok
   end
 
+  # M2/B3: `forget!/3`'s `tenant:` opt is a coverage-PARTITION lookup (feeds
+  # `Invalidation.on_write/4` -> `Coverage.bump_epoch/2`/`Coverage.entries/2`),
+  # not a target-layer tenant — canonicalize through the one shared function
+  # so it agrees with the read-side partition a prior read recorded under,
+  # even when the caller passed a struct/integer tenant.
   defp notification_tenant(resource, %{changeset: changeset, data: record})
        when not is_nil(changeset) do
-    TenantKey.changeset(resource, changeset, record)
+    resource |> TenantKey.changeset(changeset, record) |> then(&TenantKey.canonical(resource, &1))
   end
 
   defp notification_tenant(resource, %{data: record}) when not is_nil(record) do
-    TenantKey.record(resource, record)
+    resource |> TenantKey.record(record) |> then(&TenantKey.canonical(resource, &1))
   end
 
   # --- writes ------------------------------------------------------------
@@ -915,7 +920,11 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
   defp coverage_epoch(resource, query),
     do: Coverage.epoch(resource, coverage_tenant(resource, query))
 
-  defp coverage_tenant(resource, query), do: TenantKey.query(resource, query)
+  # B3: the ledger's own partition key — always the canonical string (or the
+  # unscoped sentinel), never the raw target-layer tenant `TenantKey.query/2`
+  # returns.
+  defp coverage_tenant(resource, query),
+    do: resource |> TenantKey.query(query) |> then(&TenantKey.canonical(resource, &1))
 
   defp emit_read(kind, query, resource, started, extra) do
     Telemetry.read(

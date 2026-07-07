@@ -41,6 +41,12 @@ defmodule AshMultiDatalayer.Test.LocalOutbox.Migrations do
       add(:name, :string)
     end
 
+    create table("lo_mt_widgets", primary_key: false) do
+      add(:id, :uuid, primary_key: true)
+      add(:org_id, :string)
+      add(:name, :string)
+    end
+
     create table("lo_outbox", primary_key: false) do
       add(:seq, :integer, primary_key: true)
       add(:write_ref, :uuid, null: false)
@@ -68,6 +74,7 @@ defmodule AshMultiDatalayer.Test.LocalOutbox.Migrations do
     drop(table("lo_timestamp_widgets"))
     drop(table("lo_ifempty_widgets"))
     drop(table("lo_failable_local_widgets"))
+    drop(table("lo_mt_widgets"))
     drop(table("lo_outbox"))
   end
 end

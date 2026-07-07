@@ -54,7 +54,7 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
   end
 
   setup do
-    for t <- ~w(lo_widgets lo_stale_widgets lo_stamp_widgets lo_outbox oban_jobs) do
+    for t <- ~w(lo_widgets lo_stale_widgets lo_stamp_widgets lo_mt_widgets lo_outbox oban_jobs) do
       Ecto.Adapters.SQL.query!(SkeletonRepo, "DELETE FROM #{t}", [])
     end
 
@@ -62,7 +62,7 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
     # wrapped-layer ETS table is not reliably reset by `Ash.DataLayer.Ets.stop/1`.
     FailableLayer.clear(Remote)
 
-    for res <- [Widget, StaleWidget, StampWidget] do
+    for res <- [Widget, StaleWidget, StampWidget, AshMultiDatalayer.Test.LocalOutbox.MtWidget] do
       {:ok, rows} = Target.read_all(res, :remote)
       Enum.each(rows, &Target.destroy(res, :remote, &1, domain: Domain))
     end
@@ -485,6 +485,56 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
       end
 
       assert entries() == []
+    end
+  end
+
+  # --- H5: multitenant tenant model (`nil` = "IS NULL" vs "unscoped") -----
+
+  describe "H5: multitenant boot hydration / resume / dirty-chain scans" do
+    alias AshMultiDatalayer.Test.LocalOutbox.MtWidget
+    alias AshMultiDatalayer.TenantKey
+
+    defp mt_create!(attrs) do
+      MtWidget
+      |> Ash.Changeset.for_create(:create, Map.new(attrs), domain: Domain, tenant: attrs[:org_id])
+      |> Ash.create!()
+    end
+
+    test "boot hydration (unscoped scan) does not bypass the dirty-chain rule for a real tenant's pending write" do
+      w = mt_create!(org_id: "t1", name: "mine-unflushed")
+
+      # Mirrors what `boot_hydrate/1`'s `:on_start` branch now does — pass
+      # the unscoped scan sentinel explicitly, not the bare `nil` default.
+      # Unfixed code (`nil` -> `is_nil(tenant)`) sees zero pending entries
+      # for a multitenant host (every real entry has a real tenant string,
+      # never a literal null column) -> reports empty -> bypasses the
+      # dirty-chain rule -> the remote-authoritative `:all` reconcile then
+      # DELETES this still-pending local write (remote has nothing yet).
+      # `:all` scope is authoritative-reconcile: a local row absent from the
+      # (empty) remote result is normally DELETED — unless the dirty-chain
+      # check (which is what's under test) protects it.
+      assert %{deleted: 0} = LocalOutbox.refresh(MtWidget, :all, TenantKey.unscoped())
+      assert [%{id: id, name: "mine-unflushed"}] = local(MtWidget)
+      assert id == w.id
+    end
+
+    test "resume_sync kicks a real tenant's pending backlog, not just a nil-tenant one" do
+      _w = mt_create!(org_id: "t1", name: "backlogged")
+      assert [%{state: :pending}] = entries()
+
+      assert :ok = LocalOutbox.resume_sync(MtWidget)
+      drain()
+
+      assert [%{state: :synced}] = entries()
+      assert [%{name: "backlogged"}] = remote(MtWidget)
+    end
+
+    test "status reflects a pending tenant-scoped entry" do
+      w = mt_create!(org_id: "t1", name: "pending-status")
+      assert LocalOutbox.status(w) == :pending
+
+      drain()
+      assert LocalOutbox.status(w) == :synced
     end
   end
 end

@@ -1,6 +1,10 @@
 # B1 — RPC exfiltrates private calcs/aggregates; field-policy-denied field 500s
 
-- **Status**: OPEN
+- **Status**: DONE — `fields.ex:132-134` switched to `Info.public_aggregate`/
+  `Info.public_calculation`; repro + #27/#1-private-attribute retained
+  regressions added (`test/backend/rpc_field_policy_test.exs`,
+  `test/ash_remote/server/fields_test.exs`); full `mix test` green (185).
+  Committed `ash_remote@b0d9af0`.
 - **Severity**: Blocker (security)
 - **Repo**: ash_remote
 - **Verification**: VERIFIED (reviewer confirmed end-to-end in source)

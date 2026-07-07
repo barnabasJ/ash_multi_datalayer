@@ -1,6 +1,11 @@
 # B2 — Aggregate-filter code injection at codegen time
 
-- **Status**: OPEN
+- **Status**: DONE — `reproducible_aggregate?/1` now re-verifies
+  `aggregate_filter` with `AshRemote.Expression.safe?`, mirroring the calc path;
+  unsafe/unreproducible aggregates fall back to `remote(...)`. Loader left as
+  pure pass-through. Repro + positive + loader tests added (`gen_test.exs`,
+  `manifest_loader_test.exs`); full `mix test` green (185). Committed
+  `ash_remote@b0d9af0`.
 - **Severity**: Blocker (security — arbitrary code execution)
 - **Repo**: ash_remote
 - **Verification**: VERIFIED

@@ -1,6 +1,17 @@
 # H5 — Systemic LocalOutbox tenant model: `nil` = "IS NULL" vs "unscoped"
 
-- **Status**: OPEN
+- **Status**: DONE — `TenantKey.unscoped/0` (`:__global__`) is the single
+  scan-scope sentinel consumed from B3; `write.ex` always canonicalizes the
+  outbox `tenant` column (never a bare `nil`, so `nil`/unscoped both mean "every
+  partition" for `tenant_filter/2`, matching the storage side).
+  `boot_hydrate/1`/`resume_sync/1` pass `TenantKey.unscoped()` explicitly
+  instead of relying on the old `nil` default. `refresh/3` splits its tenant
+  into `real_tenant` (`TenantKey.real/1`, target-layer calls) vs the raw scan
+  value (dirty-chain checks) — target calls never see the sentinel. New
+  `AshMultiDatalayer.Test.LocalOutbox.MtWidget` fixture + repro: unscoped boot
+  hydration no longer deletes a real tenant's pending write; `resume_sync` kicks
+  a real tenant's backlog; `status` reflects a pending tenant-scoped entry.
+  `INTEGRATION=1 mix test` green (279).
 - **Severity**: High (multitenant boot clobbers pending writes)
 - **Repo**: MDL (ash_multi_datalayer)
 - **Verification**: VERIFIED / AGENT

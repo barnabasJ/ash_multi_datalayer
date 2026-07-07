@@ -51,6 +51,23 @@ defmodule AshMultiDatalayer.Coverage do
     ArgumentError -> []
   end
 
+  @doc """
+  Every distinct tenant partition currently holding a ledger entry for
+  `resource` (P4: the "sweep every partition" side of a `global? true`
+  nil-tenant write). Excludes the epoch meta-keys (`{:__mdl_meta__, :epoch,
+  _}`), which share the same table but are not entry keys.
+  """
+  @spec partitions(module()) :: [term()]
+  def partitions(resource) do
+    table = TableOwner.table_name(resource)
+
+    :ets.select(table, [{{{:"$1", :_}, :_}, [], [:"$1"]}])
+    |> Enum.reject(&(&1 == :__mdl_meta__))
+    |> Enum.uniq()
+  rescue
+    ArgumentError -> []
+  end
+
   @doc "Inserts a ledger entry (keyed by `entry.id`) for a resource+tenant."
   @spec insert(module(), term(), %{:id => term(), optional(any()) => any()}) :: :ok
   def insert(resource, tenant, entry) do

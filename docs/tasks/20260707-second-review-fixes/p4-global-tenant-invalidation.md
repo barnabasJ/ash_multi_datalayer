@@ -1,9 +1,16 @@
 # P4 — `global? true` multitenancy: invalidation never crosses tenant partitions
 
-- **Status**: OPEN — re-verified 2026-07-07: `invalidation.ex:72-73` comment
-  explicitly defers the cross-partition sweep ("…is M6, still open" — the
-  comment's "M6" means the **20260704 review's M6**, i.e. THIS task, not this
-  tracker's [M6](m6-destroy-flush-already-gone-parks.md) destroy-flush task)
+- **Status**: DONE — `Invalidation.on_write/4`/`drop_all/2` now sweep
+  `sweep_partitions/2` (P4's own 1:many orchestration, gated on
+  `Ash.Resource.Info.multitenancy_global?/1`): a tenant-scoped write also
+  bumps/drops the unscoped partition; a genuinely unscoped write sweeps every
+  partition currently in the ledger (new `Coverage.partitions/1`). Each
+  individual partition key still comes from B3's `TenantKey.canonical/2` — only
+  the "which partitions" orchestration is new. New
+  `AshMultiDatalayer.Test.Tenancy.AttrPost` `global? true` fixture (none existed
+  before) + repro (both directions: tenant-write invalidates a prior nil-tenant
+  read, and vice versa); fails on unfixed code (confirmed).
+  `INTEGRATION=1 mix test` green (279).
 - **Severity**: Medium (stale global reads after tenant-scoped writes)
 - **Repo**: MDL (ash_multi_datalayer)
 - **Source**:

@@ -1,6 +1,15 @@
 # L3 — `write_through` inline drain misses creates; nil tenant on attribute-tenancy creates
 
-- **Status**: OPEN
+- **Status**: IN PROGRESS — **tenant half DONE** (as planned, in the tenant-unit
+  phase): `TenantKey`'s `attribute_value/2` now has an `%Ash.Changeset{}` clause
+  reading `changeset.attributes` instead of the changeset struct's own top-level
+  keys (always nil); repro confirms an attribute-tenancy create's tenant is now
+  derived correctly; fails on unfixed code (confirmed). `drain_chain_inline`'s
+  partition-key derivation also switched to `TenantKey.canonical/2`. The
+  **create-PK drain half** (keying the inline drain on the effective PK, not
+  `changeset.data`) is deferred to
+  [H4](h4-write-through-drain-race-divergence.md), same function, per the
+  index's execution order.
 - **Severity**: Low (recreated row later deleted by stale destroy flush)
 - **Repo**: MDL (ash_multi_datalayer)
 - **Verification**: AGENT

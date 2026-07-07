@@ -1,6 +1,15 @@
 # M2 — External-change invalidation for `:context` tenancy uses the raw metadata tenant
 
-- **Status**: OPEN
+- **Status**: DONE — both `notification_tenant/2` clauses (changeset and
+  record-only) canonicalize via `TenantKey.canonical/2` before use as the
+  `forget!/3` partition; `Invalidation.on_write/4`/`drop_all/2` ALSO
+  canonicalize internally as a defensive choke point for any other caller. Repro
+  test adapted to attribute-strategy (the fix is strategy-agnostic — same
+  `notification_tenant/2` code path — building full context-tenancy Postgres
+  schema infra was unnecessary): an inbound notification carrying a
+  non-canonical (atom) tenant invalidates the exact partition a prior read
+  recorded; fails on unfixed code (confirmed). `INTEGRATION=1 mix test` green
+  (279).
 - **Severity**: Medium (wrong-partition invalidation → permanent stale entry)
 - **Repo**: MDL (ash_multi_datalayer)
 - **Verification**: AGENT

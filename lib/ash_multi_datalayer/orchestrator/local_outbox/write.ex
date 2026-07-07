@@ -67,7 +67,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
   defp drain_chain_inline(resource, record_pk, tenant) do
     outbox = LocalOutbox.outbox_resource(resource)
     key = Atom.to_string(resource)
-    tenant_key = stringify(tenant)
+    tenant_key = TenantKey.canonical(resource, tenant)
 
     outbox
     |> Ash.Query.for_read(:read, %{}, domain: Ash.Resource.Info.domain(outbox))
@@ -97,8 +97,12 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
     end)
   end
 
-  defp tenant_filter(query, nil), do: Ash.Query.filter(query, is_nil(tenant))
-  defp tenant_filter(query, tenant), do: Ash.Query.filter(query, tenant == ^to_string(tenant))
+  # `tenant_key` is always B3's canonical partition string (never nil —
+  # `TenantKey.canonical/2` maps a tenant-less write to the single unscoped
+  # sentinel, stored/matched like any other partition) — a plain equality
+  # filter, no local to_string/inspect.
+  defp tenant_filter(query, tenant_key),
+    do: Ash.Query.filter(query, tenant == ^to_string(tenant_key))
 
   # Materializes the record write_through pushes to targets — WITHOUT running
   # the local write yet (M-2's reorder: targets first, local last). A destroy
@@ -270,7 +274,12 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
     record_pk = Snapshot.record_pk(resource, record)
     payload = payload(op_atom, resource, record)
     base_image = base_image(op_atom, resource, changeset)
-    tenant = resource |> TenantKey.changeset(changeset, record) |> stringify()
+
+    tenant =
+      resource
+      |> TenantKey.changeset(changeset, record)
+      |> then(&TenantKey.canonical(resource, &1))
+      |> to_string()
 
     for target <- targets do
       outbox
@@ -306,10 +315,6 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
     do: Snapshot.dump(resource, changeset.data)
 
   defp base_image(_op, _resource, _changeset), do: nil
-
-  defp stringify(nil), do: nil
-  defp stringify(tenant) when is_binary(tenant), do: tenant
-  defp stringify(tenant), do: to_string(tenant)
 
   defp normalize_upsert({:error, :no_rollback, reason}), do: {:error, reason}
   defp normalize_upsert(other), do: other

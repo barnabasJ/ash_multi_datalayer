@@ -36,6 +36,7 @@ defmodule AshMultiDatalayer.Test.LocalOutbox.Domain do
     resource(AshMultiDatalayer.Test.LocalOutbox.TimestampWidget)
     resource(AshMultiDatalayer.Test.LocalOutbox.IfEmptyWidget)
     resource(AshMultiDatalayer.Test.LocalOutbox.FailableLocalWidget)
+    resource(AshMultiDatalayer.Test.LocalOutbox.MtWidget)
     resource(AshMultiDatalayer.Test.LocalOutbox.OutboxEntry)
   end
 end
@@ -281,6 +282,54 @@ defmodule AshMultiDatalayer.Test.LocalOutbox.FailableLocalWidget do
 
   attributes do
     uuid_primary_key(:id)
+    attribute(:name, :string, public?: true)
+  end
+
+  actions do
+    defaults([:read, :destroy, create: :*, update: :*])
+  end
+end
+
+defmodule AshMultiDatalayer.Test.LocalOutbox.MtWidget do
+  @moduledoc """
+  Host under LocalOutbox with attribute-strategy multitenancy (`global?
+  true`) — H5: the outbox tenant model must distinguish "unscoped" from
+  "IS NULL" for a genuinely multitenant host's boot hydration / resume /
+  dirty-chain checks.
+  """
+  use Ash.Resource,
+    domain: AshMultiDatalayer.Test.LocalOutbox.Domain,
+    data_layer: AshMultiDatalayer.DataLayer,
+    extensions: [AshSqlite.DataLayer]
+
+  multi_data_layer do
+    orchestrator(
+      {AshMultiDatalayer.Orchestrator.LocalOutbox,
+       outbox_resource: AshMultiDatalayer.Test.LocalOutbox.OutboxEntry,
+       conflict_detection: :off,
+       hydrate: :manual}
+    )
+
+    layer(:local, AshSqlite.DataLayer)
+    layer(:remote, AshMultiDatalayer.Test.LocalOutbox.Remote)
+    read_order([:local])
+    write_order([:local, :remote])
+  end
+
+  sqlite do
+    table("lo_mt_widgets")
+    repo(AshMultiDatalayer.Test.ObanSqlite.SkeletonRepo)
+  end
+
+  multitenancy do
+    strategy :attribute
+    attribute :org_id
+    global? true
+  end
+
+  attributes do
+    uuid_primary_key(:id)
+    attribute(:org_id, :string, public?: true)
     attribute(:name, :string, public?: true)
   end
 

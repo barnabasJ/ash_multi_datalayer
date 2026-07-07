@@ -304,8 +304,11 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   def resume_sync(host_resource) do
     :ok = Oban.resume_queue(instance(host_resource), queue: queue(host_resource))
     # Kick the backlog so it drains without waiting for the next sweep tick.
+    # H5: the unscoped sentinel, not the `nil` default — a multitenant host's
+    # real entries are never stored under a `nil` tenant, so relying on the
+    # bare default would silently kick nothing.
     outbox = outbox(host_resource)
-    for entry <- pending(host_resource), do: Enqueue.flush(outbox, entry)
+    for entry <- pending(host_resource, TenantKey.unscoped()), do: Enqueue.flush(outbox, entry)
     :ok
   end
 
@@ -336,9 +339,16 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   def refresh(host_resource, scope, tenant \\ nil) do
     local = LocalOutbox.local_layer(host_resource)
     target = last_target(host_resource)
-    opts = backfill_opts(host_resource, tenant)
+    # H5: `tenant` may be the unscoped SCAN sentinel (boot_hydrate/resume_sync
+    # asking for every tenant partition's dirty-check) — that is never a real
+    # tenant a target layer's Ash calls understand, so target/backfill calls
+    # translate it back to Ash's own "no tenant" (nil); the dirty-check calls
+    # below keep the raw `tenant` so they can genuinely scan every partition.
+    real_tenant = TenantKey.real(tenant)
+    opts = backfill_opts(host_resource, real_tenant)
 
-    with {:ok, {remote_rows, do_delete?}} <- remote_scope(host_resource, target, scope, tenant) do
+    with {:ok, {remote_rows, do_delete?}} <-
+           remote_scope(host_resource, target, scope, real_tenant) do
       {refreshed, skipped} =
         Enum.reduce(remote_rows, {0, []}, fn row, {n, skipped} ->
           pk = Snapshot.record_pk(host_resource, row)
@@ -355,14 +365,14 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
         cond do
           # `:all` scope is authoritative over the whole set — reconcile removals.
           do_delete? ->
-            reconcile_deletes(host_resource, local, remote_rows, tenant, opts)
+            reconcile_deletes(host_resource, local, remote_rows, real_tenant, tenant, opts)
 
           # A single-PK refresh whose remote row is GONE mirrors a peer's destroy:
           # remove it locally (unless the PK is dirty — our own unflushed write wins).
           # Without this, an inbound destroy notification (handle_external_change →
           # refresh(pk)) left the deleted row lingering on other online clients.
           is_map(scope) and remote_rows == [] and not dirty?(host_resource, scope, tenant) ->
-            delete_local_pk(host_resource, local, scope, tenant, opts)
+            delete_local_pk(host_resource, local, scope, real_tenant, opts)
 
           true ->
             0
@@ -374,6 +384,8 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
 
   # Destroy a single locally-held row by primary key (a peer's destroy arrived via
   # a per-record notification, so there is no remote row to compare against).
+  # `tenant` here is always the REAL target-layer value (translated by the
+  # caller) — never the unscoped scan sentinel.
   defp delete_local_pk(host_resource, local, pk, tenant, opts) do
     case Target.read_pk(host_resource, hd(read_order(host_resource)), pk, tenant: tenant) do
       {:ok, nil} ->
@@ -433,9 +445,14 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   end
 
   defp boot_hydrate(resource) do
+    # H5: pass the unscoped scan sentinel explicitly — a multitenant host's
+    # pending entries are stored under their real tenant, never `nil`, so
+    # relying on `refresh`/`hydrate`'s bare `nil` default here would miss
+    # them (`outbox_nonempty?`/`dirty?` would only ever see literal-null
+    # rows) and boot hydration would bypass the dirty-chain rule.
     case LocalOutbox.hydrate_mode(resource) do
-      :on_start -> refresh(resource, :all)
-      :if_empty -> hydrate(resource)
+      :on_start -> refresh(resource, :all, TenantKey.unscoped())
+      :if_empty -> hydrate(resource, TenantKey.unscoped())
       _ -> :ok
     end
 
@@ -474,16 +491,19 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
     end
   end
 
-  defp reconcile_deletes(host_resource, local, remote_rows, tenant, opts) do
+  # `real_tenant` (never the scan sentinel) drives the target-layer read;
+  # `scan_tenant` (may be the sentinel) drives the dirty-chain check — the
+  # same dual-use split as `refresh/3`.
+  defp reconcile_deletes(host_resource, local, remote_rows, real_tenant, scan_tenant, opts) do
     remote_pks = MapSet.new(remote_rows, &Snapshot.record_pk(host_resource, &1))
 
     {:ok, local_rows} =
-      Target.read_all(host_resource, hd(read_order(host_resource)), tenant: tenant)
+      Target.read_all(host_resource, hd(read_order(host_resource)), tenant: real_tenant)
 
     local_rows
     |> Enum.reject(fn row ->
       pk = Snapshot.record_pk(host_resource, row)
-      MapSet.member?(remote_pks, pk) or dirty?(host_resource, pk, tenant)
+      MapSet.member?(remote_pks, pk) or dirty?(host_resource, pk, scan_tenant)
     end)
     |> Enum.reduce(0, fn row, n ->
       :ok = Backfill.destroy_record(local, host_resource, row, opts) |> normalize_backfill()
@@ -558,12 +578,32 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
 
   defp base_query(query, host_resource, tenant) do
     key = Atom.to_string(host_resource)
-    q = Ash.Query.filter(query, resource == ^key)
-    tenant_filter(q, tenant)
+
+    query
+    |> Ash.Query.filter(resource == ^key)
+    |> tenant_filter(scope(host_resource, tenant))
   end
 
-  defp tenant_filter(query, nil), do: Ash.Query.filter(query, is_nil(tenant))
-  defp tenant_filter(query, tenant), do: Ash.Query.filter(query, tenant == ^to_string(tenant))
+  # H5: entries are always stored under B3's canonical partition string —
+  # write.ex canonicalizes every enqueue, including a tenant-less write
+  # (which becomes the unscoped sentinel, never a literal `nil` column
+  # value). So a `nil`/unscoped scope argument here means the same thing:
+  # "every partition" — `tenant_filter/2` omits the predicate for both.
+  # Anything else is canonicalized via B3's shared function — never a local
+  # to_string/inspect.
+  defp scope(resource, tenant) do
+    if TenantKey.unscoped?(tenant),
+      do: TenantKey.unscoped(),
+      else: TenantKey.canonical(resource, tenant)
+  end
+
+  defp tenant_filter(query, tenant) do
+    if TenantKey.unscoped?(tenant) do
+      query
+    else
+      Ash.Query.filter(query, tenant == ^tenant)
+    end
+  end
 
   defp read(query), do: Ash.read!(query, authorize?: false)
 

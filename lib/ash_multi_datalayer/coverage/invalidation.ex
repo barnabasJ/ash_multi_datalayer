@@ -25,6 +25,7 @@ defmodule AshMultiDatalayer.Coverage.Invalidation do
   alias AshMultiDatalayer.Coverage
   alias AshMultiDatalayer.Coverage.Entry
   alias AshMultiDatalayer.DataLayer.Info
+  alias AshMultiDatalayer.TenantKey
   alias AshMultiDatalayer.Telemetry
 
   @doc """
@@ -68,22 +69,39 @@ defmodule AshMultiDatalayer.Coverage.Invalidation do
   Bumps the invalidation epoch first, **unconditionally, including
   zero-drop writes** — the C3 race this closes is precisely a write against
   a ledger with nothing to drop for Q racing an in-flight miss for Q;
-  skipping the bump when nothing matched would reopen it. Only the
-  partition this write touches is bumped (the tenant, or `:__global__` for
-  a nil tenant) — a cross-partition sweep for `global?` multitenancy is M6,
-  out of scope here.
+  skipping the bump when nothing matched would reopen it.
+
+  `tenant` is canonicalized via `TenantKey.canonical/2` (B3) before it's
+  used as a ledger partition key — callers may pass any tenant
+  representation. For a `global? true` resource (P4), the write also sweeps
+  the complementary partition(s): a tenant-scoped write ALSO touches the
+  unscoped partition (a nil-tenant read may have cached this row across
+  every tenant); a genuinely unscoped write touches every partition
+  currently holding entries (conservative — it may have been cached under
+  any of them). See `sweep_partitions/2`.
 
   Also evicts the physical row from every earlier read layer (C4, fix
-  direction 1) — see `evict_physical_row/3`. This runs **regardless of the
-  kill switch**: it is part of invalidation, and invalidation is already
-  never skippable once the authoritative layer has committed (the kill
-  switch only skips *propagation* — see `WriteDispatch`'s moduledoc).
+  direction 1) — see `evict_physical_row/3`, using the RAW (real,
+  target-layer) tenant, never the partition key. This runs **regardless of
+  the kill switch**: it is part of invalidation, and invalidation is
+  already never skippable once the authoritative layer has committed (the
+  kill switch only skips *propagation* — see `WriteDispatch`'s moduledoc).
   """
   @spec on_write(module(), term(), Ash.Resource.Record.t() | nil, Ash.Resource.Record.t() | nil) ::
           non_neg_integer()
   def on_write(resource, tenant, row_before, row_after) do
-    Coverage.bump_epoch(resource, tenant)
     evict_physical_row(resource, tenant, row_before)
+
+    partition = TenantKey.canonical(resource, tenant)
+
+    [partition | sweep_partitions(resource, partition)]
+    |> Enum.reduce(0, fn p, total ->
+      total + drop_for_partition(resource, p, row_before, row_after)
+    end)
+  end
+
+  defp drop_for_partition(resource, tenant, row_before, row_after) do
+    Coverage.bump_epoch(resource, tenant)
 
     dropped =
       resource
@@ -102,6 +120,23 @@ defmodule AshMultiDatalayer.Coverage.Invalidation do
     end
 
     count
+  end
+
+  # P4: 1:many sweep orchestration (B3's canonical function derives each
+  # individual partition key; this only decides WHICH partitions a
+  # `global? true` write must additionally touch — never re-derives a key).
+  # Not `global?`: no sweep, the write's own partition is the only one a
+  # read could ever have used.
+  defp sweep_partitions(resource, partition) do
+    if Ash.Resource.Info.multitenancy_global?(resource) do
+      if TenantKey.unscoped?(partition) do
+        resource |> Coverage.partitions() |> Enum.reject(&(&1 == partition))
+      else
+        [TenantKey.unscoped()]
+      end
+    else
+      []
+    end
   end
 
   # Removes the row from every earlier read layer, by the BEFORE-image's
@@ -236,10 +271,18 @@ defmodule AshMultiDatalayer.Coverage.Invalidation do
   state, only clearing the partition is provably safe.
 
   Bumps the invalidation epoch first, unconditionally — same reasoning as
-  `on_write/4`.
+  `on_write/4`. `tenant` is canonicalized via `TenantKey.canonical/2` (B3),
+  and the same `global?` sweep as `on_write/4` applies (P4).
   """
   @spec drop_all(module(), term()) :: non_neg_integer()
   def drop_all(resource, tenant) do
+    partition = TenantKey.canonical(resource, tenant)
+
+    [partition | sweep_partitions(resource, partition)]
+    |> Enum.reduce(0, &(&2 + drop_all_for_partition(resource, &1)))
+  end
+
+  defp drop_all_for_partition(resource, tenant) do
     Coverage.bump_epoch(resource, tenant)
 
     entries = Coverage.entries(resource, tenant)
