@@ -1,10 +1,13 @@
 # `ash_multi_datalayer` — Technical Deep-Dive
 
-**Last verified**: 2026-07-03 (v1 implemented; updated to match the shipped
-code) **Scope**: Architecture, runtime behaviour, data model, and key decisions
-for v1 of the library. Does NOT cover: v2 ideas (`:write_behind`, multi-node
-coherence, N>2 layers). **Prerequisites**: Familiarity with Ash 3.x resources,
-the `Ash.DataLayer` behaviour, and Spark DSL extensions.
+**Last verified**: 2026-07-06 (v1 implemented; updated to match the shipped
+code, including the orchestrator extraction) **Scope**: Architecture, runtime
+behaviour, data model, and key decisions for v1 of the library, focused on the
+default `ProvenCoverage` strategy. Does NOT cover: the `LocalOutbox`
+offline-first strategy in depth (see the guide and
+[20260705-local-outbox-orchestrator-rfc](../design/20260705-local-outbox-orchestrator-rfc.md)),
+v2 ideas (multi-node coherence, N>2 layers). **Prerequisites**: Familiarity with
+Ash 3.x resources, the `Ash.DataLayer` behaviour, and Spark DSL extensions.
 
 ## TL;DR
 
@@ -19,6 +22,14 @@ without fall-through. Writes are synchronous across layers; each write
 preserving unrelated cached coverage. The library ships with a runtime
 kill-switch, a ledger size cap + LRU eviction, a divergence sampler, and rich
 telemetry.
+
+Since the orchestrator extraction (2026-07-05), `AshMultiDatalayer.DataLayer` is
+a thin callback shell: the data path is delegated to a per-resource
+**orchestrator strategy** (`AshMultiDatalayer.Orchestrator` behaviour). The
+default strategy, `Orchestrator.ProvenCoverage`, implements everything this
+document describes; the alternative `Orchestrator.LocalOutbox` strategy
+(offline-first local writes flushed through an Oban-backed outbox) is covered by
+the guide and its RFC.
 
 ## Table of Contents
 
@@ -204,8 +215,9 @@ flowchart TD
     end
 
     subgraph Core["Core routing"]
-      DL["DataLayer (callbacks)"]
-      Writes["Writes (write_order dispatch)"]
+      DL["DataLayer (thin callback shell)"]
+      Orch["Orchestrator strategy: ProvenCoverage (default) | LocalOutbox"]
+      Writes["WriteDispatch (write_order dispatch)"]
     end
 
     subgraph Cov["Coverage"]
@@ -222,21 +234,25 @@ flowchart TD
     end
 
     subgraph Compile["Compile-time"]
-      V1["ValidateLayers (incl. extension-presence check)"]
-      V2["ValidateMultitenancy"]
-      V3["RejectFieldPolicies"]
-      V4["RejectMultiNode"]
-      V5["ValidateSolverSupportedPredicates"]
+      V1["ValidateOrchestrator"]
+      V2["ValidateLayers (incl. extension-presence check)"]
+      V3["ValidateMultitenancy"]
+      V4["ValidateAggregateOverrides"]
+      V5["RejectFieldPolicies"]
+      V6["RejectMultiNode"]
+      V7["ValidateSolverSupportedPredicates"]
     end
 
     Sup["Supervisor"]
   end
 
-  DSL --> V1 --> V2 --> V3 --> V4 --> V5
-  DL --> KS
-  DL --> Ledger
-  DL --> Tel
-  DL --> Samp
+  DSL --> V1 --> V2 --> V3 --> V4 --> V5 --> V6 --> V7
+  DL --> Orch
+  Orch --> KS
+  Orch --> Ledger
+  Orch --> Tel
+  Orch --> Samp
+  Orch --> Writes
   Writes --> Inv
   Writes --> Ledger
   Writes --> Tel
@@ -370,15 +386,23 @@ at-least-once duplication risk; cross-node coherence broken. **ADR**:
 ## Known Limitations and Technical Debt
 
 - **No multi-node coherence.** Single-node v1 by design.
-- **No `:write_behind`.** Users wire asynchronous primary writes in their
-  actions if they need them.
+- **No `:write_behind` write_order entry.** Asynchronous replication is instead
+  an orchestrator concern: the `LocalOutbox` strategy commits locally and
+  flushes to targets through a durable Oban-backed outbox (superseding the
+  original "no async writes at all" ADR — see
+  [20260705-local-outbox-orchestrator-rfc](../design/20260705-local-outbox-orchestrator-rfc.md)).
 - **No `field_policies` + fall-through.** Hard-rejected at compile time.
 - **No TTL beyond LRU.** `loaded_at` is recorded but not used for time-based
   eviction.
-- **No aggregate/calculation subsumption.** Reads that include aggregates the
-  solver can't reason about fall through unconditionally.
-- **No per-action strategy override.** `read_order` / `write_order` are
-  resource-level.
+- **Aggregate/calculation support has bounds.** Relationship aggregates are
+  supported (folded from cached related rows or SQL-joined on the source — since
+  2026-07-04, see Edge Cases), and calculations are handled via computed-value
+  merge / local evaluation; but reads with aggregates or calcs the solver/fold
+  can't reason about still fall through unconditionally.
+- **Per-action routing is an escape hatch, not a strategy override.**
+  `read_order` / `write_order` are resource-level; `read_from:` context forces a
+  read to a named layer and `write_through: true` forces a synchronous write,
+  but a resource has exactly one orchestrator strategy.
 - **No cache stampede prevention.** Concurrent cold-reads for the same filter
   all hit the primary; documented v2 work.
 - **Only 2-layer configurations exercised in CI.** N>2 works in theory.
@@ -408,7 +432,7 @@ replacement: resources declare underlying-layer extensions explicitly via
 `ValidateLayers` verifier errors helpfully when one is missing. Verifiers run as
 usual.
 
-**Verified by**: `test/ash_multi_datalayer/data_layer_test.exs` (smoke),
+**Verified by**: `test/ash_multi_datalayer/data_layer_dsl_test.exs` (smoke),
 `test/integration/generate_migrations_test.exs` (the architect's blocking
 concern).
 
@@ -550,15 +574,15 @@ live. Two mechanisms uphold "covered region ⇒ physical rows are fresh":
   swallowed (logged + telemetried;
   `[:ash_multi_datalayer, :ledger, :evict_failed]`) — never fails the write.
 
-  Between this eviction and `WriteDispatch.propagate/5`'s re-upsert of the
-  fresh record, a reader can observe the row **physically absent** from an
-  earlier layer, even though it existed before the update and exists again
-  immediately after — an absence **anomaly** (a state that never logically
-  existed), not staleness (a state that WAS true once). The epoch/ledger
-  protocol above guards against serving a stale value; it does not close this
-  narrower, self-healing window. Accepted by decision (M-7, doc-only): revisit
-  upsert-in-place for updates (evict only on destroy/PK-change) only if this
-  shows up in practice.
+  Between this eviction and `WriteDispatch.propagate/5`'s re-upsert of the fresh
+  record, a reader can observe the row **physically absent** from an earlier
+  layer, even though it existed before the update and exists again immediately
+  after — an absence **anomaly** (a state that never logically existed), not
+  staleness (a state that WAS true once). The epoch/ledger protocol above guards
+  against serving a stale value; it does not close this narrower, self-healing
+  window. Accepted by decision (M-7, doc-only): revisit upsert-in-place for
+  updates (evict only on destroy/PK-change) only if this shows up in practice.
+
 - **Reconcile-on-record** (defense in depth, inside `maybe_backfill`, between
   the physical backfill and `Coverage.record`'s insert): deletes cached rows
   matching the just-recorded region whose primary key is **not** in the
@@ -573,18 +597,17 @@ live. Two mechanisms uphold "covered region ⇒ physical rows are fresh":
 
   The eviction itself joins the epoch protocol (M-3): a reader's reconcile pass
   can find a "ghost" (cached, absent from this reader's own — possibly stale —
-  fetch) that another, faster reader legitimately fetched and recorded
-  coverage over moments earlier. Evicting it via a bare destroy, with no
-  epoch/ledger awareness, would leave that other reader's coverage entry
-  pointing at a now-missing row — a lasting, silent missing-row cache hit.
+  fetch) that another, faster reader legitimately fetched and recorded coverage
+  over moments earlier. Evicting it via a bare destroy, with no epoch/ledger
+  awareness, would leave that other reader's coverage entry pointing at a
+  now-missing row — a lasting, silent missing-row cache hit.
   `Invalidation.on_evict/3` closes this the same way `on_write/4` closes the
-  write-side race: one batched call per reconcile pass bumps the epoch and
-  drops every ledger entry covering any evicted ghost (`should_drop?` as a
+  write-side race: one batched call per reconcile pass bumps the epoch and drops
+  every ledger entry covering any evicted ghost (`should_drop?` as a
   destroy-style check, `row_after: nil`), so a reader racing the eviction sees
   the bumped epoch and aborts its own `Coverage.record/5` — including,
   intentionally, the reconcile-initiating reader's own record call. The next
-  identical read is then a clean miss that refetches and records fresh
-  coverage.
+  identical read is then a clean miss that refetches and records fresh coverage.
 
 For consumers that discover staleness out-of-band (a lost realtime notification,
 typically surfaced as a `NotFound` from a direct call),

@@ -1,6 +1,17 @@
 # 20260417-No-Write-Behind-In-V1-ADR
 
-**Status**: Accepted **Date**: 2026-04-17 **Deciders**: Barnabas Jovanovics
+**Status**: Accepted (Implementation Details superseded — see Addendum)
+**Date**: 2026-04-17 **Deciders**: Barnabas Jovanovics
+
+> **Addendum (2026-07-06)**: The "separate RFC" this decision anticipated has
+> since landed — asynchronous replication shipped as the `LocalOutbox`
+> orchestrator strategy
+> ([20260705-local-outbox-orchestrator-rfc](./20260705-local-outbox-orchestrator-rfc.md)),
+> designed against the constraints pinned below. The Implementation Details
+> section is therefore historical: `mix.exs` now carries optional
+> `oban`/`ash_oban` dependencies and the outbox flush runs in Oban workers. The
+> core decision stands — there is still no `:write_behind` write_order strategy;
+> asynchrony lives in the orchestrator seam.
 
 ## Decision Drivers
 
@@ -46,7 +57,7 @@ propagation invariant (PRD FR3.5/FR3.6): **layers earlier in `read_order` than
 the layer that took the authoritative write are updated synchronously, in the
 same operation, with the record that layer returned** — otherwise the very next
 read is a guaranteed stale hit. Asynchrony is only discussable for layers
-*later* in `read_order`, and even there the RFC must address two problems the
+_later_ in `read_order`, and even there the RFC must address two problems the
 invariant does not cover: a read that coverage-misses falls through to a
 not-yet-flushed layer and reads stale from below, and a crash before the flush
 loses the write (durability). These are the reasons write-behind was cut, not
@@ -77,9 +88,9 @@ incidental details.
 - Document the escape hatch: "wrap your `AshPostgres.DataLayer`-writing action
   in an Oban job yourself" with a complete example.
 - Keep the internal `write_order` abstraction generic so a future
-  `:write_behind` layer slot is additive, not a rewrite. The "Constraints on
-  the future `:write_behind` RFC" section above pins the correctness bar that
-  slot must meet.
+  `:write_behind` layer slot is additive, not a rewrite. The "Constraints on the
+  future `:write_behind` RFC" section above pins the correctness bar that slot
+  must meet.
 
 ## Alternatives Considered
 
@@ -120,4 +131,4 @@ incidental details.
 
 ---
 
-**Last Updated**: 2026-07-03
+**Last Updated**: 2026-07-06

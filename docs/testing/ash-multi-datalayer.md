@@ -1,6 +1,14 @@
 # `ash_multi_datalayer` — Test Strategy
 
-**Status**: Draft **Created**: 2026-04-17 **Last Updated**: 2026-07-03
+**Status**: Implemented (originally the pre-implementation plan) **Created**:
+2026-04-17 **Last Updated**: 2026-07-06
+
+> **Status note (2026-07-06)**: the suite this strategy planned is implemented;
+> file paths below were updated to the shipped layout (several tests landed in
+> different files than planned — e.g. all verifier tests in one
+> `verifiers_test.exs`). Checkbox lists are the original planning checklists,
+> kept as a scenario inventory, not a live coverage report. Known gaps vs. the
+> plan are marked **GAP** inline.
 
 ## Overview
 
@@ -17,12 +25,12 @@ most bugs live at the seams.
 
 ## Testing Model
 
-| Layer       | Definition (this project)                                                 | Scope                                                                                                       | Status  |
-| ----------- | ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- | ------- |
-| Unit        | In-process pure-function or GenServer-isolated tests; no DB.              | `Coverage.Implication`, `Coverage.Invalidation`, `Info`, verifiers, kill-switch, telemetry fingerprints     | Planned |
-| Integration | Real Postgres (via `ash_postgres` TestRepo), real ETS, compiled resources | `run_query/2`, write dispatch, `mix ash_multi_datalayer.generate_migrations`, ledger + cache + primary interaction | Planned |
-| Property    | StreamData-generated cases, cross-checked against a reference evaluator   | Solver implication; row-aware invalidation                                                                  | Planned |
-| Manual      | `iex -S mix` smoke in the author's own host project                       | Pre-release dogfood                                                                                         | Planned |
+| Layer       | Definition (this project)                                                 | Scope                                                                                                              | Status  |
+| ----------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ | ------- |
+| Unit        | In-process pure-function or GenServer-isolated tests; no DB.              | `Coverage.Implication`, `Coverage.Invalidation`, `Info`, verifiers, kill-switch, telemetry fingerprints            | Implemented |
+| Integration | Real Postgres (via `ash_postgres` TestRepo), real ETS, compiled resources | `run_query/2`, write dispatch, `mix ash_multi_datalayer.generate_migrations`, ledger + cache + primary interaction | Implemented |
+| Property    | StreamData-generated cases, cross-checked against a reference evaluator   | Solver implication; row-aware invalidation                                                                         | Implemented |
+| Manual      | `iex -S mix` smoke in the author's own host project                       | Pre-release dogfood                                                                                                | Ongoing     |
 
 **Model rationale**: the library's headline correctness invariant ("solver bugs
 never return stale rows") is only verifiable at the property-test layer; the
@@ -32,35 +40,35 @@ surface beyond Ash itself.
 
 ## Risk-Based Coverage
 
-| Component / Area                                     | Likelihood of Defect | Business Impact      | Test Layers                   | Notes                                                    |
-| ---------------------------------------------------- | -------------------- | -------------------- | ----------------------------- | -------------------------------------------------------- |
-| `Coverage.Implication` (solver)                      | High                 | High (stale reads)   | Unit + Property + Integration | Highest-priority area. Property suite is mandatory.      |
-| `Coverage.Invalidation` (row-matcher)                | High                 | High (stale reads)   | Unit + Property + Integration | Same rigor as the solver; inverse problem.               |
+| Component / Area                                                   | Likelihood of Defect | Business Impact      | Test Layers                   | Notes                                                    |
+| ------------------------------------------------------------------ | -------------------- | -------------------- | ----------------------------- | -------------------------------------------------------- |
+| `Coverage.Implication` (solver)                                    | High                 | High (stale reads)   | Unit + Property + Integration | Highest-priority area. Property suite is mandatory.      |
+| `Coverage.Invalidation` (row-matcher)                              | High                 | High (stale reads)   | Unit + Property + Integration | Same rigor as the solver; inverse problem.               |
 | `AshMultiDatalayer.Migration` shadow modules + migration generator | High                 | High (compile break) | Integration                   | Architect's blocking concern; one dedicated test.        |
-| Verifiers (5 of them)                                | Medium               | Medium (UX)          | Unit                          | Each needs both an accept case and a reject case.        |
-| Kill-switch                                          | Low                  | Medium (ops)         | Unit + Integration            | Small surface; integration confirms runtime bypass path. |
-| Telemetry event shape                                | Low                  | Medium (ops)         | Unit                          | Each event captured in a test; schema verified.          |
-| Ledger cap + LRU                                     | Medium               | Medium (mem)         | Integration                   | Benchmark-gated default; test asserts eviction order.    |
-| Divergence sampler                                   | Low                  | High (observability) | Integration                   | Seed divergent state; assert telemetry fires.            |
-| DSL / Info introspection                             | Low                  | Low                  | Unit                          | Thin wrapper over Spark; small.                          |
+| Verifiers (7 of them)                                              | Medium               | Medium (UX)          | Unit                          | Each needs both an accept case and a reject case.        |
+| Kill-switch                                                        | Low                  | Medium (ops)         | Unit + Integration            | Small surface; integration confirms runtime bypass path. |
+| Telemetry event shape                                              | Low                  | Medium (ops)         | Unit                          | Each event captured in a test; schema verified.          |
+| Ledger cap + LRU                                                   | Medium               | Medium (mem)         | Integration                   | Benchmark-gated default; test asserts eviction order.    |
+| Divergence sampler                                                 | Low                  | High (observability) | Integration                   | Seed divergent state; assert telemetry fires.            |
+| DSL / Info introspection                                           | Low                  | Low                  | Unit                          | Thin wrapper over Spark; small.                          |
 
 ## Acceptance Criteria Mapping
 
 | PRD Acceptance Criterion                                                                     | Test Type   | Test Location                                                          | Status  |
 | -------------------------------------------------------------------------------------------- | ----------- | ---------------------------------------------------------------------- | ------- |
-| Switching `data_layer:` + adding the DSL block compiles with no other changes                | Integration | `test/integration/drop_in_replacement_test.exs`                        | Planned |
-| `mix ash_multi_datalayer.generate_migrations` works on a multi-datalayer resource            | Integration | `test/integration/generate_migrations_test.exs`                        | Planned |
-| Subsumption recognises `name == "foo"` implies `name == "foo" and age > 18`                  | Integration | `test/integration/subsumption_test.exs`                                | Planned |
-| Solver cross-check against brute-force evaluator — 10 k cases, zero counterexamples          | Property    | `test/ash_multi_datalayer/coverage/implication_property_test.exs`      | Planned |
-| Row-aware invalidation keeps unrelated ledger entries on writes                              | Integration | `test/integration/row_aware_invalidation_test.exs`                     | Planned |
-| Row-aware invalidation cross-check against `Ash.Filter.Runtime.do_match/2`                   | Property    | `test/ash_multi_datalayer/coverage/invalidation_property_test.exs`     | Planned |
-| Capability matrix: `can?(:transact)` correct across `(read_order, write_order)` combinations | Unit        | `test/ash_multi_datalayer/capabilities_test.exs`                       | Planned |
-| Divergence sampler fires `:divergence_detected` telemetry on seeded mismatch                 | Integration | `test/integration/divergence_sampler_test.exs`                         | Planned |
-| Runtime kill-switch bypasses cache layer without recompile                                   | Integration | `test/integration/kill_switch_test.exs`                                | Planned |
-| Ledger cap evicts oldest entry on overflow                                                   | Integration | `test/integration/ledger_cap_test.exs`                                 | Planned |
-| Verifier rejects `field_policies` + multi-layer `read_order`                                 | Unit        | `test/ash_multi_datalayer/verifiers/reject_field_policies_test.exs`    | Planned |
-| Verifier warns on missing single-node ack                                                    | Unit        | `test/ash_multi_datalayer/verifiers/reject_multi_node_test.exs`        | Planned |
-| Tenant isolation: cross-tenant filter pairs never claim coverage                             | Property    | `test/ash_multi_datalayer/coverage/tenant_isolation_property_test.exs` | Planned |
+| Switching `data_layer:` + adding the DSL block compiles with no other changes                | Integration | `test/integration/drop_in_replacement_test.exs`                        | Implemented |
+| `mix ash_multi_datalayer.generate_migrations` works on a multi-datalayer resource            | Integration | `test/integration/generate_migrations_test.exs`                        | Implemented |
+| Subsumption recognises `name == "foo"` implies `name == "foo" and age > 18`                  | Integration | `test/integration/subsumption_test.exs`                                | Implemented |
+| Solver cross-check against brute-force evaluator — 10 k cases, zero counterexamples          | Property    | `test/ash_multi_datalayer/coverage/implication_property_test.exs`      | Implemented |
+| Row-aware invalidation keeps unrelated ledger entries on writes                              | Integration | `test/integration/row_aware_invalidation_test.exs`                     | Implemented |
+| Row-aware invalidation cross-check against `Ash.Filter.Runtime.do_match` (5-arg form, `unknown_on_unknown_refs?: true`)                   | Property    | `test/ash_multi_datalayer/coverage/invalidation_property_test.exs`     | Implemented |
+| Capability matrix: `can?(:transact)` correct across `(read_order, write_order)` combinations | Unit        | `test/ash_multi_datalayer/capabilities_test.exs`                       | Implemented |
+| Divergence sampler fires `:divergence_detected` telemetry on seeded mismatch                 | Integration | `test/integration/divergence_sampler_test.exs`                         | Implemented |
+| Runtime kill-switch bypasses cache layer without recompile                                   | Integration | `test/ash_multi_datalayer/kill_switch_test.exs`                                | Implemented |
+| Ledger cap evicts oldest entry on overflow                                                   | Integration | `test/integration/ledger_cap_test.exs`                                 | Implemented |
+| Verifier rejects `field_policies` + multi-layer `read_order`                                 | Unit        | `test/ash_multi_datalayer/verifiers_test.exs`    | Implemented |
+| Verifier warns on missing single-node ack                                                    | Unit        | `test/ash_multi_datalayer/verifiers_test.exs`        | Implemented |
+| Tenant isolation: cross-tenant filter pairs never claim coverage                             | Property    | cross-tenant cases in `test/ash_multi_datalayer/coverage/invalidation_test.exs` | **GAP** (no dedicated property) |
 
 ## Unit Tests
 
@@ -101,7 +109,7 @@ end
 
 #### Test Cases
 
-- [ ] `on_write/5` drops entries whose filter matches `row_after` (create).
+- [ ] `on_write/4` drops entries whose filter matches `row_after` (create).
 - [ ] Drops entries whose filter matches `row_before` (destroy).
 - [ ] Drops entries whose filter matches either side (update).
 - [ ] Keeps entries whose filter matches neither.
@@ -110,18 +118,18 @@ end
 
 ### Verifiers
 
-**Files**: `test/ash_multi_datalayer/verifiers/*_test.exs`
+**Files**: `test/ash_multi_datalayer/verifiers_test.exs` (all verifiers in one file)
 
 Each verifier needs:
 
 - [ ] Happy-path resource compiles.
 - [ ] Failing-path assertion on the expected error text. **Not** via
-      `assert_raise`: in spark 2.7 the whole verifier pass is wrapped in a
-      catch that converts `DslError`s to compiler warnings/diagnostics (which
-      fail builds under `--warnings-as-errors`) — verifier failures do not
-      hard-raise at runtime. Instead, tests call the verifier directly on the
-      resource's `spark_dsl_config` and use Spark's test collector to capture
-      the diagnostics.
+      `assert_raise`: in spark 2.7 the whole verifier pass is wrapped in a catch
+      that converts `DslError`s to compiler warnings/diagnostics (which fail
+      builds under `--warnings-as-errors`) — verifier failures do not hard-raise
+      at runtime. Instead, tests call the verifier directly on the resource's
+      `spark_dsl_config` and use Spark's test collector to capture the
+      diagnostics.
 
 ### Kill-switch
 
@@ -133,7 +141,7 @@ Each verifier needs:
 
 ### Telemetry fingerprints
 
-**File**: `test/ash_multi_datalayer/telemetry/fingerprint_test.exs`
+**File**: **GAP** — no dedicated fingerprint test file; fingerprints appear only incidentally in `test/ash_multi_datalayer/coverage_test.exs`
 
 - [ ] Structurally identical filters produce identical fingerprints.
 - [ ] Filters differing only in literal values produce identical fingerprints.
@@ -208,7 +216,7 @@ planned.
 
 ### Kill-switch
 
-**File**: `test/integration/kill_switch_test.exs`
+**File**: `test/ash_multi_datalayer/kill_switch_test.exs`
 
 - [ ] Default: cache hits.
 - [ ] After `AshMultiDatalayer.disable!/1`: all reads route to `:l2`.
@@ -240,7 +248,7 @@ planned.
 
 ### Tenant isolation
 
-**File**: `test/integration/tenant_isolation_test.exs`
+**File**: **GAP** — no dedicated integration file; cross-tenant ledger isolation is covered at unit level in `test/ash_multi_datalayer/coverage/invalidation_test.exs`, tenantless partitioning in `test/integration/subsumption_test.exs`
 
 - [ ] Tenant A loads `name == "foo"` (caches in tenant A's ledger).
 - [ ] Tenant B loads `name == "foo"` — cache miss (no cross-tenant coverage);
@@ -292,7 +300,7 @@ end
 - **Input**: resource without `multitenancy`, read with no tenant.
 - **Expected behavior**: `:__global__` sentinel; reads work normally; no
   cross-tenant risk because there's only one tenant.
-- **Test**: `test/integration/nil_tenant_test.exs`.
+- **Test**: `test/integration/subsumption_test.exs` ("tenantless reads use the global partition consistently").
 - **Risk**: the sentinel must be distinct from any value that could appear as a
   real tenant atom.
 
@@ -309,20 +317,22 @@ end
 - **Input**: reads in flight when `disable!/1` is called.
 - **Expected behavior**: no crash; in-flight reads may use either path;
   subsequent reads use the disabled path.
-- **Test**: `test/concurrent/kill_switch_concurrent_test.exs` with many
-  processes.
+- **Test**: **GAP** — no dedicated concurrent kill-switch test; flip behavior is covered non-concurrently in `test/ash_multi_datalayer/kill_switch_test.exs`.
 
 ### Ledger insertion race
 
 - **Input**: two concurrent misses for the same filter.
 - **Expected behavior**: at most two ledger entries (we don't coordinate);
   subsequent reads recognise coverage regardless.
-- **Test**: `test/concurrent/ledger_insertion_race_test.exs`.
+- **Test**: `test/integration/concurrency_stress_test.exs` (quiescence under concurrent reads/writes) and `test/integration/read_write_race_test.exs`.
 
 ## What We're NOT Testing (and why)
 
 - **Multi-node clustering**: out of scope for v1 per single-node ADR.
-- **Oban write-behind paths**: removed in v1.
+- **`:write_behind` as a write_order strategy**: never built; asynchronous
+  replication ships as the LocalOutbox orchestrator instead, tested in
+  `test/integration/local_outbox_test.exs`, `local_outbox_resolution_test.exs`,
+  and `oban_sqlite_skeleton_test.exs`.
 - **N>2 layer configurations**: generalises in code but not exercised in CI; v1
   only tests 2-layer.
 - **Performance of `Ash.DataLayer.Ets` itself**: upstream library, not ours.
@@ -374,8 +384,8 @@ end
 | Fixture                  | Purpose                          | Created By                      | Cleanup                             |
 | ------------------------ | -------------------------------- | ------------------------------- | ----------------------------------- |
 | `TestRepo`               | Postgres backing primary layer   | `test/support/test_repo.ex`     | Ecto sandbox; truncate on each test |
-| `TestResource`           | Canonical two-layer resource     | `test/support/test_resource.ex` | N/A (module)                        |
-| `TestResource.Migration` | Schema creation                  | `test/support/migration.ex`     | `mix ecto.drop` between suites      |
+| `TestResource`           | Canonical two-layer resource     | `test/support/resources.ex` | N/A (module)                        |
+| `TestResource.Migration` | Schema creation                  | `test/support/migration_resources.ex`     | `mix ecto.drop` between suites      |
 | `StreamData` generators  | Random filter, row, value combos | `test/support/generators.ex`    | N/A                                 |
 
 ## Running Tests
@@ -393,10 +403,10 @@ mix test --only property
 # Integration only:
 mix test --only integration
 
-# With coverage (diff coverage preferred for PRs):
-mix coveralls.html
+# With coverage:
+mix test --cover
 ```
 
 ---
 
-**Last Updated**: 2026-07-03
+**Last Updated**: 2026-07-06

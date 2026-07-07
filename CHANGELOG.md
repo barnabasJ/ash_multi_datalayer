@@ -22,8 +22,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   ledger entry logically implies their filter (per-attribute interval
   representation).
 - **Row-aware ledger invalidation.** Writes drop only ledger entries whose
-  filter matches the changed row (via `Ash.Filter.Runtime.do_match/2`);
-  unrelated entries preserved.
+  filter matches the changed row (via `Ash.Filter.Runtime.do_match` with
+  `unknown_on_unknown_refs?: true`, so unknowns drop conservatively); unrelated
+  entries preserved.
 - **Synchronous write dispatch** via `write_order`; fail-fast on the first
   layer, best-effort on subsequent.
 - **Strategy-aware capability negotiation** (`can?/2` intersects the layers
@@ -47,6 +48,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
     `read_order`/`write_order` names are declared.
   - `ValidateMultitenancy` — all declared layers agree on multi- tenancy
     strategy.
+  - `ValidateAggregateOverrides` — rejects `sql_join_aggregate_overrides`
+    entries that don't name an aggregate on the resource.
   - `RejectFieldPolicies` — rejects resources combining `field_policies` with
     multi-layer `read_order`.
   - `RejectMultiNode` — warns unless the host app sets
@@ -104,47 +107,46 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-Whole-repo review findings (2026-07-06), all `LocalOutbox`/coverage
-correctness or hygiene issues found before any release:
+Whole-repo review findings (2026-07-06), all `LocalOutbox`/coverage correctness
+or hygiene issues found before any release:
 
 - `LocalOutbox.rebase/2` no longer destroys the outbox entries its own
-  resolution write just created — it now captures the parked chain's entry
-  IDs before applying the changeset and destroys exactly those, inside one
-  outbox-repo transaction. A cleanup failure after a successful apply leaves
-  the resolution durably applied locally (its fresh entries held `:blocked`
-  behind the still-parked head) and returns a structured
-  `RebaseCleanupError` naming the head to resolve, instead of silently losing
-  replication.
-- `write_through: true` writes now match their documented invariant —
-  every replica target is written **first**; the local layer commits only
-  once every target has durably accepted the write. A replica failure fails
-  the action with the local layer untouched (it previously committed the
-  local write first, so a replica failure left an un-replicable local write
-  with no outbox entry to repair it).
+  resolution write just created — it now captures the parked chain's entry IDs
+  before applying the changeset and destroys exactly those, inside one
+  outbox-repo transaction. A cleanup failure after a successful apply leaves the
+  resolution durably applied locally (its fresh entries held `:blocked` behind
+  the still-parked head) and returns a structured `RebaseCleanupError` naming
+  the head to resolve, instead of silently losing replication.
+- `write_through: true` writes now match their documented invariant — every
+  replica target is written **first**; the local layer commits only once every
+  target has durably accepted the write. A replica failure fails the action with
+  the local layer untouched (it previously committed the local write first, so a
+  replica failure left an un-replicable local write with no outbox entry to
+  repair it).
 - `LocalOutbox.Flush.classify/1` gained a third class: `%Ash.Error.Forbidden{}`
-  / `class: :forbidden` parks immediately as `:auth` (no retry-budget burn —
-  a token does not un-expire by retrying), instead of falling through to the
+  / `class: :forbidden` parks immediately as `:auth` (no retry-budget burn — a
+  token does not un-expire by retrying), instead of falling through to the
   `:transient` catch-all and masking an expired credential as flakiness. The
   outbox `error_class` constraint now accepts `:auth` (library upgrade +
   recompile only — no `gen.outbox` re-run, no migration). `drain_chain_inline`
   conflicts now surface as a typed `LocalOutbox.ConflictError`, not a bare
   `{:conflict, remote}` tuple.
-- Reconcile's ghost eviction now participates in the invalidation epoch
-  protocol (`Invalidation.on_evict/3`, batched per reconcile pass): a
-  concurrent reader's coverage entry over a row reconcile is about to evict is
-  now correctly dropped in the same batch, closing a race that could leave a
-  lasting, silent missing-row cache hit.
+- Reconcile's ghost eviction now participates in the invalidation epoch protocol
+  (`Invalidation.on_evict/3`, batched per reconcile pass): a concurrent reader's
+  coverage entry over a row reconcile is about to evict is now correctly dropped
+  in the same batch, closing a race that could leave a lasting, silent
+  missing-row cache hit.
 - A LocalOutbox config with no co-commit repo between the local layer and the
   outbox resource is now rejected at compile time (`validate_opts`) instead of
   silently degrading to an orphaned local write on the first outbox-enqueue
-  failure; a belt-and-suspenders runtime guard also converts a would-be raise
-  in that path to `{:error, _}`.
-- `discard_local/1` now propagates the local-write result: on failure it
-  returns `{:error, _}` and leaves the chain in place, instead of dropping the
-  only record of the disagreement while the local layer still holds the
-  un-discarded value. A failed `hydrate: :on_start`/`:if_empty` boot hydration
-  now logs a warning (mirroring `ExternalChange`'s contract) instead of
-  swallowing the failure silently.
+  failure; a belt-and-suspenders runtime guard also converts a would-be raise in
+  that path to `{:error, _}`.
+- `discard_local/1` now propagates the local-write result: on failure it returns
+  `{:error, _}` and leaves the chain in place, instead of dropping the only
+  record of the disagreement while the local layer still holds the un-discarded
+  value. A failed `hydrate: :on_start`/`:if_empty` boot hydration now logs a
+  warning (mirroring `ExternalChange`'s contract) instead of swallowing the
+  failure silently.
 - `DataLayer.transaction/4`'s no-transaction-callback fallback now catches the
   `{:rollback, term}` throw its own `rollback/2` fallback raises, returning
   `{:error, term}` instead of an uncaught `nocatch` crash.
@@ -153,14 +155,13 @@ correctness or hygiene issues found before any release:
   keeping its "never crash the notifying socket" contract.
 - `LocalOutbox`'s flush worker and resolution verbs resolve a persisted
   `resource` string against a cached known-resource map instead of
-  `String.to_existing_atom/Module.concat` directly — a stale outbox row
-  naming a resource the app no longer defines now parks as `:rejected` (or
-  raises a clear message from the manual verbs) instead of crashing on an
-  unresolvable atom.
+  `String.to_existing_atom/Module.concat` directly — a stale outbox row naming a
+  resource the app no longer defines now parks as `:rejected` (or raises a clear
+  message from the manual verbs) instead of crashing on an unresolvable atom.
 - Documented (doc-only by decision): the narrow window between a write's
-  physical eviction and its re-propagation, where a reader can observe a row
-  as physically absent even though it existed before and exists again
-  immediately after (an absence anomaly, not staleness).
+  physical eviction and its re-propagation, where a reader can observe a row as
+  physically absent even though it existed before and exists again immediately
+  after (an absence anomaly, not staleness).
 
 ### Not in this release (planned for v2+)
 
