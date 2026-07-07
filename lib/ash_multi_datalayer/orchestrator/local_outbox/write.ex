@@ -52,17 +52,87 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
   defp write_through(resource, changeset, op) do
     local = LocalOutbox.local_layer(resource)
     op_atom = op_atom(op)
-    record_pk = Snapshot.record_pk(resource, changeset.data)
+    # L3 (create-PK drain half): `changeset.data` has no PK yet for a create
+    # with a CLIENT-GENERATED primary key — it's only in `changeset.
+    # attributes` at this point (materialize/apply_attributes hasn't run).
+    # Keying the drain on `changeset.data`'s (nil) PK misses a pending
+    # `:destroy` chain for that same re-created PK — the chain never
+    # drains, and the recreated row is later deleted by the stale flush.
+    record_pk = Snapshot.record_pk(resource, drain_pk_source(changeset))
 
     tenant = TenantKey.changeset(resource, changeset, changeset.data)
 
     with :ok <- drain_chain_inline(resource, record_pk, tenant),
          {:ok, record, fields} <- materialize(resource, changeset, op),
-         :ok <- push_all_targets(resource, op_atom, record, fields, tenant),
-         {:ok, local_record} <- local_write(local, resource, changeset, op) do
-      finalize_write_through(op, local_record)
+         :ok <- push_all_targets(resource, op_atom, record, fields, tenant) do
+      case local_write(local, resource, changeset, op) do
+        {:ok, local_record} ->
+          finalize_write_through(op, local_record)
+
+        {:error, _reason} = failure ->
+          # H4/#15: targets already durably hold the new value (the push
+          # above succeeded) — only the local write failed. Scoped to
+          # exactly this branch: a `drain_chain_inline`/`materialize`/
+          # `push_all_targets` failure above never reaches here, so no
+          # divergence record is created when nothing was actually pushed.
+          record_divergence(resource, changeset, op_atom, record_pk, tenant)
+          failure
+      end
     end
   end
+
+  # Never silently return an ordinary failure while a target holds the new
+  # value with no local trace of it (a later refresh would otherwise pull
+  # the target's now-orphan value into local, materializing a "failed"
+  # write). Persists a durable, discoverable record — a PARKED entry per
+  # target with `error_class: :conflict` — reusing the existing resolution
+  # verbs as the recovery path: `discard_local/1` pulls the target's value
+  # into local (closing the divergence); `force/1` re-pushes (a redundant
+  # but harmless upsert); `discard/1` acknowledges without auto-fixing.
+  defp record_divergence(resource, changeset, op_atom, record_pk, tenant) do
+    outbox = LocalOutbox.outbox_resource(resource)
+    domain = Ash.Resource.Info.domain(outbox)
+    write_ref = Ash.UUID.generate()
+    payload = payload(op_atom, resource, changeset.data)
+    base_image = base_image(op_atom, resource, changeset)
+    tenant_key = TenantKey.canonical(resource, tenant)
+
+    for target <- LocalOutbox.targets(resource) do
+      outbox
+      |> Ash.Changeset.for_create(
+        :enqueue,
+        %{
+          write_ref: write_ref,
+          resource: Atom.to_string(resource),
+          tenant: tenant_key,
+          record_pk: record_pk,
+          op: op_atom,
+          payload: payload,
+          base_image: base_image,
+          target: target
+        },
+        domain: domain
+      )
+      |> Ash.create!(authorize?: false)
+      |> Ash.Changeset.for_update(
+        :park,
+        %{error_class: :conflict, remote_snapshot: payload},
+        domain: domain
+      )
+      |> Ash.update!(authorize?: false)
+    end
+
+    :ok
+  end
+
+  # L3: the effective source for the drain's PK — `changeset.data` overlaid
+  # with `changeset.attributes` for a create (a client-generated PK lives
+  # only in `attributes` before `materialize/3`'s `apply_attributes` runs);
+  # `changeset.data` alone for update/destroy, where the PK is unchanged.
+  defp drain_pk_source(%{action_type: :create} = changeset),
+    do: struct(changeset.data, changeset.attributes)
+
+  defp drain_pk_source(changeset), do: changeset.data
 
   defp drain_chain_inline(resource, record_pk, tenant) do
     outbox = LocalOutbox.outbox_resource(resource)

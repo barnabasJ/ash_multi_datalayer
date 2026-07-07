@@ -43,7 +43,23 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
       {:ok, host} ->
         case chain_position(outbox, domain, entry) do
           :head ->
-            apply_result(changeset, outbox, domain, host, entry, push(host, entry))
+            # H4/#14: `entry` is however-stale ash_oban's initial
+            # `worker_read_action :pending` read left it — an in-flight
+            # `write_through`'s inline drain (`Write.drain_chain_inline/3`,
+            # same PK) can push and discard this exact entry in the window
+            # between that read and this push. Re-fetch immediately before
+            # pushing (the smallest achievable window — a push to a target
+            # is inherently non-transactional with the local outbox state,
+            # so this narrows the race rather than eliminating it
+            # mathematically): if the entry is gone, someone already
+            # resolved it — a clean no-op, not a stale re-push.
+            case refetch(outbox, domain, entry) do
+              nil ->
+                changeset
+
+              entry ->
+                apply_result(changeset, outbox, domain, host, entry, push(host, entry))
+            end
 
           :racing ->
             # A pending ancestor is still ahead; try again shortly (zero budget burn).
@@ -66,6 +82,20 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
           nil
         )
     end
+  end
+
+  # A single fresh read of this exact row by its real PK (`seq`) — `nil` if
+  # it no longer exists (already discarded).
+  defp refetch(outbox, domain, entry) do
+    outbox
+    |> Ash.Query.for_read(
+      :for_record,
+      %{resource: entry.resource, record_pk: entry.record_pk, target: entry.target},
+      domain: domain,
+      authorize?: false
+    )
+    |> Ash.Query.filter(seq == ^entry.seq)
+    |> Ash.read_one!(authorize?: false)
   end
 
   # --- chain position ----------------------------------------------------

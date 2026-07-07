@@ -181,7 +181,7 @@ is H5/#19 work and uses the real tenant, not the partition key.
 | H1  | [Bundled remote-calculation fetch runs unauthenticated](h1-remote-calc-fetch-unauthenticated.md)          | ash_remote | OPEN   |
 | H2  | [Non-PK upsert identity ignored + accept-list truncation](h2-non-pk-upsert-identity-accept-truncation.md) | ash_remote | OPEN   |
 | H3  | [`refresh/3` TOCTOU vs co-committed local write](h3-refresh-toctou.md)                                    | MDL        | DONE   |
-| H4  | [`write_through` drain race + post-target-push divergence](h4-write-through-drain-race-divergence.md)     | MDL        | OPEN   |
+| H4  | [`write_through` drain race + post-target-push divergence](h4-write-through-drain-race-divergence.md)     | MDL        | DONE   |
 | H5  | [LocalOutbox tenant model: `nil` = "IS NULL" vs "unscoped"](h5-localoutbox-nil-tenant-model.md)           | MDL        | DONE   |
 | P6  | [Lost-kick recovery semantics (#4): sweeper unproven](p6-lost-kick-recovery.md)                           | MDL        | OPEN   |
 
@@ -211,7 +211,7 @@ is H5/#19 work and uses the real tenant, not the partition key.
 | --- | ---------------------------------------------------------------------------------------------------------------------------------- | ---------- | ------ |
 | L1  | [Composite-PK crash in aggregate fold paths](l1-composite-pk-aggregate-paths.md)                                                   | MDL        | OPEN   |
 | L2  | [Aggregate fold leaves `%Ash.NotLoaded{}` (flaky live test)](l2-aggregate-fold-notloaded.md)                                       | MDL        | OPEN   |
-| L3  | [`write_through` inline drain misses creates; nil tenant on attribute-tenancy creates](l3-write-through-drain-create-pk-tenant.md) | MDL        | IN PROGRESS |
+| L3  | [`write_through` inline drain misses creates; nil tenant on attribute-tenancy creates](l3-write-through-drain-create-pk-tenant.md) | MDL        | DONE   |
 | L4  | [String/CiString range subsumption still byte-ordered](l4-string-range-subsumption-collation.md)                                   | MDL        | OPEN   |
 | L5  | [Sweeper `{:global, ...}` name fails second-node boot; RejectMultiNode config](l5-sweeper-global-name-multinode.md)                | MDL        | OPEN   |
 | L6  | [Codegen LOWs: identifier validation, path traversal, FK fidelity](l6-codegen-lows.md)                                             | ash_remote | OPEN   |

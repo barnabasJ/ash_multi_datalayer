@@ -397,6 +397,46 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxResolutionTest do
     end
   end
 
+  # --- H4 (#15): a local-write failure after a successful write_through push
+  # must leave a discoverable trace, never a silent ordinary failure.
+
+  describe "H4: write_through target-push-succeeds/local-write-fails divergence" do
+    test "records a parked, discoverable entry instead of silently returning an error" do
+      w =
+        FailableLocalWidget
+        |> Ash.Changeset.for_create(:create, %{name: "to-delete"}, domain: Domain)
+        |> Ash.create!()
+
+      drain()
+      assert [%{name: "to-delete"}] = remote(FailableLocalWidget)
+
+      # The target destroy will succeed; the LOCAL destroy fails.
+      FailableLayer.fail(FailableSqlite, :rejected)
+
+      result =
+        w
+        |> Ash.Changeset.for_destroy(:destroy, %{}, domain: Domain)
+        |> Ash.Changeset.set_context(%{multi_datalayer: %{write_through: true}})
+        |> Ash.destroy()
+
+      FailableLayer.clear(FailableSqlite)
+
+      assert {:error, _} = result
+
+      # Unfixed: the target already durably destroyed the row (push
+      # succeeded) but nothing records this — a later refresh would pull
+      # the target's now-absent row's absence into local silently, and
+      # there is no trace an operator could find. Fixed: a discoverable
+      # parked entry records the divergence.
+      assert elem(Target.read_pk(FailableLocalWidget, :remote, %{"id" => w.id}), 1) == nil
+
+      assert [%{state: :parked, error_class: :conflict, op: :destroy}] =
+               OutboxEntry
+               |> Ash.read!(domain: Domain, authorize?: false)
+               |> Enum.filter(&(&1.record_pk["id"] == w.id and &1.state == :parked))
+    end
+  end
+
   # --- H3: refresh/3 propagates a local read failure instead of raising -----
 
   describe "H3: refresh/3 surfaces a local read failure as {:error, _}, never a raise/MatchError" do

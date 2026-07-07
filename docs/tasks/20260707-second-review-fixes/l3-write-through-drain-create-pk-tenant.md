@@ -1,15 +1,14 @@
 # L3 — `write_through` inline drain misses creates; nil tenant on attribute-tenancy creates
 
-- **Status**: IN PROGRESS — **tenant half DONE** (as planned, in the tenant-unit
-  phase): `TenantKey`'s `attribute_value/2` now has an `%Ash.Changeset{}` clause
-  reading `changeset.attributes` instead of the changeset struct's own top-level
-  keys (always nil); repro confirms an attribute-tenancy create's tenant is now
-  derived correctly; fails on unfixed code (confirmed). `drain_chain_inline`'s
-  partition-key derivation also switched to `TenantKey.canonical/2`. The
-  **create-PK drain half** (keying the inline drain on the effective PK, not
-  `changeset.data`) is deferred to
-  [H4](h4-write-through-drain-race-divergence.md), same function, per the
-  index's execution order.
+- **Status**: DONE — **tenant half** (tenant-unit phase): `TenantKey`'s
+  `attribute_value/2` now has an `%Ash.Changeset{}` clause reading
+  `changeset.attributes`. **create-PK drain half** (with
+  [H4](h4-write-through-drain-race-divergence.md), same function):
+  `write_through/3`'s drain PK now comes from `drain_pk_source/1`
+  (`changeset.data` overlaid with `changeset.attributes` for a create), not
+  `changeset.data` alone — a client-generated PK's pending `:destroy` chain is
+  now found and drained on re-create. Both repros fail on unfixed code
+  (confirmed). `INTEGRATION=1 mix test` green (295).
 - **Severity**: Low (recreated row later deleted by stale destroy flush)
 - **Repo**: MDL (ash_multi_datalayer)
 - **Verification**: AGENT

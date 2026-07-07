@@ -526,6 +526,89 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
     end
   end
 
+  # --- H4 (#14): a stale in-flight flush must not regress the target after
+  # write_through's inline drain has already resolved that entry.
+
+  describe "H4: write_through's inline drain vs a stale in-flight flush" do
+    test "a worker holding a pre-drain snapshot does not push it after the entry is gone" do
+      # V1: an unflushed create — this is exactly what an Oban worker's
+      # `worker_read_action :pending` would have loaded.
+      w = create!(name: "v1")
+      stale_entry = entries() |> List.first()
+      assert stale_entry.op == :create
+
+      # write_through for the SAME PK drains this exact entry inline (pushes
+      # V1, discards it), then pushes + writes V2 synchronously.
+      w
+      |> Ash.Changeset.for_update(:update, %{name: "v2"}, domain: Domain)
+      |> Ash.Changeset.set_context(%{multi_datalayer: %{write_through: true}})
+      |> Ash.update!()
+
+      assert entries() == []
+      assert [%{name: "v2"}] = remote()
+
+      # The "worker" now (too late) tries to flush its stale, already-
+      # discarded reference. Unfixed code pushes it blindly — `entry` is
+      # used as-is, never re-checked — clobbering the target back to V1.
+      # Fixed code re-fetches immediately before pushing, finds nothing,
+      # and no-ops (whether the surrounding update then errors on the
+      # missing row or succeeds as a no-op, the target must be unaffected).
+      try do
+        stale_entry
+        |> Ash.Changeset.for_update(:flush, %{}, domain: Domain)
+        |> Ash.update()
+      rescue
+        _ -> :ok
+      end
+
+      assert [%{name: "v2"}] = remote()
+    end
+  end
+
+  # --- L3 (create-PK drain half): a re-create with the same client-generated
+  # PK must drain a pending :destroy for that PK.
+
+  describe "L3: write_through's inline drain keys on the effective (create) PK" do
+    test "a re-create with the same client-generated id drains a pending :destroy for it" do
+      known_id = Ash.UUID.generate()
+
+      w1 =
+        Widget
+        |> Ash.Changeset.for_create(:create, %{name: "gen1"}, domain: Domain)
+        |> Ash.Changeset.force_change_attribute(:id, known_id)
+        |> Ash.create!()
+
+      drain()
+      assert [%{name: "gen1"}] = remote()
+
+      w1
+      |> Ash.Changeset.for_destroy(:destroy, %{}, domain: Domain)
+      |> Ash.destroy!()
+
+      # a pending :destroy entry for known_id, not yet flushed (the earlier
+      # create entry is already :synced from the drain above).
+      assert [%{op: :destroy, state: :pending}] =
+               Enum.filter(entries(), &(&1.state != :synced))
+
+      # Unfixed: `drain_chain_inline`'s PK comes from `changeset.data` (nil
+      # for a create), so it searches for a chain keyed by `%{"id" => nil}`
+      # — never matches the destroy entry above (keyed by `known_id`) — the
+      # stale destroy survives and later deletes the recreated row.
+      Widget
+      |> Ash.Changeset.for_create(:create, %{name: "gen2"}, domain: Domain)
+      |> Ash.Changeset.force_change_attribute(:id, known_id)
+      |> Ash.Changeset.set_context(%{multi_datalayer: %{write_through: true}})
+      |> Ash.create!()
+
+      assert Enum.filter(entries(), &(&1.state != :synced)) == []
+      assert [%{name: "gen2"}] = remote()
+
+      # Nothing left pending to later clobber the recreated row.
+      drain()
+      assert [%{name: "gen2"}] = remote()
+    end
+  end
+
   # --- H3: refresh/3's dirty-check + backfill is atomic vs a co-committed write
 
   describe "H3: refresh's atomic dirty-check + backfill uses a real DB lock" do
