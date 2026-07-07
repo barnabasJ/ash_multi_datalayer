@@ -123,7 +123,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
           |> Ash.Changeset.for_update(:retry, %{}, domain: domain(outbox))
           |> Ash.update!(authorize?: false)
 
-        Enqueue.flush(outbox, updated)
+        Enqueue.flush_and_log(outbox, updated)
         :ok
 
       {:error, _} = error ->
@@ -347,7 +347,10 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
     # real entries are never stored under a `nil` tenant, so relying on the
     # bare default would silently kick nothing.
     outbox = outbox(host_resource)
-    for entry <- pending(host_resource, TenantKey.unscoped()), do: Enqueue.flush(outbox, entry)
+
+    for entry <- pending(host_resource, TenantKey.unscoped()),
+        do: Enqueue.flush_and_log(outbox, entry)
+
     :ok
   end
 
@@ -720,7 +723,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
     |> Ash.Query.limit(1)
     |> read()
     |> case do
-      [next | _] -> Enqueue.flush(outbox, next)
+      [next | _] -> Enqueue.flush_and_log(outbox, next)
       [] -> :ok
     end
   end

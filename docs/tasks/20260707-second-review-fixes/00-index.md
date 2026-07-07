@@ -183,7 +183,7 @@ is H5/#19 work and uses the real tenant, not the partition key.
 | H3  | [`refresh/3` TOCTOU vs co-committed local write](h3-refresh-toctou.md)                                    | MDL        | DONE   |
 | H4  | [`write_through` drain race + post-target-push divergence](h4-write-through-drain-race-divergence.md)     | MDL        | DONE   |
 | H5  | [LocalOutbox tenant model: `nil` = "IS NULL" vs "unscoped"](h5-localoutbox-nil-tenant-model.md)           | MDL        | DONE   |
-| P6  | [Lost-kick recovery semantics (#4): sweeper unproven](p6-lost-kick-recovery.md)                           | MDL        | OPEN   |
+| P6  | [Lost-kick recovery semantics (#4): sweeper unproven](p6-lost-kick-recovery.md)                           | MDL        | DONE   |
 
 ## Medium
 

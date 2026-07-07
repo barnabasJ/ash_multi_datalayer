@@ -304,8 +304,10 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
         # Post-commit kick — after the write is durable. Rows are the truth,
         # jobs are ephemeral pointers: a lost kick leaves the entry pending
         # until the next kick reaches its host chain (a later write, retry/1,
-        # or resume_sync/1) — there is no background sweeper.
-        Enum.each(entries, &Enqueue.flush(outbox, &1))
+        # or resume_sync/1) — or, failing that, the background
+        # `LocalOutbox.Sweeper` (P6), which periodically re-kicks any
+        # `:pending` chain head with no live job.
+        Enum.each(entries, &Enqueue.flush_and_log(outbox, &1))
         finalize(op, record, write_ref)
 
       {:error, error} ->

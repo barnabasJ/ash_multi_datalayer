@@ -33,6 +33,33 @@ defmodule AshMultiDatalayer.Sync.Enqueue do
     Oban.insert(instance, worker.new(args))
   end
 
+  @doc """
+  `flush/3`, but for the post-commit "best effort" kick sites that
+  historically discarded the result outright (P6/#4): a lost kick must not
+  vanish silently. The row (already durably committed) stays `:pending`
+  regardless of whether this succeeds — `AshMultiDatalayer.Orchestrator.
+  LocalOutbox.Sweeper` recovers it on its next tick either way, so this
+  only makes an immediate failure visible instead of invisible.
+  """
+  @spec flush_and_log(Ash.Resource.t(), Ash.Resource.record(), keyword()) :: :ok
+  def flush_and_log(outbox_resource, entry, opts \\ []) do
+    case flush(outbox_resource, entry, opts) do
+      {:ok, _job} ->
+        :ok
+
+      {:error, reason} ->
+        require Logger
+
+        Logger.warning(
+          "ash_multi_datalayer: failed to enqueue a LocalOutbox flush job for " <>
+            "#{entry.resource} (seq #{entry.seq}): #{inspect(reason)} — the entry stays " <>
+            "pending and will be recovered by the outbox sweeper"
+        )
+
+        :ok
+    end
+  end
+
   @doc "The ash_oban-generated worker module backing the outbox `:flush` trigger."
   @spec flush_worker(Ash.Resource.t()) :: module()
   def flush_worker(outbox_resource) do

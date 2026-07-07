@@ -715,5 +715,46 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
       drain()
       assert LocalOutbox.status(w) == :synced
     end
+
+    # P6: retained regression, expected to PASS regardless of H5 — the
+    # sweeper's own scan (`sweeper.ex`) reads the outbox with a plain
+    # unscoped `Ash.read!`, never through the H5-affected `tenant_filter/2`;
+    # the outbox `tenant` column is a regular attribute to that read, so it
+    # already returns every tenant's entries. Guards against a future
+    # regression that scopes the sweeper's read the same way H5 fixed
+    # LocalOutbox's own tenant_filter.
+    test "the sweeper discovers a multitenant (tenant-scoped) pending entry with no live job" do
+      pk = Ash.UUID.generate()
+
+      # Bypasses the normal write path's post-commit kick entirely (same
+      # "lost kick" simulation as the P6 tests in local_outbox_resolution_
+      # test.exs) — a tenant-scoped entry, so the sweep must NOT filter it
+      # out the way an is_nil(tenant)-based scan (the H5 defect) would.
+      entry =
+        OutboxEntry
+        |> Ash.Changeset.for_create(
+          :enqueue,
+          %{
+            write_ref: Ash.UUID.generate(),
+            resource: Atom.to_string(MtWidget),
+            tenant: "t1",
+            record_pk: %{"id" => pk},
+            op: :create,
+            payload: %{"id" => pk, "org_id" => "t1", "name" => "mt-lost-kick"},
+            base_image: nil,
+            target: :remote
+          },
+          domain: Domain
+        )
+        |> Ash.create!(authorize?: false)
+
+      assert entry.state == :pending
+
+      AshMultiDatalayer.Orchestrator.LocalOutbox.Sweeper.run_once([MtWidget])
+      drain()
+
+      assert [%{state: :synced}] = Ash.read!(OutboxEntry, domain: Domain, authorize?: false)
+      assert [%{name: "mt-lost-kick"}] = remote(MtWidget)
+    end
   end
 end

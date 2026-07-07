@@ -16,7 +16,7 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxResolutionTest do
   @moduletag :oban_sqlite
 
   alias AshMultiDatalayer.Orchestrator.LocalOutbox
-  alias AshMultiDatalayer.Orchestrator.LocalOutbox.{Flush, Target}
+  alias AshMultiDatalayer.Orchestrator.LocalOutbox.{Flush, Sweeper, Target}
   alias AshMultiDatalayer.Test.FailableLayer
 
   alias AshMultiDatalayer.Test.LocalOutbox.{
@@ -394,6 +394,103 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxResolutionTest do
 
       assert Enum.all?(entries(), &(&1.state == :synced))
       assert [%{name: "chain-block-2"}] = remote()
+    end
+  end
+
+  # --- P6: lost-kick recovery (#4) — the sweeper actually recovers a
+  # `:pending` chain head with no live job, not just "exists".
+
+  describe "P6: the LocalOutbox sweeper recovers a lost kick" do
+    defp enqueue_directly!(pk, write_ref, op, payload, base_image) do
+      OutboxEntry
+      |> Ash.Changeset.for_create(
+        :enqueue,
+        %{
+          write_ref: write_ref,
+          resource: Atom.to_string(Widget),
+          tenant: "__global__",
+          record_pk: %{"id" => pk},
+          op: op,
+          payload: payload,
+          base_image: base_image,
+          target: :remote
+        },
+        domain: Domain
+      )
+      |> Ash.create!(authorize?: false)
+    end
+
+    test "a pending entry with no live job is discovered and enqueued" do
+      pk = Ash.UUID.generate()
+
+      # Simulate the lost kick directly: the outbox row exists (as if its
+      # co-commit transaction had already succeeded) but no job was ever
+      # inserted for it — bypasses `Write.async_run/3`'s normal post-commit
+      # `Enqueue.flush` call entirely.
+      entry =
+        enqueue_directly!(
+          pk,
+          Ash.UUID.generate(),
+          :create,
+          %{
+            "id" => pk,
+            "name" => "lost-kick",
+            "count" => 0,
+            "updated_at" => 0
+          },
+          nil
+        )
+
+      assert entry.state == :pending
+
+      Sweeper.run_once([Widget])
+      drain()
+
+      assert [%{state: :synced}] = entries()
+      assert [%{name: "lost-kick"}] = remote()
+    end
+
+    test "a same-PK chain drains fully across ticks even with no automatic kicks at all" do
+      pk = Ash.UUID.generate()
+
+      _head =
+        enqueue_directly!(
+          pk,
+          Ash.UUID.generate(),
+          :create,
+          %{
+            "id" => pk,
+            "name" => "v1",
+            "count" => 0,
+            "updated_at" => 0
+          },
+          nil
+        )
+
+      tail =
+        enqueue_directly!(
+          pk,
+          Ash.UUID.generate(),
+          :update,
+          %{"id" => pk, "name" => "v2", "count" => 0, "updated_at" => 0},
+          %{"id" => pk, "name" => "v1", "count" => 0, "updated_at" => 0}
+        )
+
+      # The tail is genuinely NOT the chain head yet — the sweeper must
+      # respect FIFO and not kick it out of order.
+      assert Flush.chain_position(OutboxEntry, Domain, tail) == :racing
+
+      Sweeper.run_once([Widget])
+      drain()
+
+      # Whether the head's own flush-success `kick_next` already enqueued
+      # the tail or not, a second sweep tick must find and resolve it if
+      # it's still stranded — the chain converges either way.
+      Sweeper.run_once([Widget])
+      drain()
+
+      assert Enum.all?(entries(), &(&1.state == :synced))
+      assert [%{name: "v2"}] = remote()
     end
   end
 

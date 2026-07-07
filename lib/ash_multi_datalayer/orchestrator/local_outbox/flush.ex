@@ -179,7 +179,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
     |> Ash.Query.limit(1)
     |> Ash.read!(authorize?: false)
     |> case do
-      [next | _] -> Enqueue.flush(outbox, next)
+      [next | _] -> Enqueue.flush_and_log(outbox, next)
       [] -> :ok
     end
   end

@@ -1,7 +1,21 @@
 # P6 — Lost-kick recovery semantics (#4): sweeper exists but is unproven
 
-- **Status**: OPEN — sweeper module landed (untracked `sweeper.ex`) but with
-  **zero tests**; `Enqueue.flush` error posture unverified
+- **Status**: DONE — repros prove: (1) a `:pending` entry with no live job is
+  discovered and enqueued by `Sweeper.run_once/1`; (2) a same-PK chain created
+  with NO automatic kicks at all (bypassing both the write path's post-commit
+  kick and `kick_next`) still fully converges across sweep ticks, respecting
+  FIFO (`chain_position` stays non-`:head` for the tail until the ancestor
+  resolves); (3) multitenant (tenant-scoped) entries are discovered too —
+  retained regression, passes regardless of H5 per the task's own note (the
+  sweeper's scan was never routed through the H5-affected `tenant_filter/2`).
+  All 6 `Enqueue.flush` call sites that discarded the result now go through a
+  new `flush_and_log/3` (or the sweeper's own `kick/2`), which logs + emits
+  telemetry on failure instead of silently dropping it — the row stays
+  `:pending` either way, so the next write/retry/sweep tick naturally retries
+  it. Not independently repro'd: a genuinely-failing `Oban.insert` mid-sweep
+  (would need Oban- level fault injection: disproportionate cost given remaining
+  scope) — covered by code review + the existing rescue/log path instead of a
+  live fault-injection test. `INTEGRATION=1 mix test` green (298).
 - **Severity**: High (a lost kick strands a per-PK chain forever if recovery
   doesn't work)
 - **Repo**: MDL (ash_multi_datalayer)
