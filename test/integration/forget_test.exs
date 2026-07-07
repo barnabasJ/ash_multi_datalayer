@@ -61,4 +61,45 @@ defmodule AshMultiDatalayer.Integration.ForgetTest do
     assert AshMultiDatalayer.not_found?(%{errors: [%Ash.Error.Query.NotFound{}]})
     refute AshMultiDatalayer.not_found?(%{errors: []})
   end
+
+  # M3 (A2): an external UPDATE notification's `data` is the AFTER-image —
+  # `handle_external_change/2` routes it through `forget!/3` unchanged.
+  test "M3: an external update notification's after-image does not let a covering entry survive (A2)" do
+    x =
+      MirrorPost
+      |> Ash.Changeset.for_create(:create, %{name: "flip", age: 5})
+      |> Ash.create!()
+
+    # Warms coverage for a filter the row currently matches (age == 5).
+    assert [%{name: "flip"}] = TestPost |> Ash.Query.filter(age == 5) |> Ash.read!()
+    assert [_] = Coverage.entries(TestPost, nil)
+
+    # An external write elsewhere flips age to 99 — no local write runs
+    # (WriteDispatch's own invalidation never fires), only an inbound
+    # notification carrying the AFTER-image. `data` must be TestPost's own
+    # struct (matching what a real notifier hookup delivers) — MirrorPost
+    # is a separate resource over the same table, used only to write
+    # without going through MDL's own dispatch.
+    notification = %Ash.Notifier.Notification{
+      resource: TestPost,
+      data:
+        struct(
+          TestPost,
+          Map.take(x, [:id, :name, :age, :score, :published_at]) |> Map.put(:age, 99)
+        ),
+      changeset: nil
+    }
+
+    :ok =
+      AshMultiDatalayer.Orchestrator.ProvenCoverage.handle_external_change(
+        TestPost,
+        notification
+      )
+
+    # Unfixed: forget_probe passed the after-image (age: 99) verbatim as
+    # row_before — `age == 5` evaluates false against it, so the entry
+    # (still caching the now-stale age: 5 row) survives. Fixed: a PK-only
+    # unknown probe can't resolve `age`, forcing a conservative drop.
+    assert Coverage.entries(TestPost, nil) == []
+  end
 end

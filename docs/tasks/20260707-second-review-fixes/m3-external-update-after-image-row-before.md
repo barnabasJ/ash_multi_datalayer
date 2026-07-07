@@ -1,6 +1,15 @@
 # M3 — External update notification passes the after-image as `row_before` (A2)
 
-- **Status**: OPEN
+- **Status**: DONE — `forget_probe/2`'s `%resource{}` clause now delegates to
+  the PK-map clause (`Map.take(record, primary_key)`) instead of returning the
+  full record verbatim; every non-PK field becomes `%Ash.NotLoaded{}`, degrading
+  filter evaluation to `:unknown` (a conservative drop) rather than evaluating a
+  covering entry's predicate against the after-image's actual (possibly
+  non-matching) value. The after-image itself (`on_write/4`'s 4th arg) stays
+  `nil` — no `forget!/3` API change, per the scope guard. Repro (age 5→99 flip
+  via a simulated external notification) fails on unfixed code (confirmed: the
+  stale `age == 5` entry survives). `INTEGRATION=1 mix test` green (302, up from
+  301).
 - **Severity**: Medium (stale cached row survives under live entry)
 - **Repo**: MDL (ash_multi_datalayer)
 - **Verification**: VERIFIED

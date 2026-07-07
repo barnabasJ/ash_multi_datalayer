@@ -58,7 +58,14 @@ defmodule AshMultiDatalayer do
   end
 
   @doc false
-  def forget_probe(resource, %resource{} = record), do: record
+  # M3: a full after-image record must NOT pass through verbatim — delegate
+  # to the PK-map clause so `forget!/3` always probes with a PK-only
+  # *unknown* row (every non-PK field `%Ash.NotLoaded{}`), never a known
+  # after-image value a covering ledger entry's predicate could evaluate
+  # against (and wrongly decide not to drop).
+  def forget_probe(resource, %resource{} = record) do
+    forget_probe(resource, Map.take(record, Ash.Resource.Info.primary_key(resource)))
+  end
 
   def forget_probe(resource, pk) when is_map(pk) do
     primary_key = Ash.Resource.Info.primary_key(resource)
