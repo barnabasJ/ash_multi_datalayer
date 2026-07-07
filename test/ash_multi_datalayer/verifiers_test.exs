@@ -323,6 +323,65 @@ defmodule AshMultiDatalayer.VerifiersTest do
       assert error_message(ValidateAggregateOverrides.verify(module.spark_dsl_config())) =~
                "not an aggregate"
     end
+
+    # B5: `local_evaluation_overrides` holds CALCULATION names, not aggregate
+    # names (data_layer.ex's doc, consumed at value_merge.ex:57) — unfixed
+    # code validates it against `Ash.Resource.Info.aggregates/1`, so ANY
+    # legitimate calculation override fails compilation.
+    test "an override naming a real calculation in local_evaluation_overrides verifies" do
+      module =
+        define(
+          quote do
+            multi_data_layer do
+              layer(:l1, Ash.DataLayer.Ets)
+              layer(:l2, Ash.DataLayer.Ets)
+              read_order([:l1, :l2])
+              write_order([:l2, :l1])
+              local_evaluation_overrides([:overdue?])
+            end
+
+            calculations do
+              calculate :overdue?, :boolean, expr(false)
+            end
+          end
+        )
+
+      assert :ok = ValidateAggregateOverrides.verify(module.spark_dsl_config())
+    end
+
+    test "an override naming something that isn't a calculation in local_evaluation_overrides is rejected" do
+      module =
+        define(
+          quote do
+            multi_data_layer do
+              layer(:l1, Ash.DataLayer.Ets)
+              read_order([:l1])
+              write_order([:l1])
+              local_evaluation_overrides([:not_a_calculation])
+            end
+          end
+        )
+
+      assert error_message(ValidateAggregateOverrides.verify(module.spark_dsl_config())) =~
+               "not a calculation"
+    end
+
+    test "fold_aggregate_overrides still validates against aggregate names" do
+      module =
+        define(
+          quote do
+            multi_data_layer do
+              layer(:l1, Ash.DataLayer.Ets)
+              read_order([:l1])
+              write_order([:l1])
+              fold_aggregate_overrides([:not_an_aggregate])
+            end
+          end
+        )
+
+      assert error_message(ValidateAggregateOverrides.verify(module.spark_dsl_config())) =~
+               "not an aggregate"
+    end
   end
 
   describe "ValidateSolverSupportedPredicates" do

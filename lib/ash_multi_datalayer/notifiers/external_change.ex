@@ -69,14 +69,24 @@ defmodule AshMultiDatalayer.Notifiers.ExternalChange do
     )
   end
 
-  defp replayed_external?(%{metadata: %{"ash_remote" => %{"origin" => origin}}})
-       when origin in [:remote, "remote"],
-       do: true
+  # B4: the actual producer (`ash_remote`'s `Realtime.Inbound.metadata/1`)
+  # emits `Map.put(user_meta, "ash_remote", %{origin: :remote, id: ...,
+  # occurred_at: ...})` — a STRING outer key with ATOM inner keys. Matching
+  # only all-string or all-atom shapes (as two separate clauses previously
+  # did) matches neither, so every replayed notification was silently
+  # dropped. Normalize both key levels once instead of enumerating shape
+  # combinations, so producer key-casing drift (string vs atom, either
+  # level) can't silently break this again.
+  defp replayed_external?(%{metadata: metadata}) when is_map(metadata) do
+    case Map.get(metadata, "ash_remote") || Map.get(metadata, :ash_remote) do
+      %{} = ash_remote ->
+        origin = Map.get(ash_remote, "origin") || Map.get(ash_remote, :origin)
+        origin in [:remote, "remote"]
 
-  defp replayed_external?(%{metadata: %{ash_remote: %{origin: origin}}})
-       when origin in [:remote, "remote"],
-       do: true
+      _ ->
+        false
+    end
+  end
 
-  defp replayed_external?(%{metadata: %{external?: true}}), do: true
   defp replayed_external?(_), do: false
 end

@@ -169,10 +169,10 @@ is H5/#19 work and uses the real tenant, not the partition key.
 | B1  | [RPC exfiltrates private calcs/aggregates + field-policy 500](b1-rpc-private-calc-aggregate-exfiltration.md)  | ash_remote | DONE   |
 | B2  | [Aggregate-filter code injection at codegen](b2-aggregate-filter-codegen-injection.md)                        | ash_remote | DONE   |
 | B3  | [`tenant_from_filter/2` dead code — attribute-tenancy invalidation inert](b3-tenant-from-filter-dead-code.md) | MDL        | DONE   |
-| B4  | [ExternalChange origin marker matches no real notification](b4-external-change-origin-marker-mismatch.md)     | MDL        | OPEN   |
-| B5  | [`validate_aggregate_overrides` compile regression](b5-validate-aggregate-overrides-regression.md)            | MDL        | OPEN   |
-| B6  | [Stale-check payload compare skips JSON normalization](b6-stale-check-json-normalization.md)                  | MDL        | OPEN   |
-| B7  | [Resolution-verb guard inverted for `:synced` entries](b7-resolution-verb-synced-guard.md)                    | MDL        | OPEN   |
+| B4  | [ExternalChange origin marker matches no real notification](b4-external-change-origin-marker-mismatch.md)     | MDL        | DONE   |
+| B5  | [`validate_aggregate_overrides` compile regression](b5-validate-aggregate-overrides-regression.md)            | MDL        | DONE   |
+| B6  | [Stale-check payload compare skips JSON normalization](b6-stale-check-json-normalization.md)                  | MDL        | DONE   |
+| B7  | [Resolution-verb guard inverted for `:synced` entries](b7-resolution-verb-synced-guard.md)                    | MDL        | DONE   |
 
 ## High
 

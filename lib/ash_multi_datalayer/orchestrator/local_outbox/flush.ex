@@ -230,8 +230,16 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
 
   defp remote_matches_payload?(_host, %{payload: nil}, _remote), do: false
 
+  # `entry.payload` was stored in the outbox's `:map` attribute and read back
+  # through a JSON round-trip (JSON scalars — a `DateTime` became an ISO
+  # string); `Snapshot.dump/2` yields embedded values (structs). Normalise
+  # both sides the same way the field-level compare below already does —
+  # otherwise this fast path never matches for a `:utc_datetime_usec`/
+  # `:decimal` field, and an already-applied retry falsely parks as a
+  # conflict (B6/#5). Covers `drain_chain_inline` too — it calls this same
+  # `push/2`.
   defp remote_matches_payload?(host, entry, remote) do
-    Snapshot.dump(host, remote) == entry.payload
+    json_scalar(Snapshot.dump(host, remote)) == json_scalar(entry.payload)
   end
 
   # Reduce a value to the JSON scalar the outbox `:map` round-trip would yield,

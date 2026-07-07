@@ -1,6 +1,13 @@
 # B6 — `remote_matches_payload?` dead for timestamped resources (#5 inert)
 
-- **Status**: OPEN
+- **Status**: DONE — `remote_matches_payload?/3` now applies the same
+  `json_scalar/1` normalization as the field-level fallback to both sides before
+  comparing. Covers `drain_chain_inline` too — it calls the same `Flush.push/2`.
+  Repro (StampWidget, `:utc_datetime_usec` stale field): target already equals
+  the payload (simulating a worker dying after the push landed but before the
+  entry synced) → retry must sync clean, not park a false conflict; fails on
+  unfixed code (confirmed). `INTEGRATION=1 mix test` green (283 at the time, 289
+  after Phase 3).
 - **Severity**: Blocker (false conflicts block the PK chain)
 - **Repo**: MDL (ash_multi_datalayer)
 - **Verification**: VERIFIED

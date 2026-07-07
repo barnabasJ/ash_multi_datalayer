@@ -397,6 +397,72 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxResolutionTest do
     end
   end
 
+  # --- B7: resolution verbs on a stale handle to an already-:synced entry ----
+
+  describe "B7: resolution verbs are idempotent no-ops on an already-:synced entry" do
+    test "retry does not re-pend it" do
+      _w = create!(name: "b7-retry")
+      drain()
+      [entry] = entries()
+      assert entry.state == :synced
+
+      # Unfixed: `ensure_resolvable_head/1` returns `:ok` for `:synced`, so
+      # `retry/1` falls into its body and re-pends via the `:retry` action
+      # (which has no state guard) — flipping this back to `:pending` and
+      # re-flushing (re-pushing) an already-applied write.
+      assert :ok = LocalOutbox.retry(entry)
+      assert [%{state: :synced}] = entries()
+    end
+
+    test "force does not re-push or destroy it" do
+      _w = create!(name: "b7-force")
+      drain()
+      [entry] = entries()
+      assert entry.state == :synced
+
+      # Unfixed: force falls into its body, blind-pushes to the target again,
+      # then destroys this already-synced entry and kicks the next chain
+      # entry.
+      assert :ok = LocalOutbox.force(entry)
+      assert [%{state: :synced}] = entries()
+    end
+
+    test "discard of a non-create entry is a no-op, not a destroy + kick_next" do
+      w = create!(name: "b7-discard")
+      drain()
+      _updated = update!(w, name: "b7-discard-2")
+      drain()
+
+      [_create_entry, update_entry] = entries()
+      assert update_entry.op == :update
+      assert update_entry.state == :synced
+
+      # Unfixed: `entry.op != :create` takes the "just this entry" branch —
+      # `Ash.destroy!(entry, action: :discard, ...)` + `kick_next` — removing
+      # an already-applied, already-synced entry from the outbox.
+      assert {:ok, %{discarded: 0, dropped_chain: false}} = LocalOutbox.discard(update_entry)
+      assert length(entries()) == 2
+    end
+
+    test "rebase does not apply the resolution changeset" do
+      w = create!(name: "b7-rebase")
+      drain()
+      [entry] = entries()
+      assert entry.state == :synced
+
+      # Unfixed: rebase falls into its body regardless of `record_chain`
+      # being `[]` (nothing parked) and applies the resolution changeset — a
+      # REAL mutation the caller never should have triggered since there was
+      # no conflict to resolve.
+      changeset =
+        w
+        |> Ash.Changeset.for_update(:update, %{name: "should-not-apply"}, domain: Domain)
+
+      assert {:ok, ^entry} = LocalOutbox.rebase(entry, changeset)
+      assert [%{name: "b7-rebase"}] = local()
+    end
+  end
+
   # --- shared helpers ---------------------------------------------------------
 
   # Runs the boot_hydrate task ash_multi_datalayer registers for a resource's

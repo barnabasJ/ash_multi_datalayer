@@ -1,6 +1,12 @@
 # B5 — `validate_aggregate_overrides` compile regression breaks legitimate configs
 
-- **Status**: OPEN
+- **Status**: DONE — `local_evaluation_overrides` now validates against
+  `Ash.Resource.Info.calculations/1` names; `sql_join_aggregate_overrides`/
+  `fold_aggregate_overrides` still validate against aggregate names (typo
+  rejection retained for both, separate error messages per kind). Repro calls
+  `ValidateAggregateOverrides.verify/1` directly per the posture note (bounded
+  by P2, not plain `mix compile`); fails on unfixed code (confirmed). `mix test`
+  green (20 in `verifiers_test.exs`).
 - **Severity**: Blocker (compile failure on valid config)
 - **Repo**: MDL (ash_multi_datalayer)
 - **Verification**: VERIFIED

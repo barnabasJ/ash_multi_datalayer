@@ -333,6 +333,44 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
       assert [%{error_class: :conflict}] =
                Enum.filter(entries(), &(&1.state == :parked))
     end
+
+    # B6: `remote_matches_payload?/3` (the fast "already applied" check
+    # `check_stale/2` runs BEFORE pushing) compared a freshly-`Snapshot.dump`ed
+    # remote (structs) against `entry.payload` (JSON-round-tripped scalars)
+    # with no normalization — so it can never match on a DATETIME/decimal
+    # field, falling through to the base-image field compare, which then
+    # (correctly, on its own terms) sees base_image (the PRE-write snapshot)
+    # differ from the remote's CURRENT (already-updated) value and parks a
+    # FALSE conflict, even though the remote already holds exactly what this
+    # entry would push.
+    test "a retry whose target already equals the payload does not falsely park (JSON round-trip)" do
+      s =
+        StampWidget
+        |> Ash.Changeset.for_create(:create, %{name: "s", seen_at: ~U[2026-07-05 12:00:00Z]},
+          domain: Domain
+        )
+        |> Ash.create!()
+
+      drain()
+
+      updated =
+        s
+        |> Ash.Changeset.for_update(:update, %{name: "s2", seen_at: ~U[2026-07-05 18:30:00Z]},
+          domain: Domain
+        )
+        |> Ash.update!()
+
+      # Simulate the push having already landed on the target (e.g. a worker
+      # died after `Target.upsert` succeeded but before the entry was marked
+      # `:synced`) — the remote already holds exactly the pending payload.
+      Target.upsert(StampWidget, :remote, updated)
+
+      drain()
+
+      assert entries() |> Enum.filter(&(&1.state == :parked)) == []
+      assert Enum.all?(entries(), &(&1.state == :synced))
+      assert [%{name: "s2", seen_at: ~U[2026-07-05 18:30:00.000000Z]}] = remote(StampWidget)
+    end
   end
 
   # --- inbound refresh ---------------------------------------------------

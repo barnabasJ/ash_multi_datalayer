@@ -94,4 +94,43 @@ defmodule AshMultiDatalayer.Notifiers.ExternalChangeExitTest do
 
     assert log == ""
   end
+
+  # B4: the actual producer (`ash_remote`'s `Realtime.Inbound.metadata/1`)
+  # emits `Map.put(user_meta, "ash_remote", %{origin: :remote, id: ...,
+  # occurred_at: ...})` — a STRING outer key, ATOM inner keys. Neither the
+  # all-string nor the all-atom synthetic shape above (both already fixed)
+  # covers this mixed shape — unfixed code drops every real replayed
+  # notification, so the reaction (invalidate/refresh) never runs.
+  test "the real producer's mixed-key metadata shape (string outer, atom inner) is recognized" do
+    notification = %Ash.Notifier.Notification{
+      resource: ExitingPost,
+      data: %ExitingPost{},
+      metadata: %{
+        "ash_remote" => %{origin: :remote, id: "abc", occurred_at: "2026-07-07T00:00:00Z"}
+      }
+    }
+
+    log =
+      capture_log(fn ->
+        assert :ok = ExternalChange.notify(notification)
+      end)
+
+    assert log =~ "inbound reaction"
+    assert log =~ "reaction_timeout"
+  end
+
+  # B4: the `external?: true` marker clause matched no known producer and is
+  # removed — confirm it stays removed (not silently dead) rather than
+  # accidentally marking something external.
+  test "a bare external?: true metadata field (the removed dead clause) does not mark a notification external" do
+    notification = %Ash.Notifier.Notification{
+      resource: ExitingPost,
+      data: %ExitingPost{},
+      metadata: %{external?: true}
+    }
+
+    log = capture_log(fn -> assert :ok = ExternalChange.notify(notification) end)
+
+    assert log == ""
+  end
 end

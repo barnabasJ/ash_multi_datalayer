@@ -1,6 +1,16 @@
 # B7 — Resolution-verb guard inverted for `:synced` entries (#17)
 
-- **Status**: OPEN
+- **Status**: DONE — `ensure_resolvable_head/1` returns `:noop` (not `:ok`) for
+  `:synced`, distinct from proceed; all four call sites (`retry`, `discard`,
+  `force`, `rebase`) switched from `with :ok <-` to a `case` that treats `:noop`
+  as an idempotent no-op success — picked ONE contract per the binding decision,
+  none fall through to the action. Per-verb repros (the failure mode differs by
+  verb, per the task's guidance): retry/force fail unfixed by
+  re-pushing/re-pending; discard of a non-create entry fails unfixed by
+  destroying the synced entry + `kick_next`; rebase fails unfixed regardless of
+  op by applying the resolution changeset. All 4 fail on unfixed code
+  (confirmed). `INTEGRATION=1 mix test` green (287 at the time, 289 after Phase
+  3).
 - **Severity**: Blocker (re-applies already-applied writes)
 - **Repo**: MDL (ash_multi_datalayer)
 - **Verification**: VERIFIED

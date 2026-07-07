@@ -1,6 +1,14 @@
 # B4 — ExternalChange origin marker matches no real notification → realtime invalidation dead
 
-- **Status**: OPEN
+- **Status**: DONE — `replayed_external?/1` now normalizes both key levels
+  (`Map.get(metadata, "ash_remote") || Map.get(metadata, :ash_remote)`, then the
+  same for `origin`) instead of two shape-specific clauses, so it matches the
+  real producer's mixed string-outer/atom-inner shape. The dead
+  `external?: true` clause (no known producer) is removed. Repro built from the
+  exact shape in `ash_remote/lib/ash_remote/realtime/inbound.ex`'s `metadata/1`;
+  fails on unfixed code (confirmed) by dropping the notification. Both existing
+  synthetic-shape tests (all-string, all-atom) kept and still pass.
+  `INTEGRATION=1 mix test` green (289).
 - **Severity**: Blocker (permanent silent staleness)
 - **Repo**: MDL (consumer) — producer shape defined in ash_remote
 - **Verification**: VERIFIED

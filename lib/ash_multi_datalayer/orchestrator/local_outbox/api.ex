@@ -108,16 +108,26 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   @doc "parked → pending, re-trigger the chain head (after the operator fixed the cause)."
   @spec retry(Ash.Resource.record()) :: :ok
   def retry(entry) do
-    with :ok <- ensure_resolvable_head(entry) do
-      outbox = entry.__struct__
+    case ensure_resolvable_head(entry) do
+      # B7: a stale handle to an entry that's already `:synced` is an
+      # idempotent no-op success — the write it names already landed, so
+      # re-pending + re-flushing it would push it again.
+      :noop ->
+        :ok
 
-      updated =
-        entry
-        |> Ash.Changeset.for_update(:retry, %{}, domain: domain(outbox))
-        |> Ash.update!(authorize?: false)
+      :ok ->
+        outbox = entry.__struct__
 
-      Enqueue.flush(outbox, updated)
-      :ok
+        updated =
+          entry
+          |> Ash.Changeset.for_update(:retry, %{}, domain: domain(outbox))
+          |> Ash.update!(authorize?: false)
+
+        Enqueue.flush(outbox, updated)
+        :ok
+
+      {:error, _} = error ->
+        error
     end
   end
 
@@ -128,23 +138,31 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   @spec discard(Ash.Resource.record()) ::
           {:ok, %{discarded: pos_integer(), dropped_chain: boolean()}}
   def discard(entry) do
-    with :ok <- ensure_resolvable_head(entry) do
-      outbox = entry.__struct__
+    case ensure_resolvable_head(entry) do
+      # B7: already `:synced` — nothing pending/parked to discard.
+      :noop ->
+        {:ok, %{discarded: 0, dropped_chain: false}}
 
-      if entry.op == :create do
-        chain = record_chain(entry)
+      :ok ->
+        outbox = entry.__struct__
 
-        Enum.each(
-          Enum.sort_by(chain, & &1.seq, :desc),
-          &Ash.destroy!(&1, action: :discard, domain: domain(outbox), authorize?: false)
-        )
+        if entry.op == :create do
+          chain = record_chain(entry)
 
-        {:ok, %{discarded: length(chain), dropped_chain: true}}
-      else
-        Ash.destroy!(entry, action: :discard, domain: domain(outbox), authorize?: false)
-        kick_next(entry)
-        {:ok, %{discarded: 1, dropped_chain: false}}
-      end
+          Enum.each(
+            Enum.sort_by(chain, & &1.seq, :desc),
+            &Ash.destroy!(&1, action: :discard, domain: domain(outbox), authorize?: false)
+          )
+
+          {:ok, %{discarded: length(chain), dropped_chain: true}}
+        else
+          Ash.destroy!(entry, action: :discard, domain: domain(outbox), authorize?: false)
+          kick_next(entry)
+          {:ok, %{discarded: 1, dropped_chain: false}}
+        end
+
+      {:error, _} = error ->
+        error
     end
   end
 
@@ -188,27 +206,37 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   @doc "Re-flush as a blind PK-upsert/destroy, ignoring base_image (LWW for this entry)."
   @spec force(Ash.Resource.record()) :: :ok | {:error, term()}
   def force(entry) do
-    with :ok <- ensure_resolvable_head(entry) do
-      host = host(entry)
-      outbox = entry.__struct__
-      record = Target.record_from_entry(host, entry)
+    case ensure_resolvable_head(entry) do
+      # B7: already `:synced` — the write already landed; re-pushing (a blind
+      # PK-upsert/destroy) would re-apply it, and a `:destroy` re-applied
+      # against a possibly-recreated PK is exactly the hazard this guards.
+      :noop ->
+        :ok
 
-      result =
-        if entry.op == :destroy do
-          Target.destroy(host, entry.target, record, tenant: entry.tenant)
-        else
-          Target.upsert(host, entry.target, record, tenant: entry.tenant)
+      :ok ->
+        host = host(entry)
+        outbox = entry.__struct__
+        record = Target.record_from_entry(host, entry)
+
+        result =
+          if entry.op == :destroy do
+            Target.destroy(host, entry.target, record, tenant: entry.tenant)
+          else
+            Target.upsert(host, entry.target, record, tenant: entry.tenant)
+          end
+
+        case normalize(result) do
+          :ok ->
+            Ash.destroy!(entry, action: :discard, domain: domain(outbox), authorize?: false)
+            kick_next(entry)
+            :ok
+
+          {:error, error} ->
+            {:error, error}
         end
 
-      case normalize(result) do
-        :ok ->
-          Ash.destroy!(entry, action: :discard, domain: domain(outbox), authorize?: false)
-          kick_next(entry)
-          :ok
-
-        {:error, error} ->
-          {:error, error}
-      end
+      {:error, _} = error ->
+        error
     end
   end
 
@@ -235,25 +263,36 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   @spec rebase(Ash.Resource.record(), Ash.Changeset.t()) ::
           {:ok, Ash.Resource.record()} | {:error, term()}
   def rebase(entry, changeset) do
-    with :ok <- ensure_resolvable_head(entry) do
-      outbox = entry.__struct__
-      captured_chain = record_chain(entry)
+    case ensure_resolvable_head(entry) do
+      # B7: already `:synced` — the conflict this resolution changeset was
+      # meant to resolve no longer exists (nothing parked); do NOT apply it.
+      # Returning the current entry is the idempotent no-op success — the
+      # caller's stale handle just observes what already happened.
+      :noop ->
+        {:ok, entry}
 
-      result =
-        case changeset.action_type do
-          :create -> Ash.create!(changeset)
-          :update -> Ash.update!(changeset)
-          :destroy -> Ash.destroy!(changeset)
+      :ok ->
+        outbox = entry.__struct__
+        captured_chain = record_chain(entry)
+
+        result =
+          case changeset.action_type do
+            :create -> Ash.create!(changeset)
+            :update -> Ash.update!(changeset)
+            :destroy -> Ash.destroy!(changeset)
+          end
+
+        case destroy_captured_chain(outbox, captured_chain, entry) do
+          :ok ->
+            kick_next(entry)
+            {:ok, result}
+
+          {:error, _} = error ->
+            error
         end
 
-      case destroy_captured_chain(outbox, captured_chain, entry) do
-        :ok ->
-          kick_next(entry)
-          {:ok, result}
-
-        {:error, _} = error ->
-          error
-      end
+      {:error, _} = error ->
+        error
     end
   end
 
@@ -640,10 +679,15 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   defp tenant_of(%{__metadata__: %{tenant: tenant}}), do: tenant
   defp tenant_of(_), do: nil
 
+  # B7: `:synced` is a distinct outcome from `:ok` — a stale handle to an
+  # already-applied entry must not fall into a verb's `with`/`case` body and
+  # re-apply the write. Every call site treats `:noop` as an idempotent
+  # no-op success (pick ONE contract, per the task's binding decision), not
+  # as "proceed".
   defp ensure_resolvable_head(entry) do
     cond do
       entry.state == :synced ->
-        :ok
+        :noop
 
       entry.state != :parked ->
         {:error, :not_parked}
