@@ -1,6 +1,26 @@
 # M4 — `discard_local/1` destroys a freshly re-read chain and skips the head guard
 
-- **Status**: OPEN
+- **Status**: DONE — `discard_local/1` now captures `record_chain(entry)` BEFORE
+  the local upsert/destroy (mirroring `rebase/2`'s fix) and destroys only that
+  captured set via the shared `destroy_captured_chain/3` helper (`drop_chain/1`,
+  the destroy-time re-read, is now dead and removed); gained the
+  `ensure_resolvable_head` guard (`:noop` on `:synced`,
+  `{:error, :not_parked}`/`{:error, :not_chain_head}` otherwise, matching B7);
+  kicks the next entry after a successful destroy (a survived concurrent write's
+  fresh entry needs one, same as `rebase/2`'s fresh entries). The remote-gone
+  branch now threads `entry.tenant` into `backfill_opts` (was unconditionally
+  `nil` — inconsistent with the sibling branch, which already passed it) —
+  code-consistent with the fix's stated intent, though the specific test built
+  for it didn't end up discriminating fixed vs. unfixed (ash*sqlite's
+  PK-addressed destroy doesn't appear to need tenant scoping to find the row),
+  so this half is verified by code review rather than an observed-failing repro.
+  New `FailableLayer.run_before/2` (fires a callback immediately before the
+  layer's next upsert/destroy — reproduces "another write lands mid-operation"
+  deterministically, no real thread timing) drives the race repro. 3 of 4 new
+  tests fail on unfixed code (confirmed); a 5th test is a retained F2 regression
+  (Target.read_pk failure surfaces as `{:error,
+  *}`— this was already a soft`case`match pre-M4, Cat B coverage, not a new fix).`INTEGRATION=1
+  mix test` green (307, up from 302).
 - **Severity**: Medium (silent divergence — M-1-class)
 - **Repo**: MDL (ash_multi_datalayer)
 - **Verification**: AGENT

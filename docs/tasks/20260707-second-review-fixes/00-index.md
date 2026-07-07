@@ -192,7 +192,7 @@ is H5/#19 work and uses the real tenant, not the partition key.
 | M1  | [`{:upsert_skipped, ...}` crashes with `BadMapError`](m1-upsert-skipped-badmaperror.md)                                                      | MDL        | DONE   |
 | M2  | [Context-tenancy invalidation uses raw metadata tenant](m2-context-tenancy-raw-metadata-tenant.md)                                           | MDL        | DONE   |
 | M3  | [External update passes after-image as `row_before`](m3-external-update-after-image-row-before.md)                                           | MDL        | DONE   |
-| M4  | [`discard_local/1` destroys freshly re-read chain, skips head guard](m4-discard-local-chain-destroy.md)                                      | MDL        | OPEN   |
+| M4  | [`discard_local/1` destroys freshly re-read chain, skips head guard](m4-discard-local-chain-destroy.md)                                      | MDL        | DONE   |
 | M5  | [Refresh/delete reconciliation not atomic with dirty check](m5-refresh-delete-reconciliation-not-atomic.md) — subsumed by H3, closes with it | MDL        | DONE   |
 | M6  | [Destroy-flush of already-gone row parks as `:rejected`](m6-destroy-flush-already-gone-parks.md)                                             | MDL        | OPEN   |
 | M7  | [Query calculations/aggregates decoded uncast](m7-query-calc-aggregate-decode-uncast.md)                                                     | ash_remote | OPEN   |

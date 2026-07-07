@@ -176,27 +176,54 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   """
   @spec discard_local(Ash.Resource.record()) :: :ok | {:error, term()}
   def discard_local(entry) do
-    host = host(entry)
-    local = LocalOutbox.local_layer(host)
-
-    result =
-      case Target.read_pk(host, last_target(host), entry.record_pk, tenant: entry.tenant) do
-        {:ok, nil} ->
-          # gone remotely — remove locally too
-          record = Snapshot.load(host, entry.record_pk)
-          Backfill.destroy_record(local, host, record, backfill_opts(host))
-
-        {:ok, remote} ->
-          Backfill.upsert_record(local, host, remote, backfill_opts(host, entry.tenant))
-
-        {:error, _} = error ->
-          error
-      end
-
-    case normalize(result) do
-      :ok ->
-        drop_chain(entry)
+    case ensure_resolvable_head(entry) do
+      # B7: already `:synced` — nothing parked to resolve.
+      :noop ->
         :ok
+
+      :ok ->
+        host = host(entry)
+        local = LocalOutbox.local_layer(host)
+        # M4: captured BEFORE the local upsert/destroy runs — mirrors
+        # rebase/2's fix. An ordinary Write.run on the same record landing
+        # between the local write below and the chain destroy creates a
+        # fresh `:pending` entry sharing this exact chain key; a
+        # destroy-time `drop_chain/1` re-read would catch (and destroy) it
+        # too, silently losing that write's replication entry.
+        captured_chain = record_chain(entry)
+
+        result =
+          case Target.read_pk(host, last_target(host), entry.record_pk, tenant: entry.tenant) do
+            {:ok, nil} ->
+              # gone remotely — remove locally too
+              record = Snapshot.load(host, entry.record_pk)
+              Backfill.destroy_record(local, host, record, backfill_opts(host, entry.tenant))
+
+            {:ok, remote} ->
+              Backfill.upsert_record(local, host, remote, backfill_opts(host, entry.tenant))
+
+            {:error, _} = error ->
+              error
+          end
+
+        case normalize(result) do
+          :ok ->
+            case destroy_captured_chain(entry.__struct__, captured_chain, entry) do
+              :ok ->
+                # A write landing between the capture above and this destroy
+                # created a fresh entry that survived (by construction, not
+                # in captured_chain) — it's now the chain's real head and
+                # needs a kick, same as rebase/2's fresh entries.
+                kick_next(entry)
+                :ok
+
+              {:error, _} = error ->
+                error
+            end
+
+          {:error, _} = error ->
+            error
+        end
 
       {:error, _} = error ->
         error
@@ -697,15 +724,6 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
     |> Ash.Query.filter(state != :synced)
     |> tenant_filter(entry.tenant)
     |> read()
-  end
-
-  defp drop_chain(entry) do
-    outbox = entry.__struct__
-
-    Enum.each(
-      Enum.sort_by(record_chain(entry), & &1.seq, :desc),
-      &Ash.destroy!(&1, action: :discard, domain: domain(outbox), authorize?: false)
-    )
   end
 
   defp kick_next(entry) do

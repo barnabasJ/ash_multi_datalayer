@@ -25,6 +25,7 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxResolutionTest do
     FailableSqlite,
     FailableTarget,
     IfEmptyWidget,
+    MtWidget,
     OutboxEntry,
     Remote,
     TimestampWidget,
@@ -68,7 +69,7 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxResolutionTest do
 
   setup do
     for t <-
-          ~w(lo_widgets lo_timestamp_widgets lo_ifempty_widgets lo_failable_local_widgets lo_outbox oban_jobs) do
+          ~w(lo_widgets lo_timestamp_widgets lo_ifempty_widgets lo_failable_local_widgets lo_mt_widgets lo_outbox oban_jobs) do
       Ecto.Adapters.SQL.query!(SkeletonRepo, "DELETE FROM #{t}", [])
     end
 
@@ -325,6 +326,168 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxResolutionTest do
     after
       FailableLayer.clear(FailableSqlite)
       FailableLayer.clear(FailableTarget)
+    end
+  end
+
+  # --- M4: discard_local must capture its chain BEFORE applying, not re-read ----
+
+  describe "M4: discard_local captures its chain before the local write, mirroring rebase/2" do
+    test "a write landing between the local write and the chain destroy survives with its pending entry intact" do
+      FailableLayer.fail(FailableTarget, :rejected)
+
+      w =
+        FailableLocalWidget
+        |> Ash.Changeset.for_create(:create, %{name: "dl-race"}, domain: Domain)
+        |> Ash.create!()
+
+      drain()
+
+      assert [parked] =
+               OutboxEntry
+               |> Ash.read!(domain: Domain, authorize?: false)
+               |> Enum.filter(&(&1.state == :parked))
+
+      FailableLayer.clear(FailableTarget)
+
+      # Fires exactly during discard_local's local write (Backfill.
+      # upsert_record against FailableSqlite) — an ordinary write on the
+      # SAME record landing in that window creates a fresh :pending entry
+      # sharing this exact chain key. Unfixed: discard_local's destroy step
+      # re-reads the chain AFTER this point (drop_chain/1) and destroys the
+      # fresh entry too — the concurrent write's replication entry is gone
+      # with no trace.
+      FailableLayer.run_before(FailableSqlite, fn ->
+        w
+        |> Ash.Changeset.for_update(:update, %{name: "dl-race-2"}, domain: Domain)
+        |> Ash.update!()
+      end)
+
+      assert :ok = LocalOutbox.discard_local(parked)
+
+      fresh =
+        OutboxEntry
+        |> Ash.read!(domain: Domain, authorize?: false)
+        |> Enum.filter(&(&1.state == :pending))
+
+      assert fresh != [], "the concurrent write's pending entry must survive discard_local"
+    after
+      FailableLayer.clear(FailableTarget)
+      FailableLayer.clear_before(FailableSqlite)
+    end
+
+    test "discard_local rejects a :pending (never-parked) entry" do
+      w =
+        FailableLocalWidget
+        |> Ash.Changeset.for_create(:create, %{name: "dl-pending"}, domain: Domain)
+        |> Ash.create!()
+
+      [pending] =
+        OutboxEntry
+        |> Ash.read!(domain: Domain, authorize?: false)
+        |> Enum.filter(&(&1.record_pk["id"] == w.id))
+
+      assert pending.state == :pending
+      assert {:error, :not_parked} = LocalOutbox.discard_local(pending)
+    end
+
+    test "discard_local rejects a parked entry that is not the chain head" do
+      FailableLayer.fail(FailableTarget, :rejected)
+
+      w =
+        FailableLocalWidget
+        |> Ash.Changeset.for_create(:create, %{name: "dl-blocked"}, domain: Domain)
+        |> Ash.create!()
+
+      drain()
+
+      w
+      |> Ash.Changeset.for_update(:update, %{name: "dl-blocked-2"}, domain: Domain)
+      |> Ash.update!()
+
+      [head, tail] =
+        OutboxEntry
+        |> Ash.read!(domain: Domain, authorize?: false)
+        |> Enum.filter(&(&1.record_pk["id"] == w.id))
+        |> Enum.sort_by(& &1.seq)
+
+      assert head.state == :parked
+      # Only the chain head is ever actively flushed under normal operation
+      # — a non-head entry can't organically reach :parked. Force it
+      # directly (the same :park action record_divergence/5 uses) to
+      # exercise ensure_resolvable_head's chain_head? branch specifically,
+      # as opposed to its earlier (already-covered) :not_parked branch.
+      tail =
+        tail
+        |> Ash.Changeset.for_update(:park, %{error_class: :conflict}, domain: Domain)
+        |> Ash.update!(authorize?: false)
+
+      assert tail.state == :parked
+
+      assert {:error, :not_chain_head} = LocalOutbox.discard_local(tail)
+    after
+      FailableLayer.clear(FailableTarget)
+    end
+
+    test "the remote-gone branch carries the entry's tenant into the local destroy" do
+      FailableLayer.fail(Remote, :rejected)
+
+      w =
+        MtWidget
+        |> Ash.Changeset.for_create(:create, %{org_id: "acme", name: "dl-mt"}, domain: Domain)
+        |> Ash.create!()
+
+      drain()
+
+      assert [parked] =
+               OutboxEntry
+               |> Ash.read!(domain: Domain, authorize?: false)
+               |> Enum.filter(&(&1.record_pk["id"] == w.id and &1.state == :parked))
+
+      FailableLayer.clear(Remote)
+
+      # The target never held this row (parked immediately), so
+      # Target.read_pk returns {:ok, nil} — the remote-gone branch, whose
+      # local destroy must carry entry.tenant ("acme"). Unfixed:
+      # backfill_opts(host) with no tenant either fails to find the
+      # attribute-multitenant row at all (leaving it behind) or drops it
+      # from the wrong scope.
+      assert :ok = LocalOutbox.discard_local(parked)
+
+      assert [] =
+               MtWidget
+               |> Ash.Query.for_read(:read, %{}, domain: Domain, tenant: "acme")
+               |> Ash.Query.filter(id == ^w.id)
+               |> Ash.read!(authorize?: false)
+    after
+      FailableLayer.clear(Remote)
+    end
+
+    # F2 (pass-3a review): retained regression, not a repro — discard_local's
+    # `Target.read_pk` call was ALREADY a soft `case`/`{:error, _} = error`
+    # match before M4 (never a hard `{:ok, _} =` match that would raise);
+    # this is Cat B coverage for that pre-existing-but-untested safety, not
+    # a new fix.
+    test "a Target.read_pk failure surfaces as {:error, _}, never a raise" do
+      FailableLayer.fail(FailableTarget, :rejected)
+
+      w =
+        FailableLocalWidget
+        |> Ash.Changeset.for_create(:create, %{name: "dl-readfail"}, domain: Domain)
+        |> Ash.create!()
+
+      drain()
+
+      assert [parked] =
+               OutboxEntry
+               |> Ash.read!(domain: Domain, authorize?: false)
+               |> Enum.filter(&(&1.record_pk["id"] == w.id and &1.state == :parked))
+
+      FailableLayer.fail_reads(FailableTarget, {:rejected, "target read failed"})
+
+      assert {:error, _} = LocalOutbox.discard_local(parked)
+    after
+      FailableLayer.clear(FailableTarget)
+      FailableLayer.clear_reads(FailableTarget)
     end
   end
 

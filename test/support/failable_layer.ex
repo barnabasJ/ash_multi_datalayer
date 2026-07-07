@@ -99,11 +99,36 @@ defmodule AshMultiDatalayer.Test.FailableLayer do
 
   @doc false
   def guard(layer, delegate) do
+    run_before_write(layer)
+
     case :ets.lookup(@table, layer) do
       [{^layer, :rejected}] -> {:error, {:rejected, "target rejected the write"}}
       [{^layer, :transient}] -> {:error, {:transient, "target transiently unavailable"}}
       [{^layer, :forbidden}] -> {:error, %Ash.Error.Forbidden{}}
       _ -> delegate.()
+    end
+  end
+
+  @doc """
+  Arm the layer to run `fun.()` as a side effect right BEFORE its next
+  `upsert`/`destroy` delegates — for deterministically reproducing "another
+  write lands in the middle of this operation" races without real thread
+  timing (M4: a write landing between `discard_local/1`'s local write and
+  its chain destroy). Fires once, then disarms itself.
+  """
+  def run_before(layer, fun), do: :ets.insert(@table, {{layer, :before_write}, fun})
+
+  @doc "Disarm the layer's before-write hook without it having fired."
+  def clear_before(layer), do: :ets.delete(@table, {layer, :before_write})
+
+  defp run_before_write(layer) do
+    case :ets.lookup(@table, {layer, :before_write}) do
+      [{_, fun}] ->
+        :ets.delete(@table, {layer, :before_write})
+        fun.()
+
+      [] ->
+        :ok
     end
   end
 
