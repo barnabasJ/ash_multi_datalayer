@@ -31,6 +31,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox do
   alias AshMultiDatalayer.DataLayer.Query
   alias AshMultiDatalayer.Delegate
   alias AshMultiDatalayer.Orchestrator.LocalOutbox.Api
+  alias AshMultiDatalayer.Orchestrator.LocalOutbox.Sweeper
   alias AshMultiDatalayer.Orchestrator.LocalOutbox.Write
 
   # --- config resolution -------------------------------------------------
@@ -218,7 +219,14 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox do
   end
 
   @impl true
-  def child_specs(resources), do: Api.child_specs(resources)
+  def child_specs(resources) do
+    if resources == [] do
+      []
+    else
+      [Supervisor.child_spec({Sweeper, resources: resources}, id: {Sweeper, resources})] ++
+        Api.child_specs(resources)
+    end
+  end
 
   # --- inbound (Phase 4 refresh/reconcile) -------------------------------
 

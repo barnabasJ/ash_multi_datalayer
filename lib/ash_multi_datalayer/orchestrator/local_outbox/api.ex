@@ -13,6 +13,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   alias AshMultiDatalayer.Orchestrator.LocalOutbox.{Snapshot, Target}
   alias AshMultiDatalayer.Sync.Enqueue
   alias AshMultiDatalayer.Sync.Info, as: SyncInfo
+  alias AshMultiDatalayer.TenantKey
 
   # --- queryable state ---------------------------------------------------
 
@@ -107,15 +108,17 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   @doc "parked → pending, re-trigger the chain head (after the operator fixed the cause)."
   @spec retry(Ash.Resource.record()) :: :ok
   def retry(entry) do
-    outbox = entry.__struct__
+    with :ok <- ensure_resolvable_head(entry) do
+      outbox = entry.__struct__
 
-    updated =
-      entry
-      |> Ash.Changeset.for_update(:retry, %{}, domain: domain(outbox))
-      |> Ash.update!(authorize?: false)
+      updated =
+        entry
+        |> Ash.Changeset.for_update(:retry, %{}, domain: domain(outbox))
+        |> Ash.update!(authorize?: false)
 
-    Enqueue.flush(outbox, updated)
-    :ok
+      Enqueue.flush(outbox, updated)
+      :ok
+    end
   end
 
   @doc """
@@ -125,20 +128,23 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   @spec discard(Ash.Resource.record()) ::
           {:ok, %{discarded: pos_integer(), dropped_chain: boolean()}}
   def discard(entry) do
-    outbox = entry.__struct__
+    with :ok <- ensure_resolvable_head(entry) do
+      outbox = entry.__struct__
 
-    if entry.op == :create do
-      chain = record_chain(entry)
+      if entry.op == :create do
+        chain = record_chain(entry)
 
-      Enum.each(
-        chain,
-        &Ash.destroy!(&1, action: :discard, domain: domain(outbox), authorize?: false)
-      )
+        Enum.each(
+          Enum.sort_by(chain, & &1.seq, :desc),
+          &Ash.destroy!(&1, action: :discard, domain: domain(outbox), authorize?: false)
+        )
 
-      {:ok, %{discarded: length(chain), dropped_chain: true}}
-    else
-      Ash.destroy!(entry, action: :discard, domain: domain(outbox), authorize?: false)
-      {:ok, %{discarded: 1, dropped_chain: false}}
+        {:ok, %{discarded: length(chain), dropped_chain: true}}
+      else
+        Ash.destroy!(entry, action: :discard, domain: domain(outbox), authorize?: false)
+        kick_next(entry)
+        {:ok, %{discarded: 1, dropped_chain: false}}
+      end
     end
   end
 
@@ -156,14 +162,17 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
     local = LocalOutbox.local_layer(host)
 
     result =
-      case Target.read_pk(host, last_target(host), entry.record_pk) do
+      case Target.read_pk(host, last_target(host), entry.record_pk, tenant: entry.tenant) do
         {:ok, nil} ->
           # gone remotely — remove locally too
           record = Snapshot.load(host, entry.record_pk)
           Backfill.destroy_record(local, host, record, backfill_opts(host))
 
         {:ok, remote} ->
-          Backfill.upsert_record(local, host, remote, backfill_opts(host))
+          Backfill.upsert_record(local, host, remote, backfill_opts(host, entry.tenant))
+
+        {:error, _} = error ->
+          error
       end
 
     case normalize(result) do
@@ -179,25 +188,27 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   @doc "Re-flush as a blind PK-upsert/destroy, ignoring base_image (LWW for this entry)."
   @spec force(Ash.Resource.record()) :: :ok | {:error, term()}
   def force(entry) do
-    host = host(entry)
-    outbox = entry.__struct__
-    record = Target.record_from_entry(host, entry)
+    with :ok <- ensure_resolvable_head(entry) do
+      host = host(entry)
+      outbox = entry.__struct__
+      record = Target.record_from_entry(host, entry)
 
-    result =
-      if entry.op == :destroy do
-        Target.destroy(host, entry.target, record)
-      else
-        Target.upsert(host, entry.target, record)
+      result =
+        if entry.op == :destroy do
+          Target.destroy(host, entry.target, record, tenant: entry.tenant)
+        else
+          Target.upsert(host, entry.target, record, tenant: entry.tenant)
+        end
+
+      case normalize(result) do
+        :ok ->
+          Ash.destroy!(entry, action: :discard, domain: domain(outbox), authorize?: false)
+          kick_next(entry)
+          :ok
+
+        {:error, error} ->
+          {:error, error}
       end
-
-    case normalize(result) do
-      :ok ->
-        Ash.destroy!(entry, action: :discard, domain: domain(outbox), authorize?: false)
-        kick_next(entry)
-        :ok
-
-      {:error, error} ->
-        {:error, error}
     end
   end
 
@@ -224,23 +235,25 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   @spec rebase(Ash.Resource.record(), Ash.Changeset.t()) ::
           {:ok, Ash.Resource.record()} | {:error, term()}
   def rebase(entry, changeset) do
-    outbox = entry.__struct__
-    captured_chain = record_chain(entry)
+    with :ok <- ensure_resolvable_head(entry) do
+      outbox = entry.__struct__
+      captured_chain = record_chain(entry)
 
-    result =
-      case changeset.action_type do
-        :create -> Ash.create!(changeset)
-        :update -> Ash.update!(changeset)
-        :destroy -> Ash.destroy!(changeset)
+      result =
+        case changeset.action_type do
+          :create -> Ash.create!(changeset)
+          :update -> Ash.update!(changeset)
+          :destroy -> Ash.destroy!(changeset)
+        end
+
+      case destroy_captured_chain(outbox, captured_chain, entry) do
+        :ok ->
+          kick_next(entry)
+          {:ok, result}
+
+        {:error, _} = error ->
+          error
       end
-
-    case destroy_captured_chain(outbox, captured_chain, entry) do
-      :ok ->
-        kick_next(entry)
-        {:ok, result}
-
-      {:error, _} = error ->
-        error
     end
   end
 
@@ -259,11 +272,8 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
     domain = domain(outbox)
     ordered = Enum.sort_by(captured_chain, & &1.seq, :desc)
 
-    Ash.DataLayer.transaction(outbox, fn ->
-      Enum.each(
-        ordered,
-        &Ash.destroy!(&1, action: :discard, domain: domain, authorize?: false)
-      )
+    transaction!(outbox, fn ->
+      Enum.each(ordered, &Ash.destroy!(&1, action: :discard, domain: domain, authorize?: false))
     end)
 
     :ok
@@ -328,38 +338,38 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
     target = last_target(host_resource)
     opts = backfill_opts(host_resource, tenant)
 
-    {remote_rows, do_delete?} = remote_scope(host_resource, target, scope, tenant)
+    with {:ok, {remote_rows, do_delete?}} <- remote_scope(host_resource, target, scope, tenant) do
+      {refreshed, skipped} =
+        Enum.reduce(remote_rows, {0, []}, fn row, {n, skipped} ->
+          pk = Snapshot.record_pk(host_resource, row)
 
-    {refreshed, skipped} =
-      Enum.reduce(remote_rows, {0, []}, fn row, {n, skipped} ->
-        pk = Snapshot.record_pk(host_resource, row)
+          if dirty?(host_resource, pk, tenant) do
+            {n, [pk | skipped]}
+          else
+            :ok = Backfill.upsert_record(local, host_resource, row, opts) |> normalize_backfill()
+            {n + 1, skipped}
+          end
+        end)
 
-        if dirty?(host_resource, pk, tenant) do
-          {n, [pk | skipped]}
-        else
-          :ok = Backfill.upsert_record(local, host_resource, row, opts) |> normalize_backfill()
-          {n + 1, skipped}
+      deleted =
+        cond do
+          # `:all` scope is authoritative over the whole set — reconcile removals.
+          do_delete? ->
+            reconcile_deletes(host_resource, local, remote_rows, tenant, opts)
+
+          # A single-PK refresh whose remote row is GONE mirrors a peer's destroy:
+          # remove it locally (unless the PK is dirty — our own unflushed write wins).
+          # Without this, an inbound destroy notification (handle_external_change →
+          # refresh(pk)) left the deleted row lingering on other online clients.
+          is_map(scope) and remote_rows == [] and not dirty?(host_resource, scope, tenant) ->
+            delete_local_pk(host_resource, local, scope, tenant, opts)
+
+          true ->
+            0
         end
-      end)
 
-    deleted =
-      cond do
-        # `:all` scope is authoritative over the whole set — reconcile removals.
-        do_delete? ->
-          reconcile_deletes(host_resource, local, remote_rows, tenant, opts)
-
-        # A single-PK refresh whose remote row is GONE mirrors a peer's destroy:
-        # remove it locally (unless the PK is dirty — our own unflushed write wins).
-        # Without this, an inbound destroy notification (handle_external_change →
-        # refresh(pk)) left the deleted row lingering on other online clients.
-        is_map(scope) and remote_rows == [] and not dirty?(host_resource, scope, tenant) ->
-          delete_local_pk(host_resource, local, scope, tenant, opts)
-
-        true ->
-          0
-      end
-
-    %{refreshed: refreshed, deleted: deleted, skipped_dirty: Enum.reverse(skipped)}
+      %{refreshed: refreshed, deleted: deleted, skipped_dirty: Enum.reverse(skipped)}
+    end
   end
 
   # Destroy a single locally-held row by primary key (a peer's destroy arrived via
@@ -372,6 +382,9 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
       {:ok, local_row} ->
         :ok = normalize_backfill(Backfill.destroy_record(local, host_resource, local_row, opts))
         1
+
+      {:error, reason} ->
+        raise "local read failed during refresh delete reconciliation: #{inspect(reason)}"
     end
   end
 
@@ -391,7 +404,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   @spec handle_external_change(Ash.Resource.t(), Ash.Notifier.Notification.t()) :: :ok
   def handle_external_change(host_resource, %{data: data}) when not is_nil(data) do
     pk = Snapshot.record_pk(host_resource, data)
-    _ = refresh(host_resource, pk, tenant_of(data))
+    _ = refresh(host_resource, pk, TenantKey.record(host_resource, data, tenant_of(data)))
     :ok
   end
 
@@ -447,14 +460,17 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   # --- internals ---------------------------------------------------------
 
   defp remote_scope(host_resource, target, :all, tenant) do
-    {:ok, rows} = Target.read_all(host_resource, target, tenant: tenant)
-    {rows, true}
+    case Target.read_all(host_resource, target, tenant: tenant) do
+      {:ok, rows} -> {:ok, {rows, true}}
+      {:error, _} = error -> error
+    end
   end
 
   defp remote_scope(host_resource, target, pk, tenant) when is_map(pk) do
     case Target.read_pk(host_resource, target, pk, tenant: tenant) do
-      {:ok, nil} -> {[], false}
-      {:ok, row} -> {[row], false}
+      {:ok, nil} -> {:ok, {[], false}}
+      {:ok, row} -> {:ok, {[row], false}}
+      {:error, _} = error -> error
     end
   end
 
@@ -507,6 +523,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
       domain: domain(entry.__struct__)
     )
     |> Ash.Query.filter(state != :synced)
+    |> tenant_filter(entry.tenant)
     |> read()
   end
 
@@ -514,7 +531,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
     outbox = entry.__struct__
 
     Enum.each(
-      record_chain(entry),
+      Enum.sort_by(record_chain(entry), & &1.seq, :desc),
       &Ash.destroy!(&1, action: :discard, domain: domain(outbox), authorize?: false)
     )
   end
@@ -529,6 +546,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
       domain: domain(outbox)
     )
     |> Ash.Query.filter(state == :pending)
+    |> tenant_filter(entry.tenant)
     |> Ash.Query.sort(seq: :asc)
     |> Ash.Query.limit(1)
     |> read()
@@ -541,13 +559,17 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   defp base_query(query, host_resource, tenant) do
     key = Atom.to_string(host_resource)
     q = Ash.Query.filter(query, resource == ^key)
-    if tenant, do: Ash.Query.filter(q, tenant == ^to_string(tenant)), else: q
+    tenant_filter(q, tenant)
   end
+
+  defp tenant_filter(query, nil), do: Ash.Query.filter(query, is_nil(tenant))
+  defp tenant_filter(query, tenant), do: Ash.Query.filter(query, tenant == ^to_string(tenant))
 
   defp read(query), do: Ash.read!(query, authorize?: false)
 
   defp outbox(host_resource), do: LocalOutbox.outbox_resource(host_resource)
   defp domain(resource), do: Ash.Resource.Info.domain(resource)
+
   defp host(entry) do
     outbox = entry.__struct__
 
@@ -563,6 +585,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
                 "(resource: #{inspect(entry.resource)}) — this app no longer defines it"
     end
   end
+
   defp queue(host_resource), do: SyncInfo.queue(outbox(host_resource))
   defp instance(host_resource), do: SyncInfo.oban_instance(outbox(host_resource))
   defp read_order(host_resource), do: AshMultiDatalayer.DataLayer.Info.read_order(host_resource)
@@ -576,6 +599,32 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
 
   defp tenant_of(%{__metadata__: %{tenant: tenant}}), do: tenant
   defp tenant_of(_), do: nil
+
+  defp ensure_resolvable_head(entry) do
+    cond do
+      entry.state == :synced ->
+        :ok
+
+      entry.state != :parked ->
+        {:error, :not_parked}
+
+      not AshMultiDatalayer.Orchestrator.LocalOutbox.Flush.chain_head?(
+        entry.__struct__,
+        domain(entry.__struct__),
+        entry
+      ) ->
+        {:error, :not_chain_head}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp transaction!(outbox, fun) do
+    repo = Module.concat(Ash.DataLayer.data_layer(outbox), Info).repo(outbox, :mutate)
+    {:ok, _} = repo.transaction(fn -> fun.() end)
+    :ok
+  end
 
   defp normalize(:ok), do: :ok
   defp normalize({:ok, _}), do: :ok

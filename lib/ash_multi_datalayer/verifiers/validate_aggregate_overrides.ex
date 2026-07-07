@@ -1,6 +1,6 @@
 defmodule AshMultiDatalayer.Verifiers.ValidateAggregateOverrides do
   @moduledoc """
-  Rejects `sql_join_aggregate_overrides` entries that don't name an aggregate on
+  Rejects aggregate override entries that don't name an aggregate on
   the resource — a typo would otherwise silently fold nothing (the real
   aggregate would join by default), so we catch it loudly at compile time.
   """
@@ -21,28 +21,34 @@ defmodule AshMultiDatalayer.Verifiers.ValidateAggregateOverrides do
   end
 
   defp verify_overrides(dsl_state) do
-    overrides =
-      Verifier.get_option(dsl_state, [:multi_data_layer], :sql_join_aggregate_overrides, [])
-
     aggregate_names =
       dsl_state
       |> Ash.Resource.Info.aggregates()
       |> MapSet.new(& &1.name)
 
-    case Enum.reject(overrides, &MapSet.member?(aggregate_names, &1)) do
-      [] ->
-        :ok
+    Enum.reduce_while(
+      [:sql_join_aggregate_overrides, :fold_aggregate_overrides, :local_evaluation_overrides],
+      :ok,
+      fn option, :ok ->
+        overrides = Verifier.get_option(dsl_state, [:multi_data_layer], option, [])
 
-      unknown ->
-        {:error,
-         Spark.Error.DslError.exception(
-           module: Verifier.get_persisted(dsl_state, :module),
-           path: [:multi_data_layer, :sql_join_aggregate_overrides],
-           message:
-             "#{inspect(unknown)} in `sql_join_aggregate_overrides` " <>
-               "#{if length(unknown) == 1, do: "is not an aggregate", else: "are not aggregates"} " <>
-               "on this resource. Only relationship aggregates can be overridden to fold."
-         )}
-    end
+        case Enum.reject(overrides, &MapSet.member?(aggregate_names, &1)) do
+          [] -> {:cont, :ok}
+          unknown -> {:halt, unknown_override_error(dsl_state, option, unknown)}
+        end
+      end
+    )
+  end
+
+  defp unknown_override_error(dsl_state, option, unknown) do
+    {:error,
+     Spark.Error.DslError.exception(
+       module: Verifier.get_persisted(dsl_state, :module),
+       path: [:multi_data_layer, option],
+       message:
+         "#{inspect(unknown)} in `#{option}` " <>
+           "#{if length(unknown) == 1, do: "is not an aggregate", else: "are not aggregates"} " <>
+           "on this resource. Only relationship aggregates can be overridden."
+     )}
   end
 end

@@ -67,7 +67,8 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxResolutionTest do
   end
 
   setup do
-    for t <- ~w(lo_widgets lo_timestamp_widgets lo_ifempty_widgets lo_failable_local_widgets lo_outbox oban_jobs) do
+    for t <-
+          ~w(lo_widgets lo_timestamp_widgets lo_ifempty_widgets lo_failable_local_widgets lo_outbox oban_jobs) do
       Ecto.Adapters.SQL.query!(SkeletonRepo, "DELETE FROM #{t}", [])
     end
 
@@ -125,7 +126,9 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxResolutionTest do
          %{widget: w, parked: parked} do
       :ok = LocalOutbox.pause_sync(Widget)
 
-      changeset = Ash.Changeset.for_update(w, :update, %{name: "resolved", count: 99}, domain: Domain)
+      changeset =
+        Ash.Changeset.for_update(w, :update, %{name: "resolved", count: 99}, domain: Domain)
+
       assert {:ok, _resolved} = LocalOutbox.rebase(parked, changeset)
 
       # (a) a :pending outbox entry exists for the resolved write immediately
@@ -269,8 +272,7 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxResolutionTest do
             multi_data_layer do
               orchestrator(
                 {AshMultiDatalayer.Orchestrator.LocalOutbox,
-                 outbox_resource: AshMultiDatalayer.Test.LocalOutbox.OutboxEntry,
-                 hydrate: :manual}
+                 outbox_resource: AshMultiDatalayer.Test.LocalOutbox.OutboxEntry, hydrate: :manual}
               )
 
               layer(:local, Ash.DataLayer.Ets)
@@ -402,7 +404,10 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxResolutionTest do
   # supervisor — extracts the `Task.start_link/1` MFA from the child_spec and
   # awaits it directly (the same function boot would run).
   defp run_boot_hydrate!(resource) do
-    [spec] = LocalOutbox.child_specs([resource])
+    spec =
+      LocalOutbox.child_specs([resource])
+      |> Enum.find(fn spec -> match?({_, :hydrate, ^resource}, spec.id) end)
+
     {Task, :start_link, [fun]} = spec.start
     Task.await(Task.async(fun))
   end
@@ -417,7 +422,8 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxResolutionTest do
   end
 
   defp define(body) do
-    module = :"Elixir.AshMultiDatalayer.Integration.LocalOutboxResolutionTest.R#{System.unique_integer([:positive])}"
+    module =
+      :"Elixir.AshMultiDatalayer.Integration.LocalOutboxResolutionTest.R#{System.unique_integer([:positive])}"
 
     Module.create(
       module,

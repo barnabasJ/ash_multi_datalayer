@@ -311,6 +311,10 @@ defmodule AshMultiDatalayer.DataLayer do
   defp default_can?(_resource, :update_query), do: false
   defp default_can?(_resource, :destroy_query), do: false
   defp default_can?(_resource, {:atomic, _}), do: false
+  defp default_can?(_resource, :bulk_create), do: false
+  defp default_can?(_resource, {:bulk_create, _}), do: false
+  defp default_can?(_resource, :aggregate_filter), do: false
+  defp default_can?(_resource, {:query_aggregate, _}), do: false
   defp default_can?(_resource, :async_engine), do: false
 
   defp default_can?(resource, :multitenancy) do

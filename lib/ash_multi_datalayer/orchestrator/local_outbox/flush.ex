@@ -81,6 +81,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
         authorize?: false
       )
       |> Ash.Query.filter(seq < ^entry.seq and state != :synced)
+      |> tenant_filter(entry.tenant)
       |> Ash.read!(authorize?: false)
 
     cond do
@@ -143,6 +144,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
       authorize?: false
     )
     |> Ash.Query.filter(state == :pending)
+    |> tenant_filter(entry.tenant)
     |> Ash.Query.sort(seq: :asc)
     |> Ash.Query.limit(1)
     |> Ash.read!(authorize?: false)
@@ -152,18 +154,29 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
     end
   end
 
+  defp tenant_filter(query, nil), do: Ash.Query.filter(query, is_nil(tenant))
+  defp tenant_filter(query, tenant), do: Ash.Query.filter(query, tenant == ^to_string(tenant))
+
   # --- push to the target -----------------------------------------------
 
   @doc false
   def push(host, %{op: :destroy} = entry) do
     with :ok <- check_stale(host, entry) do
-      normalize(Target.destroy(host, entry.target, Target.record_from_entry(host, entry)))
+      normalize(
+        Target.destroy(host, entry.target, Target.record_from_entry(host, entry),
+          tenant: entry.tenant
+        )
+      )
     end
   end
 
   def push(host, entry) do
     with :ok <- check_stale(host, entry) do
-      normalize(Target.upsert(host, entry.target, Target.record_from_entry(host, entry)))
+      normalize(
+        Target.upsert(host, entry.target, Target.record_from_entry(host, entry),
+          tenant: entry.tenant
+        )
+      )
     end
   end
 
@@ -181,20 +194,28 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
   end
 
   defp stale_check(host, entry, field) do
-    case Target.read_pk(host, entry.target, entry.record_pk) do
+    case Target.read_pk(host, entry.target, entry.record_pk, tenant: entry.tenant) do
       {:ok, nil} ->
-        :ok
+        if entry.op == :update and not is_nil(entry.base_image) do
+          {:conflict, nil}
+        else
+          :ok
+        end
 
       {:ok, remote} ->
-        # `base_image` was stored in the outbox's `:map` attribute and read back
-        # through a JSON round-trip, so its values are JSON scalars (a
-        # `DateTime` became an ISO string). Normalise the freshly-dumped remote
-        # value the same way before comparing — otherwise a stale-check on a
-        # `:utc_datetime_usec`/`:decimal` field would compare a string to a
-        # struct and park EVERY flush as a false conflict.
-        expected = json_scalar(entry.base_image && entry.base_image[to_string(field)])
-        actual = json_scalar(dump_field(host, field, Map.get(remote, field)))
-        if expected == actual, do: :ok, else: {:conflict, Snapshot.dump(host, remote)}
+        if remote_matches_payload?(host, entry, remote) do
+          :ok
+        else
+          # `base_image` was stored in the outbox's `:map` attribute and read back
+          # through a JSON round-trip, so its values are JSON scalars (a
+          # `DateTime` became an ISO string). Normalise the freshly-dumped remote
+          # value the same way before comparing — otherwise a stale-check on a
+          # `:utc_datetime_usec`/`:decimal` field would compare a string to a
+          # struct and park EVERY flush as a false conflict.
+          expected = json_scalar(entry.base_image && entry.base_image[to_string(field)])
+          actual = json_scalar(dump_field(host, field, Map.get(remote, field)))
+          if expected == actual, do: :ok, else: {:conflict, Snapshot.dump(host, remote)}
+        end
 
       {:error, error} ->
         {:error, error}
@@ -205,6 +226,12 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
     attribute = Ash.Resource.Info.attribute(host, field)
     {:ok, dumped} = Ash.Type.dump_to_embedded(attribute.type, value, attribute.constraints)
     dumped
+  end
+
+  defp remote_matches_payload?(_host, %{payload: nil}, _remote), do: false
+
+  defp remote_matches_payload?(host, entry, remote) do
+    Snapshot.dump(host, remote) == entry.payload
   end
 
   # Reduce a value to the JSON scalar the outbox `:map` round-trip would yield,
@@ -231,6 +258,8 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
   def classify(%{class: :invalid}), do: :rejected
   def classify(%Ash.Error.Forbidden{}), do: :auth
   def classify(%{class: :forbidden}), do: :auth
+  def classify({:http_error, status, _}) when status in [401, 403], do: :auth
+  def classify(%{status: status}) when status in [401, 403], do: :auth
   def classify(_error), do: :transient
 
   defp error_map({_tag, reason}), do: %{"reason" => inspect(reason)}

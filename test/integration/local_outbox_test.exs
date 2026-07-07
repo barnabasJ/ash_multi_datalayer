@@ -354,7 +354,12 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
       id = Ash.UUID.generate()
       Target.upsert(Widget, :remote, %Widget{id: id, name: "pushed-by-peer", count: 3})
 
-      notification = %Ash.Notifier.Notification{resource: Widget, data: %Widget{id: id}}
+      notification = %Ash.Notifier.Notification{
+        resource: Widget,
+        data: %Widget{id: id},
+        metadata: %{ash_remote: %{origin: :remote}}
+      }
+
       assert :ok = AshMultiDatalayer.Notifiers.ExternalChange.notify(notification)
 
       assert [%{id: ^id, name: "pushed-by-peer"}] = local()

@@ -72,7 +72,11 @@ defmodule AshMultiDatalayer.Notifiers.ExternalChangeExitTest do
   end
 
   test "an :exit inside the orchestrator's reaction is caught, warned, and swallowed" do
-    notification = %Ash.Notifier.Notification{resource: ExitingPost, data: %ExitingPost{}}
+    notification = %Ash.Notifier.Notification{
+      resource: ExitingPost,
+      data: %ExitingPost{},
+      metadata: %{"ash_remote" => %{"origin" => "remote"}}
+    }
 
     log =
       capture_log(fn ->
@@ -81,5 +85,13 @@ defmodule AshMultiDatalayer.Notifiers.ExternalChangeExitTest do
 
     assert log =~ "inbound reaction"
     assert log =~ "reaction_timeout"
+  end
+
+  test "local unmarked notifications are ignored" do
+    notification = %Ash.Notifier.Notification{resource: ExitingPost, data: %ExitingPost{}}
+
+    log = capture_log(fn -> assert :ok = ExternalChange.notify(notification) end)
+
+    assert log == ""
   end
 end

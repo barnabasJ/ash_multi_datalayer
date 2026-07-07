@@ -5,8 +5,8 @@ defmodule AshMultiDatalayer.RemoteContext do
   do not ride a caller's changeset/query and therefore carry no ambient actor.
 
   The motivating case is the LocalOutbox strategy: flush pushes and hydration/
-  stale-check reads run in a background Oban worker (or the MDL sweeper), built
-  from stored outbox rows. There is no request actor in scope, so a networked
+  stale-check reads run in a background Oban worker, built from stored outbox
+  rows. There is no request actor in scope, so a networked
   replication target (e.g. `AshRemote.DataLayer`, which authenticates from
   `context[:private][:actor]` or `context[:ash_remote][:headers]`) would push/
   read unauthenticated. Configure a context provider and MDL threads it through:

@@ -59,7 +59,7 @@ defmodule AshMultiDatalayer.Supervisor do
   defp discover_resources(opts) do
     cond do
       resources = opts[:resources] ->
-        resources
+        Enum.filter(resources, &multi_datalayer?/1)
 
       otp_app = opts[:otp_app] ->
         otp_app

@@ -23,8 +23,9 @@ defmodule AshMultiDatalayer.Verifiers.ValidateLayers do
     with :ok <- unique_names(dsl_state, layers),
          :ok <- orders_reference_layers(dsl_state, layers),
          :ok <- layers_implement_behaviour(dsl_state, layers),
-         :ok <- required_sections_present(dsl_state, layers) do
-      upsert_capable_cache_layers(dsl_state)
+         :ok <- required_sections_present(dsl_state, layers),
+         :ok <- upsert_capable_cache_layers(dsl_state) do
+      proven_coverage_authority_order(dsl_state)
     end
   end
 
@@ -140,6 +141,19 @@ defmodule AshMultiDatalayer.Verifiers.ValidateLayers do
     module.can?(dsl_state, feature)
   rescue
     _ -> false
+  end
+
+  defp proven_coverage_authority_order(dsl_state) do
+    if Info.proven_coverage?(dsl_state) and
+         List.last(Info.read_order(dsl_state)) != hd(Info.write_order(dsl_state)) do
+      error(
+        dsl_state,
+        "ProvenCoverage requires the read source authority (last read_order) to equal " <>
+          "the write authority (hd write_order)"
+      )
+    else
+      :ok
+    end
   end
 
   defp error(dsl_state, message) do

@@ -90,7 +90,9 @@ defmodule AshMultiDatalayer.Integration.ReconcileEpochRaceTest do
         [:ash_multi_datalayer, :read, :hit],
         [:ash_multi_datalayer, :read, :miss]
       ],
-      fn event, _measurements, _metadata, _config -> send(parent, {:mdl_read, List.last(event)}) end,
+      fn event, _measurements, _metadata, _config ->
+        send(parent, {:mdl_read, List.last(event)})
+      end,
       nil
     )
 

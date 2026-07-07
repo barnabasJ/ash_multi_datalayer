@@ -31,6 +31,7 @@ defmodule AshMultiDatalayer.WriteDispatch do
   alias AshMultiDatalayer.Coverage.Invalidation
   alias AshMultiDatalayer.DataLayer.Info
   alias AshMultiDatalayer.KillSwitch
+  alias AshMultiDatalayer.TenantKey
   alias AshMultiDatalayer.Telemetry
 
   @spec create(module(), Ash.Changeset.t()) ::
@@ -53,7 +54,7 @@ defmodule AshMultiDatalayer.WriteDispatch do
           {:ok, Ash.Resource.record()} | {:error, term()}
   def upsert(resource, changeset, keys, identity) do
     dispatch(resource, changeset, :upsert, fn layer ->
-      case Ash.DataLayer.run_upsert(layer, resource, changeset, keys, identity) do
+      case run_layer_upsert(layer, resource, changeset, keys, identity) do
         {:ok, {:upsert_skipped, _query, _callback} = skipped} -> {:ok, skipped}
         other -> other
       end
@@ -75,14 +76,14 @@ defmodule AshMultiDatalayer.WriteDispatch do
 
   defp dispatch(resource, changeset, operation, authoritative_write) do
     [authoritative | rest] = Info.write_layer_modules(resource)
-    tenant = changeset.tenant
     started = System.monotonic_time()
 
-    with {:ok, record} <- authoritative_write.(authoritative) do
+    with {:ok, record} <- normalize_result(authoritative_write.(authoritative)) do
+      tenant = TenantKey.changeset(resource, changeset, record)
       dropped = invalidate(resource, tenant, changeset, operation, record)
 
       if KillSwitch.enabled?(resource) do
-        propagate(rest, resource, changeset, operation, record)
+        propagate(rest, resource, changeset, operation, record, tenant)
       end
 
       Telemetry.write(
@@ -118,8 +119,8 @@ defmodule AshMultiDatalayer.WriteDispatch do
   defp row_change(changeset, :destroy, _record), do: {changeset.data, nil}
   defp row_change(_changeset, :upsert, _record), do: :no_before_image
 
-  defp propagate(layers, resource, changeset, operation, record) do
-    opts = [tenant: changeset.tenant, domain: changeset.domain]
+  defp propagate(layers, resource, changeset, operation, record, tenant) do
+    opts = [tenant: tenant, domain: changeset.domain]
 
     Enum.each(layers, fn layer ->
       result =
@@ -128,7 +129,7 @@ defmodule AshMultiDatalayer.WriteDispatch do
           _write -> propagate_upsert(layer, resource, record, opts)
         end
 
-      case result do
+      case normalize_result(result) do
         :ok ->
           :ok
 
@@ -142,7 +143,7 @@ defmodule AshMultiDatalayer.WriteDispatch do
               "invalidated, so the next read falls through (miss, not staleness)"
           )
 
-          Telemetry.write(:failed_at_layer, resource, changeset.tenant, %{}, %{
+          Telemetry.write(:failed_at_layer, resource, tenant, %{}, %{
             operation: operation,
             layer: layer,
             reason: reason
@@ -156,5 +157,19 @@ defmodule AshMultiDatalayer.WriteDispatch do
 
   defp propagate_upsert(layer, resource, record, opts) do
     Backfill.upsert_record(layer, resource, record, opts)
+  end
+
+  defp normalize_result({:error, :no_rollback, reason}), do: {:error, reason}
+  defp normalize_result(other), do: other
+
+  # Mirrors Ash.DataLayer.upsert/4's arity dispatch for an explicitly delegated layer.
+  defp run_layer_upsert(layer, resource, changeset, keys, identity) do
+    changeset = %{changeset | tenant: changeset.to_tenant}
+
+    if Code.ensure_loaded?(layer) and function_exported?(layer, :upsert, 4) do
+      Ash.DataLayer.run_upsert(layer, resource, changeset, keys, identity)
+    else
+      Ash.DataLayer.run_upsert(layer, resource, changeset, keys)
+    end
   end
 end

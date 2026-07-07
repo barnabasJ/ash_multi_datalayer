@@ -25,6 +25,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
   alias AshMultiDatalayer.Orchestrator.LocalOutbox
   alias AshMultiDatalayer.Orchestrator.LocalOutbox.{Snapshot, Target}
   alias AshMultiDatalayer.Sync.Enqueue
+  alias AshMultiDatalayer.TenantKey
 
   @doc false
   def run(resource, changeset, op) do
@@ -53,21 +54,25 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
     op_atom = op_atom(op)
     record_pk = Snapshot.record_pk(resource, changeset.data)
 
-    with :ok <- drain_chain_inline(resource, record_pk),
+    tenant = TenantKey.changeset(resource, changeset, changeset.data)
+
+    with :ok <- drain_chain_inline(resource, record_pk, tenant),
          {:ok, record, fields} <- materialize(resource, changeset, op),
-         :ok <- push_all_targets(resource, op_atom, record, fields),
+         :ok <- push_all_targets(resource, op_atom, record, fields, tenant),
          {:ok, local_record} <- local_write(local, resource, changeset, op) do
       finalize_write_through(op, local_record)
     end
   end
 
-  defp drain_chain_inline(resource, record_pk) do
+  defp drain_chain_inline(resource, record_pk, tenant) do
     outbox = LocalOutbox.outbox_resource(resource)
     key = Atom.to_string(resource)
+    tenant_key = stringify(tenant)
 
     outbox
     |> Ash.Query.for_read(:read, %{}, domain: Ash.Resource.Info.domain(outbox))
     |> Ash.Query.filter(resource == ^key and record_pk == ^record_pk and state != :synced)
+    |> tenant_filter(tenant_key)
     |> Ash.Query.sort(seq: :asc)
     |> Ash.read!(authorize?: false)
     |> Enum.reduce_while(:ok, fn entry, :ok ->
@@ -91,6 +96,9 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
       end
     end)
   end
+
+  defp tenant_filter(query, nil), do: Ash.Query.filter(query, is_nil(tenant))
+  defp tenant_filter(query, tenant), do: Ash.Query.filter(query, tenant == ^to_string(tenant))
 
   # Materializes the record write_through pushes to targets — WITHOUT running
   # the local write yet (M-2's reorder: targets first, local last). A destroy
@@ -137,7 +145,8 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
   end
 
   defp reject_nil_create_pk(resource, %{action_type: :create}, record) do
-    nil_pk_fields = resource |> Ash.Resource.Info.primary_key() |> Enum.filter(&is_nil(Map.get(record, &1)))
+    nil_pk_fields =
+      resource |> Ash.Resource.Info.primary_key() |> Enum.filter(&is_nil(Map.get(record, &1)))
 
     if nil_pk_fields == [] do
       :ok
@@ -175,13 +184,13 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
   defp loaded?(%Ash.NotLoaded{}), do: false
   defp loaded?(_), do: true
 
-  defp push_all_targets(resource, op_atom, record, fields) do
+  defp push_all_targets(resource, op_atom, record, fields, tenant) do
     Enum.reduce_while(LocalOutbox.targets(resource), :ok, fn target, :ok ->
       result =
         if op_atom == :destroy do
-          normalize(Target.destroy(resource, target, record))
+          normalize(Target.destroy(resource, target, record, tenant: tenant))
         else
-          normalize(Target.upsert(resource, target, record, fields: fields))
+          normalize(Target.upsert(resource, target, record, fields: fields, tenant: tenant))
         end
 
       case result do
@@ -196,6 +205,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
 
   defp normalize(:ok), do: :ok
   defp normalize({:ok, _}), do: :ok
+  defp normalize({:error, :no_rollback, error}), do: {:error, error}
   defp normalize({:error, error}), do: {:error, error}
 
   # --- async (default) write path ---------------------------------------
@@ -217,8 +227,10 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
 
     case committed do
       {:ok, record, entries} ->
-        # Post-commit kick — after the write is durable; a lost kick is recovered
-        # by the MDL sweeper (rows are the truth, jobs are ephemeral pointers).
+        # Post-commit kick — after the write is durable. Rows are the truth,
+        # jobs are ephemeral pointers: a lost kick leaves the entry pending
+        # until the next kick reaches its host chain (a later write, retry/1,
+        # or resume_sync/1) — there is no background sweeper.
         Enum.each(entries, &Enqueue.flush(outbox, &1))
         finalize(op, record, write_ref)
 
@@ -240,7 +252,14 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
   end
 
   defp local_write(local, resource, changeset, {:upsert, keys, identity}) do
-    Ash.DataLayer.run_upsert(local, resource, changeset, keys, identity)
+    changeset = %{changeset | tenant: changeset.to_tenant}
+
+    if Code.ensure_loaded?(local) and function_exported?(local, :upsert, 4) do
+      Ash.DataLayer.run_upsert(local, resource, changeset, keys, identity)
+    else
+      Ash.DataLayer.run_upsert(local, resource, changeset, keys)
+    end
+    |> normalize_upsert()
   end
 
   # --- outbox enqueue (one entry per target) ----------------------------
@@ -251,7 +270,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
     record_pk = Snapshot.record_pk(resource, record)
     payload = payload(op_atom, resource, record)
     base_image = base_image(op_atom, resource, changeset)
-    tenant = stringify(changeset.tenant)
+    tenant = resource |> TenantKey.changeset(changeset, record) |> stringify()
 
     for target <- targets do
       outbox
@@ -291,6 +310,9 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
   defp stringify(nil), do: nil
   defp stringify(tenant) when is_binary(tenant), do: tenant
   defp stringify(tenant), do: to_string(tenant)
+
+  defp normalize_upsert({:error, :no_rollback, reason}), do: {:error, reason}
+  defp normalize_upsert(other), do: other
 
   # --- co-commit transaction --------------------------------------------
 

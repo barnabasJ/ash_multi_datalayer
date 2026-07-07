@@ -84,14 +84,14 @@ defmodule AshMultiDatalayer.Orchestrator do
   @doc """
   React to a per-record change that arrived out of band (e.g. an `ash_remote`
   realtime notification). ProvenCoverage invalidates matching coverage;
-  LocalOutbox refreshes the local layer. *Implemented in Phase 4.*
+  LocalOutbox refreshes the local layer.
   """
   @callback handle_external_change(Ash.Resource.t(), Ash.Notifier.Notification.t()) :: :ok
 
   @doc """
   React to a notification gap (resubscribe/join-denied — writes possibly
   missed). ProvenCoverage drops the ledger for resource+tenant; LocalOutbox runs
-  a full reconcile. *Implemented in Phase 4.*
+  a full reconcile.
   """
   @callback handle_external_gap(Ash.Resource.t(), tenant :: term()) :: :ok
 

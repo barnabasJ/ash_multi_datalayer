@@ -10,11 +10,18 @@ defmodule AshMultiDatalayer.Telemetry do
       `%{cached, fetched}` row counts)
     * `[:read, :miss]` — a read that fell through (metadata `reason:` one of
       `:no_coverage_entry`, `:solver_unsupported`, `:fields_insufficient`,
-      `:not_cacheable`, `:calc_sort_source_only`, `:ledger_unavailable`)
+      `:not_cacheable`, `:calc_sort_source_only`, `:ledger_unavailable`,
+      `:stale_cache`)
     * `[:read, :forced]` — a read routed raw to a named layer via the
       `read_from` context escape hatch (metadata `%{layer}`)
+    * `[:read, :aggregate_read]` — a read whose relationship aggregates were
+      resolved by MDL (metadata `%{joined, folded}` counts: SQL-joined on the
+      source vs. folded from cached related rows)
     * `[:read, :backfill]` — fetched rows upserted into earlier layers +
       the filter recorded in the ledger
+    * `[:read, :backfill_aborted]` — a backfill (or its reconcile pass) was
+      skipped or discarded (metadata `reason:` `:epoch_moved`,
+      `:epoch_moved_at_record`, or `:reconcile_scan_failed`)
     * `[:read, :divergence_detected]` — a sampled cache hit disagreed with
       the source of truth (measurements `%{cache_count, primary_count}`,
       metadata includes `pk_delta`)

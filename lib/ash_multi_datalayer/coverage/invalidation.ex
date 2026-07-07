@@ -122,8 +122,8 @@ defmodule AshMultiDatalayer.Coverage.Invalidation do
   # external notification handler — neither may crash. The residue of a
   # failed evict (a surviving ghost row, with its covering entries already
   # dropped above) is exactly what the read-path reconcile pass
-  # (`AshMultiDatalayer.DataLayer`'s `maybe_backfill`) cleans up as defense
-  # in depth.
+  # (`AshMultiDatalayer.Orchestrator.ProvenCoverage`'s `maybe_backfill`/
+  # `reconcile`) cleans up as defense in depth.
   #
   # Cost note: for a LOCAL write through `WriteDispatch`, this evict is
   # redundant churn — propagation re-upserts the fresh returned record

@@ -30,8 +30,14 @@ defmodule AshMultiDatalayer.Notifiers.ExternalChange do
 
   @impl Ash.Notifier
   def notify(%Ash.Notifier.Notification{resource: resource} = notification) do
-    {orchestrator, _opts} = Info.orchestrator(resource)
-    orchestrator.handle_external_change(resource, notification)
+    if replayed_external?(notification) do
+      {orchestrator, _opts} = Info.orchestrator(resource)
+
+      if function_exported?(orchestrator, :handle_external_change, 2) do
+        orchestrator.handle_external_change(resource, notification)
+      end
+    end
+
     :ok
   rescue
     # An inbound reaction must never crash the notifying transaction/socket; a
@@ -62,4 +68,15 @@ defmodule AshMultiDatalayer.Notifiers.ExternalChange do
         Exception.format_stacktrace(stacktrace)
     )
   end
+
+  defp replayed_external?(%{metadata: %{"ash_remote" => %{"origin" => origin}}})
+       when origin in [:remote, "remote"],
+       do: true
+
+  defp replayed_external?(%{metadata: %{ash_remote: %{origin: origin}}})
+       when origin in [:remote, "remote"],
+       do: true
+
+  defp replayed_external?(%{metadata: %{external?: true}}), do: true
+  defp replayed_external?(_), do: false
 end

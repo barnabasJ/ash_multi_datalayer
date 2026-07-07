@@ -52,8 +52,10 @@ defmodule AshMultiDatalayer.Capability do
   @spec custom_expressions(term()) :: [struct()]
   def custom_expressions(expression), do: collect(expression, [])
 
-  defp collect(%Ash.CustomExpression{} = custom, acc),
-    do: collect(custom.expression, [custom | acc])
+  defp collect(%Ash.CustomExpression{} = custom, acc) do
+    custom.simple_expression
+    |> collect(collect(custom.expression, [custom | acc]))
+  end
 
   defp collect(list, acc) when is_list(list),
     do: Enum.reduce(list, acc, &collect/2)

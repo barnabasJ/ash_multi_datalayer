@@ -38,6 +38,7 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
   alias AshMultiDatalayer.DataLayer.Query
   alias AshMultiDatalayer.Delegate
   alias AshMultiDatalayer.KillSwitch
+  alias AshMultiDatalayer.TenantKey
   alias AshMultiDatalayer.Telemetry
 
   # Relationship-aggregate kinds we compute over a related resource — by a SQL
@@ -174,7 +175,8 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
         :ok
 
       record ->
-        AshMultiDatalayer.forget!(resource, record, tenant: notification_tenant(notification))
+        tenant = notification_tenant(resource, notification)
+        AshMultiDatalayer.forget!(resource, record, tenant: tenant)
     end
 
     :ok
@@ -188,8 +190,14 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
     :ok
   end
 
-  defp notification_tenant(%{changeset: %{tenant: tenant}}), do: tenant
-  defp notification_tenant(_), do: nil
+  defp notification_tenant(resource, %{changeset: changeset, data: record})
+       when not is_nil(changeset) do
+    TenantKey.changeset(resource, changeset, record)
+  end
+
+  defp notification_tenant(resource, %{data: record}) when not is_nil(record) do
+    TenantKey.record(resource, record)
+  end
 
   # --- writes ------------------------------------------------------------
 
@@ -227,7 +235,7 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
           resource,
           read_layers,
           :not_cacheable,
-          Coverage.epoch(resource, query.tenant)
+          coverage_epoch(resource, query)
         )
 
       sort_references_uncomputable_calc?(query, resource, hd(read_layers)) ->
@@ -242,7 +250,7 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
           resource,
           read_layers,
           :calc_sort_source_only,
-          Coverage.epoch(resource, query.tenant)
+          coverage_epoch(resource, query)
         )
 
       related_aggregates?(query, resource) ->
@@ -259,7 +267,7 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
           resource,
           read_layers,
           :not_cacheable,
-          Coverage.epoch(resource, query.tenant)
+          coverage_epoch(resource, query)
         )
 
       computed? ->
@@ -483,7 +491,9 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
   defp coverage_read(%Query{} = query, resource, read_layers) do
     started = System.monotonic_time()
 
-    case Coverage.covers?(resource, query.tenant, query) do
+    tenant = coverage_tenant(resource, query)
+
+    case Coverage.covers?(resource, tenant, query) do
       {:ok, _entry} ->
         with {:ok, records} <- Delegate.run_on_layer(query, hd(read_layers)) do
           emit_read(:hit, query, resource, started, %{})
@@ -497,7 +507,7 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
         # remainder branch) — a snapshot taken only before the source fetch
         # would be blind to a writer landing between the two halves
         # (review-1 C-P1 / review-2 F5).
-        epoch0 = Coverage.epoch(resource, query.tenant)
+        epoch0 = Coverage.epoch(resource, tenant)
 
         case remainder_plan(query, resource) do
           {:ok, coverage, complement} ->
@@ -518,7 +528,7 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
     if remainder_applicable?(query, resource) do
       needed = Coverage.needed_fields(query, resource)
 
-      case Coverage.coverage_split(resource, query.tenant, needed) do
+      case Coverage.coverage_split(resource, coverage_tenant(resource, query), needed) do
         :none -> :none
         {coverage, complement} -> {:ok, coverage, complement}
       end
@@ -606,7 +616,8 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
     cache_query = %{query | calculations: local_calcs, aggregates: []}
     source_query = %{query | calculations: source_calcs}
 
-    with {:ok, _entry} <- Coverage.covers?(resource, query.tenant, cache_query),
+    with {:ok, _entry} <-
+           Coverage.covers?(resource, coverage_tenant(resource, query), cache_query),
          {:ok, rows} <- Delegate.run_on_layer(cache_query, cache_layer) do
       case AshMultiDatalayer.ValueMerge.merge(
              source_query,
@@ -630,7 +641,7 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
             resource,
             read_layers,
             :stale_cache,
-            Coverage.epoch(resource, query.tenant)
+            coverage_epoch(resource, query)
           )
 
         {:error, error} ->
@@ -638,7 +649,7 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
       end
     else
       {:miss, reason} ->
-        source_read(query, resource, read_layers, reason, Coverage.epoch(resource, query.tenant))
+        source_read(query, resource, read_layers, reason, coverage_epoch(resource, query))
 
       {:error, error} ->
         {:error, error}
@@ -696,7 +707,7 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
       not (gate and earlier_layers != []) ->
         :ok
 
-      Coverage.epoch_moved?(resource, query.tenant, epoch0) ->
+      Coverage.epoch_moved?(resource, coverage_tenant(resource, query), epoch0) ->
         # A write raced this read before the backfill even started: the
         # fetched rows are still returned to the caller (the read result
         # itself is not stale), but caching them would be unsafe.
@@ -714,19 +725,31 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
 
         case Backfill.upsert_records(earlier_layers, resource, source_rows, backfill_opts) do
           :ok ->
-            reconcile(query, resource, earlier_layers, source_rows, opts[:complement])
-
-            case Coverage.record(resource, query.tenant, query, epoch0, probe) do
+            case reconcile(query, resource, earlier_layers, source_rows, opts[:complement]) do
               :ok ->
-                emit_read(:backfill, query, resource, started, %{records: length(source_rows)})
+                case Coverage.record(
+                       resource,
+                       coverage_tenant(resource, query),
+                       query,
+                       epoch0,
+                       probe
+                     ) do
+                  :ok ->
+                    emit_read(:backfill, query, resource, started, %{records: length(source_rows)})
 
-              :skipped ->
+                  :skipped ->
+                    :ok
+
+                  :epoch_moved ->
+                    evict_backfilled_rows(earlier_layers, resource, source_rows, query)
+
+                    Telemetry.read(:backfill_aborted, resource, query, %{}, %{
+                      reason: :epoch_moved_at_record
+                    })
+                end
+
+              {:error, :reconcile_scan_failed} ->
                 :ok
-
-              :epoch_moved ->
-                Telemetry.read(:backfill_aborted, resource, query, %{}, %{
-                  reason: :epoch_moved_at_record
-                })
             end
 
           {:error, layer, reason} ->
@@ -764,8 +787,8 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
   defp reconcile(_query, _resource, _earlier_layers, _source_rows, :empty), do: :ok
 
   defp reconcile(%Query{} = query, resource, earlier_layers, source_rows, complement) do
-    [pk] = Ash.Resource.Info.primary_key(resource)
-    fetched_pks = MapSet.new(source_rows, &Map.fetch!(&1, pk))
+    primary_key = Ash.Resource.Info.primary_key(resource)
+    fetched_pks = MapSet.new(source_rows, &Map.take(&1, primary_key))
 
     reconcile_query = %Query{
       resource: resource,
@@ -791,14 +814,32 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
     # and joins the epoch protocol doing it (M-3), unlike a bare per-ghost
     # `evict_ghost/4` (which has no epoch/ledger awareness at all).
     ghosts =
-      Enum.flat_map(
-        earlier_layers,
-        &scan_layer_ghosts(&1, reconcile_query, resource, query, pk, fetched_pks)
-      )
+      Enum.reduce_while(earlier_layers, [], fn layer, acc ->
+        case scan_layer_ghosts(layer, reconcile_query, resource, query, primary_key, fetched_pks) do
+          {:ok, ghosts} -> {:cont, acc ++ ghosts}
+          {:error, _} -> {:halt, {:error, :reconcile_scan_failed}}
+        end
+      end)
 
-    unless ghosts == [] do
-      Invalidation.on_evict(resource, query.tenant, Enum.map(ghosts, &elem(&1, 1)))
-      Enum.each(ghosts, fn {layer, ghost_row} -> evict_ghost(layer, resource, ghost_row, query) end)
+    case ghosts do
+      {:error, :reconcile_scan_failed} ->
+        {:error, :reconcile_scan_failed}
+
+      [] ->
+        :ok
+
+      ghosts ->
+        Invalidation.on_evict(
+          resource,
+          coverage_tenant(resource, query),
+          Enum.map(ghosts, &elem(&1, 1))
+        )
+
+        Enum.each(ghosts, fn {layer, ghost_row} ->
+          evict_ghost(layer, resource, ghost_row, query)
+        end)
+
+        :ok
     end
   end
 
@@ -806,12 +847,22 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
   defp reconcile_filter(%Query{filter: filter}, :universe), do: filter
   defp reconcile_filter(%Query{filter: filter}, {:ok, region}), do: and_filter(filter, region)
 
-  defp scan_layer_ghosts(layer, reconcile_query, resource, original_query, pk, fetched_pks) do
+  defp scan_layer_ghosts(
+         layer,
+         reconcile_query,
+         resource,
+         original_query,
+         primary_key,
+         fetched_pks
+       ) do
     case Delegate.run_on_layer(reconcile_query, layer) do
       {:ok, cached_rows} ->
-        cached_rows
-        |> Enum.reject(&MapSet.member?(fetched_pks, Map.fetch!(&1, pk)))
-        |> Enum.map(&{layer, &1})
+        ghosts =
+          cached_rows
+          |> Enum.reject(&MapSet.member?(fetched_pks, Map.take(&1, primary_key)))
+          |> Enum.map(&{layer, &1})
+
+        {:ok, ghosts}
 
       {:error, reason} ->
         # Neither failing the read (it already succeeded) nor skipping the
@@ -828,7 +879,15 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
           reason: :reconcile_scan_failed
         })
 
-        []
+        {:error, reason}
+    end
+  end
+
+  defp evict_backfilled_rows(layers, resource, rows, query) do
+    Invalidation.on_evict(resource, coverage_tenant(resource, query), rows)
+
+    for layer <- layers, row <- rows do
+      evict_ghost(layer, resource, row, query)
     end
   end
 
@@ -846,12 +905,17 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
             "#{inspect(resource)}: #{inspect(reason)}"
         )
 
-        Telemetry.ledger(:evict_failed, resource, query.tenant, %{}, %{
+        Telemetry.ledger(:evict_failed, resource, coverage_tenant(resource, query), %{}, %{
           layer: layer,
           reason: reason
         })
     end
   end
+
+  defp coverage_epoch(resource, query),
+    do: Coverage.epoch(resource, coverage_tenant(resource, query))
+
+  defp coverage_tenant(resource, query), do: TenantKey.query(resource, query)
 
   defp emit_read(kind, query, resource, started, extra) do
     Telemetry.read(
@@ -860,7 +924,7 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
       query,
       %{
         duration_us: Telemetry.duration_us(started),
-        ledger_size: Coverage.size(resource, query.tenant)
+        ledger_size: Coverage.size(resource, coverage_tenant(resource, query))
       },
       extra
     )
