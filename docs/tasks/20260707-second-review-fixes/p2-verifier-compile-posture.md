@@ -1,7 +1,24 @@
 # P2 — Verifier "rejections" don't block a plain `mix compile` (Spark downgrade)
 
-- **Status**: OPEN — re-verified 2026-07-07: no `--warnings-as-errors` mention
-  anywhere in README or docs/guides
+- **Status**: DONE — posture decided: **docs-only** (no new runtime guard; a
+  runtime guard for the field-policies case specifically would be a materially
+  larger, riskier change — re-implementing part of what the compile-time
+  verifier already checks — for a project that already documents
+  `--warnings-as-errors` as the fix). README gained a "Compile-time DSL checks
+  require `--warnings-as-errors`" section spelling out the
+  Spark-2.7-downgrades-verifier-rejections-to-warnings behavior, linking the
+  field-policies ADR, and giving the exact compile flag. New end-to-end test
+  pins the posture for the field-policies rejection specifically: it compiles
+  the offending config without raising (proving the "silently accepted" half)
+  AND captures the diagnostic via Spark's `:test_collector` test hook (proving
+  the "reaches the compiler diagnostic path a `--warnings-as-errors` build
+  enforces" half) — mirrors the file's existing `ValidateLayers` end-to-end test
+  for the general mechanism. Note: `assert_receive` against this specific
+  message shape (a struct nested inside a list inside a 4-tuple) reliably failed
+  to match a message plainly visible in its own failure-report mailbox dump —
+  root cause not chased down given time; a plain `receive/after` block with the
+  same pattern (as a case clause, not a receive guard) works reliably.
+  `INTEGRATION=1 mix test` green (316, up from 315).
 - **Severity**: Medium (security-adjacent: field-policies rejection is advisory)
 - **Repo**: MDL (ash_multi_datalayer)
 - **Source**:

@@ -81,3 +81,25 @@ v1 is single-node only; acknowledge this in `config/config.exs`:
 ```elixir
 config :ash_multi_datalayer, :assume_single_node, true
 ```
+
+### Compile-time DSL checks require `--warnings-as-errors`
+
+This library's Spark DSL verifiers (`lib/ash_multi_datalayer/verifiers/`) —
+including the field-policies/multi-layer `read_order` rejection the
+[ADR](docs/design/20260417-reject-field-policies-with-fallthrough-adr.md)
+documents as "fails to compile" — catch invalid configuration at compile time.
+Under Spark 2.7, a verifier's rejection downgrades to a compiler `IO.warn`
+rather than a hard failure unless the build itself treats warnings as errors.
+**A plain `mix compile` does NOT block on these** — the misconfigured resource
+still compiles and runs, silently, including the field-policies case (a cache
+row materialized under one actor's policies served to another, unredacted).
+
+Always build with:
+
+```
+mix compile --warnings-as-errors
+```
+
+(or the equivalent `elixirc_options: [warnings_as_errors: true]` in CI). If your
+project can't turn this on globally, treat "grep the compile log for this
+library's verifier warnings" as a required, not optional, CI step.

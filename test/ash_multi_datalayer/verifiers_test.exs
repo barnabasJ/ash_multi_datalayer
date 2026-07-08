@@ -1,9 +1,12 @@
 defmodule AshMultiDatalayer.VerifiersTest do
   # Spark 2.7 surfaces verifier failures as compiler diagnostics (warnings
   # that fail --warnings-as-errors builds), not runtime raises — so these
-  # tests call each verifier directly on the resource's DSL config, plus one
-  # end-to-end test through Spark's test collector proving the wiring.
-  use ExUnit.Case, async: true
+  # tests call each verifier directly on the resource's DSL config, plus two
+  # end-to-end tests through Spark's test collector proving the wiring
+  # (P2). async: false — two test_collector-using tests are safer
+  # serialized than concurrent (the collector is a registration keyed on
+  # the receiving pid, not scoped per-test).
+  use ExUnit.Case, async: false
 
   alias AshMultiDatalayer.Verifiers.{
     RejectFieldPolicies,
@@ -249,6 +252,34 @@ defmodule AshMultiDatalayer.VerifiersTest do
     test "field_policies with single-layer read_order verifies" do
       module = define_with_field_policies([:l2])
       assert :ok = RejectFieldPolicies.verify(module.spark_dsl_config())
+    end
+
+    # P2: pins the compile posture the README/ADR now document — a plain
+    # `mix compile` does NOT hard-fail on this rejection (the module
+    # compiles here without raising), it only reaches the compiler as a
+    # diagnostic Spark's `:test_collector` hook intercepts below — which is
+    # exactly the shape that fails a `--warnings-as-errors` build and is
+    # silently accepted (serving a cache row materialized under a different
+    # actor, unredacted) without it.
+    test "the rejection reaches the compiler diagnostic path a --warnings-as-errors build enforces" do
+      Process.put({Spark.Dsl, :test_collector}, self())
+
+      try do
+        _module = define_with_field_policies([:l1, :l2])
+
+        message =
+          receive do
+            {Spark.Dsl, :verifier_errors, _mod, errors} when errors != [] ->
+              [%Spark.Error.DslError{message: message} | _] = errors
+              message
+          after
+            10_000 -> flunk("no verifier_errors message received")
+          end
+
+        assert message =~ "field_policies cannot be combined"
+      after
+        Process.delete({Spark.Dsl, :test_collector})
+      end
     end
   end
 
