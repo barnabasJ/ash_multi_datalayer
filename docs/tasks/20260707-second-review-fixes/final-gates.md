@@ -1,6 +1,53 @@
 # FINAL — Plan final gates: demo exercise, docs sweep, closure checks
 
-- **Status**: OPEN — must be the LAST task closed; blocks tracker closure
+- **Status**: DONE — all 7 gates closed:
+  1. **Joint test run**: MDL `INTEGRATION=1 mix test` → 335 passed, 0 failed.
+     ash_remote `mix test` → 294/296 passed, 2 failures (the same pre-existing,
+     unrelated `AshRemote.MultiDatalayer.ChangeNotifierTest` issue documented
+     throughout this tracker — traced during this gate, see the
+     `proven_coverage.ex` doc-comment added and the R0 doc for the analysis; a
+     fix was attempted and reverted because it regressed L2's own M3 regression
+     test, a genuine two-sided trade-off, not an oversight).
+  2. **Offline-first demo exercised end-to-end**, live in a real browser
+     (chrome-devtools MCP), both clients (Ada/Grace) + server booted fresh:
+     online invalidation (realtime propagation confirmed both directions),
+     offline edit → conflict → 3-way diff UI → resolve, refresh. All 3
+     UI-exposed verbs exercised (`discard_local` via "Take theirs", `force` via
+     "Keep mine", `retry` implicitly during the bugfix-and-retry cycle);
+     `discard`/`rebase` (no UI) confirmed covered by
+     `local_outbox_resolution_test.exs`'s M-1/M4 tests. **Found and fixed a
+     real, previously-unknown bug live**: every LocalOutbox update flush failed
+     permanently (Oban retried to exhaustion) — H2's `accepted_keys/1`
+     replicated-write clause only excluded the PK from wire input, not other
+     `writable?: false` attributes, so a hydrated snapshot's
+     `inserted_at`/`updated_at` were sent as wire input and the remote correctly
+     rejected them. Fixed in `ash_remote` (excludes every non-writable
+     attribute) with a fail-first-verified regression test, plus the demo's own
+     `TodoClient.Local.Todo` (mark those fields `writable?: false` to match
+     their documented hydration-only intent). Re-verified the full conflict flow
+     live after the fix.
+  3. **Security repros retained**: #1 (`rpc_field_policy_test.exs`'s "retained
+     regression: private attribute is omitted (#1..."), #7
+     (`gen_test.exs`/`manifest_loader_test.exs`), #10
+     (`atom_exhaustion_test.exs`/`manifest_atom_safety_test.exs`) — all 45 tests
+     across these files pass.
+  4. **Tenant-strategy tests**: MDL's `tenant_partition_test.exs` (10 tests:
+     attribute tenancy, `TenantKey.canonical/2` context-struct handling, M2's
+     changeset-less-notification tenant derivation) + ash_remote's
+     `tenant_wire_test.exs`/`server_notifier_test.exs` (M8's changeset-less
+     multitenant broadcast) — all pass.
+  5. & 6. **Docs sweeps**: MDL guide/runbook already cover sweeper behavior,
+     park classes (incl. `:auth`), resolution idempotency, and tenant strategy
+     (committed earlier this run). ash_remote's `router.ex` (L13's manifest auth
+     section) and `manifest/loader.ex` (schema_version validation) confirmed
+     documented.
+  6. **Changelogs/decision logs**: MDL's `CHANGELOG.md` already carries a
+     comprehensive "Second-review fix run" entry (committed earlier this run).
+     ash_remote has no `CHANGELOG.md` (by design, per the tracker's own note) —
+     its `DECISIONS.md` gained a new "Second-review fix run" section recording
+     the H2 `accepted_keys/1` decision and the multi-datalayer-host-resource
+     authoring responsibility it implies.
+
 - **Severity**: Cross-cutting (the plan's completion bar)
 - **Repo**: both
 - **Source**:

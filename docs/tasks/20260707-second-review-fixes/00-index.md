@@ -236,7 +236,7 @@ is H5/#19 work and uses the real tenant, not the partition key.
 | PRE   | [Checkpoint-commit the uncommitted working tree](pre-checkpoint-commit.md) — **do FIRST**         | both       | DONE   |
 | A0    | [Build the MDL repro/regression harness the plan mandates](a0-mdl-repro-harness.md)               | MDL        | DONE   |
 | R0    | [Build the ash_remote repro/regression harness the plan mandates](r0-ash-remote-repro-harness.md) | ash_remote | DONE   |
-| FINAL | [Plan final gates: demo exercise, docs sweep, closure checks](final-gates.md) — last to close     | both       | OPEN   |
+| FINAL | [Plan final gates: demo exercise, docs sweep, closure checks](final-gates.md) — last to close     | both       | DONE   |
 
 Deliberately parked items (with reasons) live in
 [deferred-follow-ups.md](deferred-follow-ups.md) — including the first plan's
