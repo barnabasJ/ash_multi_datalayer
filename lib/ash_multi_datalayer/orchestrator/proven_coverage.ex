@@ -229,10 +229,15 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
 
     cond do
       not KillSwitch.enabled?(resource) ->
-        Delegate.run_on_layer(query, read_source_layer(resource))
+        # P1: the kill switch delegates straight to the source layer,
+        # bypassing merged_read/source_read entirely — the loud-failure
+        # guard for fold_aggregate_overrides aggregates must still apply
+        # here, or flipping the emergency lever silently changes results
+        # for queries whose folded value is correct when enabled.
+        guard_aggregates(query, Delegate.run_on_layer(query, read_source_layer(resource)))
 
       match?([_], read_layers) ->
-        Delegate.run_on_layer(query, hd(read_layers))
+        guard_aggregates(query, Delegate.run_on_layer(query, hd(read_layers)))
 
       not is_nil(query.lock) ->
         source_read(
@@ -436,6 +441,16 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
       end
     end)
   end
+
+  # P1: the kill-switch and single-layer `read/2` branches delegate
+  # straight to a layer's own `run_query` with no source_read/merged_read
+  # wrapper — this applies the same loud-failure guard to their result.
+  defp guard_aggregates(query, {:ok, records} = result) do
+    ensure_source_aggregates_resolved!(query, records)
+    result
+  end
+
+  defp guard_aggregates(_query, error), do: error
 
   # An aggregate handed to the source of truth (the per-aggregate
   # `fold_aggregate_overrides` escape hatch, or folding turned off) that the
@@ -672,6 +687,11 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
     fetch_query = widen_select_for_backfill(query, resource, earlier_layers)
 
     with {:ok, records} <- Delegate.run_on_layer(fetch_query, read_source_layer(resource)) do
+      # P1: covers every source_read/5 caller — cold-cache miss,
+      # not-cacheable (lock/non-mergeable), calc-sort-source-only, AND
+      # merged_read's own :stale_cache/:miss fallbacks (they call
+      # source_read/5 too) — one insertion point for all of them.
+      ensure_source_aggregates_resolved!(fetch_query, records)
       emit_read(:miss, query, resource, started, %{reason: miss_reason})
       maybe_backfill(query, resource, read_layers, records, epoch0)
       {:ok, records}

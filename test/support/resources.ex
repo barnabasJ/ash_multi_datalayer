@@ -109,6 +109,7 @@ defmodule AshMultiDatalayer.Test.Resources do
       resource AshMultiDatalayer.Test.Resources.RaceTestPost
       resource AshMultiDatalayer.Test.Resources.ReconcileRaceTestPost
       resource AshMultiDatalayer.Test.Resources.TestAuthor
+      resource AshMultiDatalayer.Test.Resources.TestAuthorSourceOverride
       # Relationship-aggregate data-layer permutation matrix (parent × child):
       resource AshMultiDatalayer.Test.Resources.PgPost
       resource AshMultiDatalayer.Test.Resources.EtsPost
@@ -208,6 +209,65 @@ defmodule AshMultiDatalayer.Test.Resources do
       count :adult_post_count, :posts do
         public? true
         filter expr(age >= 18)
+      end
+    end
+
+    actions do
+      defaults [:read, :destroy, create: :*, update: :*]
+    end
+  end
+
+  defmodule TestAuthorSourceOverride do
+    @moduledoc """
+    P1 fixture: `post_count` is opted OUT of folding
+    (`fold_aggregate_overrides`), so it is handed to the source of truth
+    (Postgres) to compute directly. The related resource (`EtsPost`) is
+    ETS-only — no SQL source to join from at all (mirrors `EtsAuthor`'s
+    documented cross-layer limitation): ash_sql itself refuses to build
+    the in-database join and raises. The loud-failure guard this task adds
+    (`ensure_source_aggregates_resolved!`, now threaded through every read
+    path) exists for the OTHER way this can go wrong — a source that
+    computes SOME rows but leaves the aggregate `%Ash.NotLoaded{}` rather
+    than erroring outright; ash_sql's own guard already covers the
+    "outright unjoinable" case exercised here, but a caller has no way to
+    tell those two apart from "did I get a loud failure" alone, and this
+    fixture is what's reliably constructible without a bespoke fault-
+    injecting data layer. Both are asserted as "never silent nil/[]", the
+    task's actual requirement.
+    """
+    use Ash.Resource,
+      domain: Domain,
+      data_layer: AshMultiDatalayer.DataLayer,
+      extensions: [AshPostgres.DataLayer]
+
+    multi_data_layer do
+      layer(:l1, Ash.DataLayer.Ets)
+      layer(:l2, AshMultiDatalayer.Test.CountingPostgres)
+
+      read_order([:l1, :l2])
+      write_order([:l2, :l1])
+      fold_aggregate_overrides([:post_count])
+    end
+
+    postgres do
+      table "mdl_source_override_authors"
+      repo(AshMultiDatalayer.TestRepo)
+    end
+
+    attributes do
+      uuid_primary_key :id
+      attribute :name, :string, public?: true
+    end
+
+    relationships do
+      has_many :posts, AshMultiDatalayer.Test.Resources.EtsPost,
+        public?: true,
+        destination_attribute: :author_id
+    end
+
+    aggregates do
+      count :post_count, :posts do
+        public? true
       end
     end
 

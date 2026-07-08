@@ -1,6 +1,28 @@
 # M11 — Client decoder crashes on `nil` / single-object read responses
 
-- **Status**: OPEN
+- **Status**: DONE — `Protocol.parse_run/1` now distinguishes
+  `%{"success" => true, "data" => nil}` (an explicit null — stays `{:ok, nil}`)
+  from `%{"success" => true}` (the `data` key entirely absent — a malformed
+  response, now `{:error, [...]}}`, so the decoder never has to guess).
+  `Decoder.decode_records/4` gained a `get?:` opt (default `false`) and always
+  returns `{:ok, [record]} | {:error, [map()]}`: a bare single object or
+  explicit `nil` decodes cleanly ONLY for `get?: true` (one- element list /
+  `[]`); for an ordinary read, either shape is a typed protocol error, never
+  silently coerced. `get?` is threaded from `context.action.get?`
+  (`AshRemote.Server`'s own `get?(action, params)` first clause — same signal,
+  same decision). Note: `read_action_name/2` always targets a resource's PRIMARY
+  read action regardless of which action a query names, so a non-primary
+  `get_by`-style action (e.g. a hand-written `get_by_id`) never actually reaches
+  the server as `get?: true` over RPC — only a resource whose PRIMARY read is
+  itself `get?: true` does; a genuine end-to-end repro needed a new fixture
+  (`Backend.Singleton`/`Client.Singleton`) built specifically that way (this
+  `read_action_name/2` behavior is itself a separate, pre-existing limitation,
+  out of scope here). 11 repro tests (unit-level `Decoder.decode_records/4` +
+  `Protocol.parse_run/1`, plus 2 genuine RPC round-trip tests against
+  `Singleton`) fail on unfixed code (confirmed: `FunctionClauseError` for the
+  round-trip cases, missing-function/wrong- shape for the unit ones). `mix test`
+  green (212/214 — the 2 remaining failures are the same pre-existing, unrelated
+  `ChangeNotifierTest` issue noted in M7/M8).
 - **Severity**: Medium (server response crashes the caller)
 - **Repo**: ash_remote
 - **Verification**: AGENT

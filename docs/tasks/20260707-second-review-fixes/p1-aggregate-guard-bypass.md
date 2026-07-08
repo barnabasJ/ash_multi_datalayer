@@ -1,8 +1,32 @@
 # P1 — Source-computed aggregate loud-failure guard bypassed on non-merged paths
 
-- **Status**: OPEN — re-verified 2026-07-07:
-  `ensure_source_aggregates_resolved!` is invoked at exactly one site
-  (`proven_coverage.ex:629`, the merged-read branch)
+- **Status**: DONE — `ensure_source_aggregates_resolved!` now runs on every read
+  path: (1) inside `source_read/5` itself — the single function every one of
+  cold-cache-miss, lock (`:not_cacheable`), calc-sort-source-only,
+  non-mergeable, AND `merged_read`'s own `:stale_cache`/`:miss` fallbacks funnel
+  through, one insertion point covers all of them; (2) a new
+  `guard_aggregates/2` wraps the kill-switch and single-layer `cond` branches in
+  `read/2`, which delegate straight to `Delegate.run_on_layer/2` with no wrapper
+  function at all. The original merged-read success-branch call site is
+  untouched. **Test limitation, noted honestly**: constructing a fixture where
+  an overridden aggregate genuinely comes back `%Ash.NotLoaded{}` (rather than
+  ash_sql's own, separate, pre-existing "cannot build an in-database join"
+  `ArgumentError` firing first) proved difficult — a same-repo-SQL related
+  resource lets ash_sql successfully build the join regardless of MDL's own
+  fold/join overrides (they're MDL-only routing decisions ash_sql doesn't know
+  about); a non-SQL related resource (`EtsPost`) hits ash_sql's OWN guard before
+  `source_read`'s `with {:ok, records} <- ...` even succeeds; a hand-built
+  fault- injecting data layer (attempted, see git history) broke ash_sql's
+  internal query-preparation pipeline when stripping the aggregate post-hoc. The
+  2 tests below assert the task's actual requirement ("raise loudly, never
+  silent nil/[]") against ash_sql's own guard, which already produces a loud
+  failure for the fixture I could build — but per a stash-and-rerun check, they
+  pass identically on unfixed code (ash_sql's guard fires before mine gets a
+  chance to), so they do **not** independently discriminate this specific fix.
+  The fix itself is verified correct by code review (the call sites above are
+  real, the function itself is unchanged and already covered by the merged-read
+  branch's existing tests) rather than by a fail-first repro for the
+  newly-covered paths specifically.
 - **Severity**: Medium (silent `%Ash.NotLoaded{}` — the failure shape the module
   docs promise to refuse)
 - **Repo**: MDL (ash_multi_datalayer)

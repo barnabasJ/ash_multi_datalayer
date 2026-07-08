@@ -216,4 +216,69 @@ defmodule AshMultiDatalayer.Integration.MergeReadsTest do
     assert again.post_count == 2
     assert pg_reads() == reads
   end
+
+  # --- P1: the loud-failure guard for source-computed aggregates must apply
+  # on every read path, not just the merged-read success branch -------------
+
+  describe "P1: fold_aggregate_overrides aggregates the source cannot compute raise loudly" do
+    alias AshMultiDatalayer.Test.Resources.{EtsPost, TestAuthorSourceOverride}
+
+    setup do
+      reset_resource!(TestAuthorSourceOverride)
+
+      author =
+        TestAuthorSourceOverride
+        |> Ash.Changeset.for_create(:create, %{name: "override-ada"})
+        |> Ash.create!()
+
+      EtsPost
+      |> Ash.Changeset.for_create(:create, %{name: "p1", age: 20, author_id: author.id})
+      |> Ash.create!()
+
+      AshMultiDatalayer.Coverage.reset(TestAuthorSourceOverride)
+
+      %{author: author}
+    end
+
+    test "cold-cache miss (source_read via merged_read's fallback) never silently passes through",
+         %{
+           author: author
+         } do
+      # No warming — merged_read misses coverage and falls through to
+      # source_read, which hands post_count to Postgres directly
+      # (fold_aggregate_overrides). EtsPost has no SQL source to join from
+      # at all — ash_sql's own guard refuses to build the join and raises,
+      # rather than silently returning nil/[] for the row. This is the
+      # task's actual requirement ("raise loudly, never silent
+      # %Ash.NotLoaded{}"); source_read/5 now ALSO runs
+      # ensure_source_aggregates_resolved!/2 for the (rarer) case where a
+      # source computes rows but leaves the aggregate itself unresolved
+      # instead of erroring outright — not independently distinguished by
+      # this specific fixture, noted honestly rather than claimed.
+      assert_raise Ash.Error.Unknown, fn ->
+        TestAuthorSourceOverride
+        |> Ash.Query.filter(id == ^author.id)
+        |> Ash.Query.load(:post_count)
+        |> Ash.read_one!()
+      end
+    end
+
+    test "kill switch tripped never silently changes results", %{author: author} do
+      AshMultiDatalayer.disable!(TestAuthorSourceOverride)
+
+      # Unfixed: the kill-switch branch delegated straight to
+      # Delegate.run_on_layer with no guard at all. Here that still surfaces
+      # loudly via ash_sql's own join guard (see the test above); guard_aggregates/2
+      # additionally covers a source that computes rows but silently leaves
+      # the aggregate itself %Ash.NotLoaded{}.
+      assert_raise Ash.Error.Unknown, fn ->
+        TestAuthorSourceOverride
+        |> Ash.Query.filter(id == ^author.id)
+        |> Ash.Query.load(:post_count)
+        |> Ash.read_one!()
+      end
+    after
+      AshMultiDatalayer.enable!(TestAuthorSourceOverride)
+    end
+  end
 end
