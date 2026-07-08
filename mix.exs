@@ -2,6 +2,7 @@ defmodule AshMultiDatalayer.MixProject do
   use Mix.Project
 
   @version "0.1.0"
+  @source_url "https://github.com/barnabasJ/ash_multi_datalayer"
 
   def project do
     [
@@ -12,7 +13,45 @@ defmodule AshMultiDatalayer.MixProject do
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       aliases: aliases(),
-      dialyzer: [plt_add_apps: [:mix, :ex_unit]]
+      dialyzer: [plt_add_apps: [:mix, :ex_unit]],
+      description: description(),
+      package: package(),
+      source_url: @source_url,
+      homepage_url: @source_url,
+      docs: docs()
+    ]
+  end
+
+  defp description do
+    "An Ash.DataLayer that composes multiple data stores (e.g. an ETS " <>
+      "read-through cache in front of Postgres) behind a single Ash resource, " <>
+      "with a coverage ledger, row-aware invalidation, a kill-switch, and " <>
+      "orchestration strategies for caching, tiering, and offline-first sync."
+  end
+
+  # P5: explicit `files:` — Hex's default file set would otherwise ship
+  # `priv/test_repo/migrations/*` (test-only fixtures, not a real consumer's
+  # migration source) alongside the real library.
+  defp package do
+    [
+      licenses: ["MIT"],
+      links: %{"GitHub" => @source_url},
+      files: ~w(lib .formatter.exs mix.exs README.md LICENSE docs/guides
+                 docs/technical docs/runbooks docs/design)
+    ]
+  end
+
+  defp docs do
+    [
+      main: "readme",
+      source_url: @source_url,
+      source_ref: "v#{@version}",
+      extras: [
+        "README.md",
+        "docs/guides/ash-multi-datalayer.md",
+        "docs/technical/ash-multi-datalayer.md",
+        "docs/runbooks/ash-multi-datalayer.md"
+      ]
     ]
   end
 
@@ -49,16 +88,22 @@ defmodule AshMultiDatalayer.MixProject do
       # Powers the Phase 3 install/gen.outbox generators. Optional — only the
       # mix tasks need it; runtime code never does.
       {:igniter, "0.8.2", optional: true},
-      # Pinned to hex-cache-available versions (sandbox has no hex.pm access);
-      # matches ash_remote's lock so both projects share identical deps.
-      {:crux, "0.1.3", override: true},
+      # P5: was `"0.1.3", override: true` — `override: true` makes the
+      # package unbuildable via `mix hex.build` (Hex rejects an override
+      # dependency in a publishable package), and the exact pin
+      # over-constrains consumers beyond what ash itself requires
+      # transitively (`>= 0.1.2 and < 1.0.0-0`). `~> 0.1` is satisfied by
+      # the already-locked 0.1.3 (no re-resolution needed) while leaving
+      # consumers free to pick any compatible 0.1.x.
+      {:crux, "~> 0.1"},
       # No :only restriction — ash 3.29+ depends on stream_data in all envs.
       {:stream_data, "~> 1.0"},
       # Not `:only [:dev, :test]` — igniter (via ex_ast) requires sourceror in
       # all envs. Harmless: it is a compile-time AST tool, unused at runtime.
       {:sourceror, "~> 1.7"},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
-      {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
   end
 

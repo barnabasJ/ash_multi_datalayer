@@ -227,7 +227,7 @@ is H5/#19 work and uses the real tenant, not the partition key.
 
 | ID  | Task                                                                 | Repo | Status |
 | --- | -------------------------------------------------------------------- | ---- | ------ |
-| P5  | [`mix hex.build` fails; package metadata missing](p5-hex-package.md) | MDL  | OPEN   |
+| P5  | [`mix hex.build` fails; package metadata missing](p5-hex-package.md) | MDL  | DONE   |
 
 ## Cross-cutting
 
