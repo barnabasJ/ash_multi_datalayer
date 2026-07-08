@@ -357,7 +357,8 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
       with {:ok, rows} <- read(base_query, resource),
            {:ok, rows} <-
              add_aggregates_via_layer(rows, join, query, resource, read_source_layer(resource)),
-           {:ok, rows} <- add_aggregates_via_layer(rows, fold, query, resource, hd(read_layers)) do
+           {:ok, rows} <- add_aggregates_via_layer(rows, fold, query, resource, hd(read_layers)),
+           {:ok, rows} <- ensure_folded_aggregates_resolved(rows, fold, query, resource) do
         emit_read(:aggregate_read, query, resource, started, %{
           joined: length(join),
           folded: length(fold)
@@ -366,6 +367,35 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
         {:ok, rows}
       end
     end
+  end
+
+  # L2 (#23): the cache layer's own fold delegates to its raw data layer's
+  # native aggregate computation (e.g. `Ash.DataLayer.Ets.run_aggregate_query/3`
+  # queries its own ETS table for the related resource directly) — it does NOT
+  # route through this related resource's own MDL read pipeline. On a cold
+  # start, if the related resource's rows haven't independently been warmed
+  # into that layer yet, the fold silently comes back incomplete, leaving
+  # `%Ash.NotLoaded{}` (the live ~70%-flaky `todo_count` bug). Detect any
+  # unresolved fold value and fall through to the authoritative source layer
+  # instead of returning it silently.
+  defp ensure_folded_aggregates_resolved(rows, [], _query, _resource), do: {:ok, rows}
+
+  defp ensure_folded_aggregates_resolved(rows, fold, query, resource) do
+    if Enum.any?(rows, &fold_unresolved?(&1, fold)) do
+      add_aggregates_via_layer(rows, fold, query, resource, read_source_layer(resource))
+    else
+      {:ok, rows}
+    end
+  end
+
+  defp fold_unresolved?(row, fold) do
+    Enum.any?(fold, fn %Ash.Query.Aggregate{load: load, name: name} ->
+      if load do
+        match?(%Ash.NotLoaded{}, Map.get(row, load))
+      else
+        match?(%Ash.NotLoaded{}, row.aggregates |> Kernel.||(%{}) |> Map.get(name))
+      end
+    end)
   end
 
   # Relationship aggregates the SQL source computes as an in-database join: a

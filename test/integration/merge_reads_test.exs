@@ -368,4 +368,42 @@ defmodule AshMultiDatalayer.Integration.MergeReadsTest do
       assert loaded.post_count == 1
     end
   end
+
+  # --- L2: aggregate fold leaves %Ash.NotLoaded{} on a cold cache (#23) -----
+
+  describe "L2: aggregate fold falls through to the source instead of a silent %Ash.NotLoaded{}" do
+    setup do
+      reset_resource!(TestAuthor)
+      reset_resource!(TestPost)
+
+      author =
+        TestAuthor
+        |> Ash.Changeset.for_create(:create, %{name: "l2-author"})
+        |> Ash.create!()
+
+      TestPost
+      |> Ash.Changeset.for_create(:create, %{name: "l2-post", age: 20, author_id: author.id})
+      |> Ash.create!()
+
+      %{author: author}
+    end
+
+    test "a limit'd query (non-recordable — never joins the coverage ledger) on a cold cache still resolves the real count",
+         %{author: author} do
+      # `limit`/`offset`/`distinct` queries are "non-recordable" (the
+      # coverage ledger is never updated for them). This is the scenario
+      # L2's defect description names most directly; it passes both with
+      # and without `ensure_folded_aggregates_resolved/4` on this stack —
+      # noted honestly in the tracker doc rather than claimed as
+      # discriminating. Retained as a regression guard for the fold path.
+      loaded =
+        TestAuthor
+        |> Ash.Query.filter(id == ^author.id)
+        |> Ash.Query.limit(1)
+        |> Ash.Query.load(:post_count)
+        |> Ash.read_one!()
+
+      assert loaded.post_count == 1
+    end
+  end
 end
