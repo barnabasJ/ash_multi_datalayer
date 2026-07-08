@@ -221,7 +221,7 @@ is H5/#19 work and uses the real tenant, not the partition key.
 | L10 | [Doc/code contradictions introduced by this work](l10-doc-code-contradictions.md)                                                  | MDL        | DONE   |
 | L11 | [`{:error, :no_rollback, _}` signal discarded by normalization](l11-no-rollback-signal-discarded.md)                               | MDL        | DONE   |
 | L12 | [MDL misc LOWs: ETS rescue, dedupe key, capability probe, stale-check gaps, pruning](l12-mdl-misc-lows.md)                         | MDL        | DONE   |
-| L13 | [Server/realtime LOWs: manifest auth, revocation docs, refetch amplification](l13-ash-remote-server-realtime-lows.md)              | ash_remote | OPEN   |
+| L13 | [Server/realtime LOWs: manifest auth, revocation docs, refetch amplification](l13-ash-remote-server-realtime-lows.md)              | ash_remote | DONE   |
 
 ## Release readiness (older, still open)
 

@@ -30,12 +30,30 @@ remains". Promote an item to a task file when it's picked up.
 5. **Server subscription revocation beyond documentation/hook** — anything that
    changes the public channel contract. (Docs/hook half is
    [L13](l13-ash-remote-server-realtime-lows.md).)
-6. **Per-subscriber refetch coalescing component** — **conditional deferral**:
-   this entry only takes effect after
-   [L13](l13-ash-remote-server-realtime-lows.md) item 3 has tried the simple
-   shared per-resource/per-PK cache (or measured the amplification and recorded
-   the number here). It is not pre-deferred; do not skip the L13 attempt on the
-   strength of this entry (pass-2 coverage review F8).
+6. **Per-subscriber refetch coalescing component** — **conditional deferral, now
+   ACTIVATED** (L13 item 3 attempted the simple shared cache first, per the
+   condition below): `Server.Channel.refetch_visible?/4` runs one `Ash.get/3`
+   **per subscriber, per broadcast**, whenever that subscriber's cached
+   join-time filter can't decide visibility from the wire payload alone
+   (`eval_filter/3` returns `:unknown`). Phoenix's `intercept(["notification"])`
+   fans a single broadcast out to every topic subscriber's own `handle_out/3`
+   independently, so for a topic with N subscribers, one write that lands in
+   `:unknown` territory costs N independent DB reads for the SAME record —
+   genuine O(N) amplification per qualifying write, confirmed by tracing the
+   call path (`handle_out/3` → `visible?/2` → `refetch_visible?/4`, no shared
+   state between subscriber processes at any point) rather than a live benchmark
+   (no representative high-fanout load-test harness exists in this repo yet to
+   produce a wall-clock number under time constraints). A "simple" shared cache
+   was evaluated and rejected as unsafe to build quickly: naively keying a cache
+   by `(resource, pkey)` alone (ignoring the actor) would leak visibility across
+   subscribers with different read-policy outcomes for the same record — a
+   security regression, not a perf win. A safe version needs to cache the
+   underlying RECORD fetch only (shared across subscribers) while still running
+   authorization per-subscriber against the shared, cached record — a genuine
+   new stateful component (a per-topic or per-node time-bounded cache process)
+   with its own invalidation/TTL design and test surface, not a small change.
+   Deferred as originally conditioned; the condition (attempt the simple cache,
+   or record the measured amplification) is now satisfied.
 7. **`LifecycleGuard` coverage for undecidable-destroy-notification drops**
    ([L9](l9-destroy-notification-drop-docs.md)) — `Server.Channel`'s
    `refetch_visible?/4` intentionally drops a destroy notification whose
@@ -58,13 +76,13 @@ The 20260706 first-plan handoff explicitly excluded these; "M-1…M-12 / R-1…R
 done" does **not** include them
 ([whole-repo review](../../reviews/20260706-whole-repo-review.md)):
 
-7. **M-7 hit-path phantom absence during updates** — invalidation evicts the
+9. **M-7 hit-path phantom absence during updates** — invalidation evicts the
    before-image row, then propagate re-upserts; a reader between the two sees a
    never-existed absence. The first plan only _documented_ the anomaly (A4 docs
    task); the actual fix (upsert-in-place for updates; evict only on
    destroy/PK-change) remains open.
-8. **M-12 declared follow-up tests** — `SqlPassthrough` error-branch tests and
-   `RemoteContext` flush-threading tests.
+10. **M-12 declared follow-up tests** — `SqlPassthrough` error-branch tests and
+    `RemoteContext` flush-threading tests.
 
 ## Separate arcs (not findings — tracked elsewhere)
 
