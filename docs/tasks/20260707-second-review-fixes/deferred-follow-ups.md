@@ -36,6 +36,21 @@ remains". Promote an item to a task file when it's picked up.
    shared per-resource/per-PK cache (or measured the amplification and recorded
    the number here). It is not pre-deferred; do not skip the L13 attempt on the
    strength of this entry (pass-2 coverage review F8).
+7. **`LifecycleGuard` coverage for undecidable-destroy-notification drops**
+   ([L9](l9-destroy-notification-drop-docs.md)) — `Server.Channel`'s
+   `refetch_visible?/4` intentionally drops a destroy notification whose
+   read-policy filter can't be resolved from the wire payload (the row is
+   already gone, nothing to re-read to prove visibility — the safe direction is
+   silence, not disclosure). This is a genuine, undocumented-until-now staleness
+   class distinct from the connection-level gaps `LifecycleGuard` already
+   reconciles on (`:resubscribed`/`:join_denied`). Closing it needs a new
+   realtime protocol event (carrying `resource`/`tenant`/`record_pk`) emitted by
+   the channel on drop, threaded through `AshRemote.Realtime` to
+   `LifecycleGuard`, which would then reconcile that specific resource+tenant
+   the same way it already does for a connection gap — a genuine
+   protocol/wire-shape change, not a bug fix, so deferred rather than attempted
+   under this task's scope. Documented at the drop site (`channel.ex` moduledoc)
+   and in the client cache guidance there in the meantime.
 
 ## First-plan handoff exclusions (M-7 / M-12) — still open by design
 

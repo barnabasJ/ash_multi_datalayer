@@ -216,8 +216,8 @@ is H5/#19 work and uses the real tenant, not the partition key.
 | L5  | [Sweeper `{:global, ...}` name fails second-node boot; RejectMultiNode config](l5-sweeper-global-name-multinode.md)                | MDL        | DONE   |
 | L6  | [Codegen LOWs: identifier validation, path traversal, FK fidelity](l6-codegen-lows.md)                                             | ash_remote | OPEN   |
 | L7  | [Data-layer LOWs: header dedupe, write retries, composite PK, sort args](l7-data-layer-lows.md)                                    | ash_remote | OPEN   |
-| L8  | [RPC dispatch lacks explicit `authorize?: true`](l8-rpc-authorize-flag.md)                                                         | ash_remote | OPEN   |
-| L9  | [Undecidable destroy notifications dropped — document staleness class](l9-destroy-notification-drop-docs.md)                       | ash_remote | OPEN   |
+| L8  | [RPC dispatch lacks explicit `authorize?: true`](l8-rpc-authorize-flag.md)                                                         | ash_remote | DONE   |
+| L9  | [Undecidable destroy notifications dropped — document staleness class](l9-destroy-notification-drop-docs.md)                       | ash_remote | DONE   |
 | L10 | [Doc/code contradictions introduced by this work](l10-doc-code-contradictions.md)                                                  | MDL        | DONE   |
 | L11 | [`{:error, :no_rollback, _}` signal discarded by normalization](l11-no-rollback-signal-discarded.md)                               | MDL        | DONE   |
 | L12 | [MDL misc LOWs: ETS rescue, dedupe key, capability probe, stale-check gaps, pruning](l12-mdl-misc-lows.md)                         | MDL        | DONE   |
