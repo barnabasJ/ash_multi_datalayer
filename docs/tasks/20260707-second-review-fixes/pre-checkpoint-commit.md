@@ -1,6 +1,17 @@
 # PRE — Checkpoint-commit the uncommitted working tree (do FIRST)
 
-- **Status**: OPEN — **must be done before any other task in this tracker**
+- **Status**: DONE — verified, not newly performed: both repos' named Cat A
+  files are already committed (from before this session's own work began — this
+  session's entire commit history builds directly on top of that baseline). MDL:
+  `capability.ex`, `supervisor.ex`, `flush.ex`, `write.ex`, `enqueue.ex`,
+  `tenant_key.ex`, `sweeper.ex` — all tracked, all show a real commit in
+  `git log -1 -- <file>` (`sweeper.ex`/`tenant_key.ex` specifically confirmed no
+  longer untracked). ash_remote: `server/fields.ex`, `realtime/connection.ex` —
+  both tracked, both landed in the "Phase 1 (B1, B2)" commit that opened this
+  fix run. `git status --short lib/` clean in both repos (aside from this
+  session's own in-progress work, itself committed per-task throughout). Every
+  downstream retained-regression task and A0/R0 assumed this durability was
+  already in place; that assumption held.
 - **Severity**: Cross-cutting (data-loss guard, not a code fix)
 - **Repo**: both
 - **Source**: pass-3b §A commit-fragility; made a tracked preflight per pass-5
