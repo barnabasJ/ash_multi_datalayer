@@ -281,4 +281,56 @@ defmodule AshMultiDatalayer.Integration.MergeReadsTest do
       AshMultiDatalayer.enable!(TestAuthorSourceOverride)
     end
   end
+
+  # --- P3: the uncomputable-calc guard must also cover distinct/distinct_sort
+
+  describe "P3: distinct/distinct_sort on a source-only calc route to the source" do
+    setup do
+      TestPost
+      |> Ash.Changeset.for_create(:create, %{name: "p3", age: 25})
+      |> Ash.create!()
+
+      # Warm coverage so the query is "covered" — unfixed code would serve
+      # this from ETS (which can't evaluate the module-based source_only
+      # calc) instead of routing to the source, silent wrong results.
+      TestPost |> Ash.read!()
+      CountingLayer.reset!()
+
+      :ok
+    end
+
+    test "distinct on a source-only calc routes to the source, not the cache" do
+      # Unfixed: sort_references_uncomputable_calc?/3 only inspects
+      # query.sort — this reaches coverage_read/merged_read and gets
+      # served from ETS, which silently can't group by source_only
+      # (source_only is a resource-declared, module-based calc — TestPost's
+      # own `:source_only`, no `expr(...)` opt, so calc_evaluable_by?/3 can
+      # never resolve it).
+      TestPost
+      |> Ash.Query.distinct(:source_only)
+      |> Ash.read!()
+
+      assert pg_reads() > 0
+    end
+
+    test "distinct_sort on a source-only calc routes to the source, not the cache" do
+      TestPost
+      |> Ash.Query.distinct(:id)
+      |> Ash.Query.distinct_sort(:source_only)
+      |> Ash.read!()
+
+      assert pg_reads() > 0
+    end
+
+    # "Sort guard behavior unchanged" (the third done-when item) is NOT an
+    # independent test here: `sort_references_uncomputable_calc?/3`'s sort
+    # half is untouched by this fix (only the distinct/distinct_sort
+    # clauses are new), and for this synthetic module-based calc
+    # (expression/2 -> nil) Ash core resolves `sort` locally post-fetch
+    # rather than pushing it to the data layer at all — a pre-existing,
+    # unrelated Ash-core sort-hydration path this fix's fixture happens to
+    # hit differently from distinct/distinct_sort, not a regression in the
+    # (unchanged) sort clause itself. The full MDL suite (no sort-guard
+    # regressions) is the evidence for this item instead.
+  end
 end

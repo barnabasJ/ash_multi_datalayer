@@ -157,11 +157,33 @@ defmodule AshMultiDatalayer.Test.Resources do
       calculate :adult?, :boolean, expr(age >= 18) do
         public? true
       end
+
+      # P3/sort-guard fixture: module-based (no `expr(...)` opt), so
+      # `calc_evaluable_by?/3` can never resolve it — mirrors an
+      # ash_remote source-only `remote(...)` calc for the guard's purpose.
+      calculate :source_only, :string, AshMultiDatalayer.Test.Resources.SourceOnlyCalc do
+        public? true
+      end
     end
 
     actions do
       defaults [:read, :destroy, create: :*, update: :*]
     end
+  end
+
+  defmodule SourceOnlyCalc do
+    @moduledoc false
+    use Ash.Resource.Calculation
+
+    @impl true
+    def calculate(records, _opts, _context), do: Enum.map(records, fn _ -> "x" end)
+
+    # No expression translation on purpose — this must stay "uncomputable
+    # by the cache layer" for the sort/distinct guard fixture's purpose
+    # (calc_evaluable_by?/3 checks for a mirrorable `:expr` opt, which a
+    # nil expression here never provides).
+    @impl true
+    def expression(_opts, _context), do: nil
   end
 
   defmodule TestAuthor do

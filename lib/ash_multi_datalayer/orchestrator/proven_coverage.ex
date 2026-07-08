@@ -254,7 +254,10 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
         # paths would hand the sort to the cache layer, which can't order by it.
         # `Coverage.epoch/2` calls `ensure_table` itself, so this branch (which
         # never passes through `covers?`) still warms from a cold start
-        # (pass-6 F2).
+        # (pass-6 F2). P3: also checks `distinct`/`distinct_sort` — the
+        # delegate replays both onto the cache layer on any coverage hit
+        # (recording is blocked for distinct queries, but SERVING isn't),
+        # same silent-wrong-results exposure as sort.
         source_read(
           query,
           resource,
@@ -486,10 +489,17 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
 
   # A calc referenced in the FILTER routes to the source via the normaliser
   # (a calc ref is opaque — no false coverage hit). A calc referenced in the
-  # SORT needs a separate guard: coverage/merge would replay the sort onto the
-  # cache layer, which can't order by a calc it can't compute.
-  defp sort_references_uncomputable_calc?(%Query{sort: sort}, resource, cache_layer) do
-    Enum.any?(sort, fn
+  # SORT, DISTINCT, or DISTINCT_SORT needs a separate guard (P3): the
+  # delegate replays all three onto the cache layer on any coverage hit,
+  # which can't order/group by a calc it can't compute.
+  defp sort_references_uncomputable_calc?(
+         %Query{sort: sort, distinct: distinct, distinct_sort: distinct_sort},
+         resource,
+         cache_layer
+       ) do
+    [sort, distinct, distinct_sort || []]
+    |> Enum.concat()
+    |> Enum.any?(fn
       {%Ash.Query.Calculation{} = calc, _direction} ->
         not calc_evaluable_by?(cache_layer, resource, calc)
 
