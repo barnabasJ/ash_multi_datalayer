@@ -13,11 +13,15 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   alias AshMultiDatalayer.Orchestrator.LocalOutbox.{Snapshot, Target}
   alias AshMultiDatalayer.Sync.Enqueue
   alias AshMultiDatalayer.Sync.Info, as: SyncInfo
-  alias AshMultiDatalayer.TenantKey
 
   # --- queryable state ---------------------------------------------------
 
-  @doc "Pending entries for a host resource (optionally scoped to a tenant)."
+  @doc """
+  Pending entries for a host resource. `tenant` scopes the scan via Ash's own
+  tenancy (the outbox is attribute-multitenant, `global? true`): a tenant sees
+  only that tenant's entries; `nil` (the default) is the unscoped scan across
+  every partition.
+  """
   @spec pending(Ash.Resource.t(), term()) :: [Ash.Resource.record()]
   def pending(host_resource, tenant \\ nil) do
     host_resource
@@ -28,7 +32,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
     |> read()
   end
 
-  @doc "Parked entries for a host resource (optionally scoped to a tenant)."
+  @doc "Parked entries for a host resource. Same `tenant` scoping as `pending/2`."
   @spec parked(Ash.Resource.t(), term()) :: [Ash.Resource.record()]
   def parked(host_resource, tenant \\ nil) do
     host_resource
@@ -374,13 +378,11 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   @spec resume_sync(Ash.Resource.t()) :: :ok
   def resume_sync(host_resource) do
     :ok = Oban.resume_queue(instance(host_resource), queue: queue(host_resource))
-    # Kick the backlog so it drains without waiting for the next sweep tick.
-    # H5: the unscoped sentinel, not the `nil` default — a multitenant host's
-    # real entries are never stored under a `nil` tenant, so relying on the
-    # bare default would silently kick nothing.
+    # Kick the backlog so it drains without waiting for the next sweep tick —
+    # unscoped (no tenant), so every partition's entries are kicked.
     outbox = outbox(host_resource)
 
-    for entry <- pending(host_resource, TenantKey.unscoped()),
+    for entry <- pending(host_resource),
         do: Enqueue.flush_and_log(outbox, entry)
 
     :ok
@@ -424,16 +426,13 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   def refresh(host_resource, scope, tenant \\ nil) do
     local = LocalOutbox.local_layer(host_resource)
     target = last_target(host_resource)
-    # H5: `tenant` may be the unscoped SCAN sentinel (boot_hydrate/resume_sync
-    # asking for every tenant partition's dirty-check) — that is never a real
-    # tenant a target layer's Ash calls understand, so target/backfill calls
-    # translate it back to Ash's own "no tenant" (nil); the dirty-check calls
-    # below keep the raw `tenant` so they can genuinely scan every partition.
-    real_tenant = TenantKey.real(tenant)
-    opts = backfill_opts(host_resource, real_tenant)
+    # One tenant value for everything: target/backfill calls pass it as the
+    # operation's tenant, and dirty-chain checks scope through the outbox's
+    # own attribute multitenancy. `nil` is Ash's unscoped read on both sides.
+    opts = backfill_opts(host_resource, tenant)
 
     with {:ok, {remote_rows, do_delete?}} <-
-           remote_scope(host_resource, target, scope, real_tenant) do
+           remote_scope(host_resource, target, scope, tenant) do
       {refreshed, skipped} =
         Enum.reduce(remote_rows, {0, []}, fn row, {n, skipped} ->
           pk = Snapshot.record_pk(host_resource, row)
@@ -448,14 +447,14 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
         cond do
           # `:all` scope is authoritative over the whole set — reconcile removals.
           do_delete? ->
-            reconcile_deletes(host_resource, local, remote_rows, real_tenant, tenant, opts)
+            reconcile_deletes(host_resource, local, remote_rows, tenant, opts)
 
           # A single-PK refresh whose remote row is GONE mirrors a peer's destroy:
           # remove it locally (unless the PK is dirty — our own unflushed write wins).
           # Without this, an inbound destroy notification (handle_external_change →
           # refresh(pk)) left the deleted row lingering on other online clients.
           is_map(scope) and remote_rows == [] ->
-            delete_local_pk(host_resource, local, scope, real_tenant, tenant, opts)
+            delete_local_pk(host_resource, local, scope, tenant, opts)
 
           true ->
             {:ok, 0}
@@ -472,12 +471,12 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   end
 
   # H3: dirty-check + backfill for ONE PK, atomic via a real `:immediate`
-  # co-commit transaction (see `refresh/3`'s moduledoc). `scan_tenant` may be
-  # the unscoped sentinel (dirty-check scans every partition); `co_commit_repo`
-  # resolution doesn't need a tenant at all.
-  defp atomic_backfill_if_clean(host_resource, local, pk, row, opts, scan_tenant) do
+  # co-commit transaction (see `refresh/3`'s moduledoc). `tenant` is the
+  # operation's tenant (`nil` = unscoped dirty-check across every partition);
+  # `co_commit_repo` resolution doesn't need a tenant at all.
+  defp atomic_backfill_if_clean(host_resource, local, pk, row, opts, tenant) do
     run_atomic(host_resource, fn ->
-      if dirty?(host_resource, pk, scan_tenant) do
+      if dirty?(host_resource, pk, tenant) do
         :skipped
       else
         :ok = Backfill.upsert_record(local, host_resource, row, opts) |> normalize_backfill()
@@ -488,19 +487,15 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
 
   # Destroy a single locally-held row by primary key (a peer's destroy arrived via
   # a per-record notification, so there is no remote row to compare against).
-  # `real_tenant` is always the REAL target-layer value (never the unscoped
-  # scan sentinel); `scan_tenant` may be the sentinel (dirty-check scope).
   # H3: dirty-check + destroy run in the same atomic `:immediate` transaction
   # as `atomic_backfill_if_clean/6`.
-  defp delete_local_pk(host_resource, local, pk, real_tenant, scan_tenant, opts) do
+  defp delete_local_pk(host_resource, local, pk, tenant, opts) do
     result =
       run_atomic(host_resource, fn ->
-        if dirty?(host_resource, pk, scan_tenant) do
+        if dirty?(host_resource, pk, tenant) do
           0
         else
-          case Target.read_pk(host_resource, hd(read_order(host_resource)), pk,
-                 tenant: real_tenant
-               ) do
+          case Target.read_pk(host_resource, hd(read_order(host_resource)), pk, tenant: tenant) do
             {:ok, nil} ->
               0
 
@@ -557,7 +552,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
     )
   end
 
-  @doc "Full hydration: guarded by an empty outbox, then `refresh(:all)`."
+  @doc "Full hydration: guarded by an empty outbox, then `refresh(:all)`. Same `tenant` scoping as `pending/2`."
   @spec hydrate(Ash.Resource.t(), term()) :: {:ok, map()} | {:error, term()}
   def hydrate(host_resource, tenant \\ nil) do
     if outbox_nonempty?(host_resource, tenant) do
@@ -576,13 +571,22 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
 
   @doc "Routes an inbound change notification to a per-record `refresh/3`."
   @spec handle_external_change(Ash.Resource.t(), Ash.Notifier.Notification.t()) :: :ok
-  def handle_external_change(host_resource, %{data: data}) when not is_nil(data) do
+  def handle_external_change(host_resource, %{data: data} = notification) when not is_nil(data) do
     pk = Snapshot.record_pk(host_resource, data)
-    _ = refresh(host_resource, pk, TenantKey.record(host_resource, data, tenant_of(data)))
+    _ = refresh(host_resource, pk, notification_tenant(notification, data))
     :ok
   end
 
   def handle_external_change(_host_resource, _notification), do: :ok
+
+  # Ash carries the notification's tenant on its changeset (a realtime
+  # transport's replayed notification builds a synthetic changeset with the
+  # topic tenant set); a changeset-less notification falls back to the
+  # record's read metadata.
+  defp notification_tenant(%{changeset: %Ash.Changeset{} = changeset}, _record),
+    do: changeset.to_tenant
+
+  defp notification_tenant(_notification, record), do: tenant_of(record)
 
   @doc "Routes a gap notification (missed/unreliable delivery) to a full `refresh(:all)`."
   @spec handle_external_gap(Ash.Resource.t(), term()) :: :ok
@@ -607,14 +611,12 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   end
 
   defp boot_hydrate(resource) do
-    # H5: pass the unscoped scan sentinel explicitly — a multitenant host's
-    # pending entries are stored under their real tenant, never `nil`, so
-    # relying on `refresh`/`hydrate`'s bare `nil` default here would miss
-    # them (`outbox_nonempty?`/`dirty?` would only ever see literal-null
-    # rows) and boot hydration would bypass the dirty-chain rule.
+    # No tenant = Ash's unscoped scan: `outbox_nonempty?`/`dirty?` see every
+    # partition's entries (the outbox is `global? true`), so a multitenant
+    # host's pending entries still gate boot hydration correctly.
     case LocalOutbox.hydrate_mode(resource) do
-      :on_start -> refresh(resource, :all, TenantKey.unscoped())
-      :if_empty -> hydrate(resource, TenantKey.unscoped())
+      :on_start -> refresh(resource, :all)
+      :if_empty -> hydrate(resource)
       _ -> :ok
     end
 
@@ -653,17 +655,16 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
     end
   end
 
-  # `real_tenant` (never the scan sentinel) drives the target-layer read;
-  # `scan_tenant` (may be the sentinel) drives the dirty-chain check — the
-  # same dual-use split as `refresh/3`.
-  # H3: same #18 no-crash contract as `delete_local_pk/6` — a local read
+  # One `tenant` drives both the target-layer read and the dirty-chain check
+  # (`nil` = unscoped on both sides).
+  # H3: same #18 no-crash contract as `delete_local_pk/5` — a local read
   # failure returns `{:error, _}` instead of a `MatchError`. Each candidate
   # row's dirty-check + destroy is atomic (same `:immediate` co-commit
   # transaction pattern), closing the same TOCTOU window per PK.
-  defp reconcile_deletes(host_resource, local, remote_rows, real_tenant, scan_tenant, opts) do
+  defp reconcile_deletes(host_resource, local, remote_rows, tenant, opts) do
     remote_pks = MapSet.new(remote_rows, &Snapshot.record_pk(host_resource, &1))
 
-    case Target.read_all(host_resource, hd(read_order(host_resource)), tenant: real_tenant) do
+    case Target.read_all(host_resource, hd(read_order(host_resource)), tenant: tenant) do
       {:ok, local_rows} ->
         count =
           local_rows
@@ -671,7 +672,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
           |> Enum.reduce(0, fn row, n ->
             pk = Snapshot.record_pk(host_resource, row)
 
-            case atomic_destroy_if_clean(host_resource, local, pk, row, opts, scan_tenant) do
+            case atomic_destroy_if_clean(host_resource, local, pk, row, opts, tenant) do
               :skipped -> n
               :ok -> n + 1
             end
@@ -684,9 +685,9 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
     end
   end
 
-  defp atomic_destroy_if_clean(host_resource, local, pk, row, opts, scan_tenant) do
+  defp atomic_destroy_if_clean(host_resource, local, pk, row, opts, tenant) do
     run_atomic(host_resource, fn ->
-      if dirty?(host_resource, pk, scan_tenant) do
+      if dirty?(host_resource, pk, tenant) do
         :skipped
       else
         :ok = Backfill.destroy_record(local, host_resource, row, opts) |> normalize_backfill()
@@ -727,7 +728,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
       domain: domain(entry.__struct__)
     )
     |> Ash.Query.filter(state != :synced)
-    |> tenant_filter(entry.tenant)
+    |> Ash.Query.set_tenant(entry.tenant)
     |> read()
   end
 
@@ -741,7 +742,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
       domain: domain(outbox)
     )
     |> Ash.Query.filter(state == :pending)
-    |> tenant_filter(entry.tenant)
+    |> Ash.Query.set_tenant(entry.tenant)
     |> Ash.Query.sort(seq: :asc)
     |> Ash.Query.limit(1)
     |> read()
@@ -751,33 +752,16 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
     end
   end
 
+  # Tenant scoping is Ash's own (the outbox is attribute-multitenant,
+  # `global? true`, with `parse_attribute` normalizing any representation to
+  # the stored column form): `set_tenant` with a tenant scopes to its
+  # partition; with `nil` it's the unscoped every-partition scan.
   defp base_query(query, host_resource, tenant) do
     key = Atom.to_string(host_resource)
 
     query
     |> Ash.Query.filter(resource == ^key)
-    |> tenant_filter(scope(host_resource, tenant))
-  end
-
-  # H5: entries are always stored under B3's canonical partition string —
-  # write.ex canonicalizes every enqueue, including a tenant-less write
-  # (which becomes the unscoped sentinel, never a literal `nil` column
-  # value). So a `nil`/unscoped scope argument here means the same thing:
-  # "every partition" — `tenant_filter/2` omits the predicate for both.
-  # Anything else is canonicalized via B3's shared function — never a local
-  # to_string/inspect.
-  defp scope(resource, tenant) do
-    if TenantKey.unscoped?(tenant),
-      do: TenantKey.unscoped(),
-      else: TenantKey.canonical(resource, tenant)
-  end
-
-  defp tenant_filter(query, tenant) do
-    if TenantKey.unscoped?(tenant) do
-      query
-    else
-      Ash.Query.filter(query, tenant == ^tenant)
-    end
+    |> Ash.Query.set_tenant(tenant)
   end
 
   defp read(query), do: Ash.read!(query, authorize?: false)

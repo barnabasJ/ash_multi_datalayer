@@ -5,8 +5,9 @@ defmodule AshMultiDatalayer.Coverage do
 
   Storage is a named public ETS table per resource, owned by
   `AshMultiDatalayer.Coverage.TableOwner` and created lazily on first use.
-  Rows are keyed `{tenant, entry_id}`; `nil` tenants use the `:__global__`
-  sentinel so untagged entries form a distinct partition.
+  Rows are keyed `{tenant, entry_id}`; the tenant component is the operation's
+  own (`Ash.ToTenant`-converted) tenant, or `nil` for untenanted entries,
+  which form their own partition under the `nil` key.
   """
 
   require Logger
@@ -15,13 +16,6 @@ defmodule AshMultiDatalayer.Coverage do
   alias AshMultiDatalayer.DataLayer.Info
   alias AshMultiDatalayer.DataLayer.Query
   alias AshMultiDatalayer.Telemetry
-
-  @global_tenant :__global__
-
-  @doc "The ledger partition key for a tenant (`nil` -> `:__global__`)."
-  @spec tenant_key(term()) :: term()
-  def tenant_key(nil), do: @global_tenant
-  def tenant_key(tenant), do: tenant
 
   @doc """
   Ensures the resource's ledger table exists, lazily starting its owner.
@@ -44,7 +38,7 @@ defmodule AshMultiDatalayer.Coverage do
   @spec entries(module(), term()) :: [term()]
   def entries(resource, tenant) do
     table = TableOwner.table_name(resource)
-    key = tenant_key(tenant)
+    key = tenant
 
     :ets.select(table, [{{{key, :_}, :"$1"}, [], [:"$1"]}])
   rescue
@@ -72,7 +66,7 @@ defmodule AshMultiDatalayer.Coverage do
   @spec insert(module(), term(), %{:id => term(), optional(any()) => any()}) :: :ok
   def insert(resource, tenant, entry) do
     table = TableOwner.table_name(resource)
-    true = :ets.insert(table, {{tenant_key(tenant), entry.id}, entry})
+    true = :ets.insert(table, {{tenant, entry.id}, entry})
     :ok
   rescue
     # L12 item 1: a TableOwner restart between a successful read and its
@@ -88,7 +82,7 @@ defmodule AshMultiDatalayer.Coverage do
   @spec drop(module(), term(), term()) :: :ok
   def drop(resource, tenant, entry_id) do
     table = TableOwner.table_name(resource)
-    true = :ets.delete(table, {tenant_key(tenant), entry_id})
+    true = :ets.delete(table, {tenant, entry_id})
     :ok
   rescue
     ArgumentError -> :ok
@@ -118,7 +112,7 @@ defmodule AshMultiDatalayer.Coverage do
   # `{{tenant, :_}, :"$1"}` select pattern (a 2-tuple key) or colliding with a
   # real entry key, for any tenant value including a tenant literally named
   # `:__mdl_meta__` (review-1 W-P6 / review-2 F11).
-  defp epoch_key(tenant), do: {:__mdl_meta__, :epoch, tenant_key(tenant)}
+  defp epoch_key(tenant), do: {:__mdl_meta__, :epoch, tenant}
 
   @doc """
   Snapshots the current invalidation epoch for a resource+tenant, seeding it
@@ -419,7 +413,7 @@ defmodule AshMultiDatalayer.Coverage do
     else
       entry = %Entry{
         id: make_ref(),
-        tenant: tenant_key(tenant),
+        tenant: tenant,
         filter: query.filter,
         normalised: normalised,
         fingerprint: fingerprint,
@@ -447,7 +441,7 @@ defmodule AshMultiDatalayer.Coverage do
 
       :ets.update_element(
         table,
-        {tenant_key(tenant), existing.id},
+        {tenant, existing.id},
         {2, %Entry{existing | loaded_fields: widened}}
       )
 
@@ -634,7 +628,7 @@ defmodule AshMultiDatalayer.Coverage do
 
     :ets.update_element(
       table,
-      {tenant_key(tenant), entry.id},
+      {tenant, entry.id},
       {2, %Entry{entry | loaded_at: System.monotonic_time()}}
     )
   rescue
@@ -645,7 +639,7 @@ defmodule AshMultiDatalayer.Coverage do
   @spec size(module(), term()) :: non_neg_integer()
   def size(resource, tenant) do
     table = TableOwner.table_name(resource)
-    key = tenant_key(tenant)
+    key = tenant
     :ets.select_count(table, [{{{key, :_}, :_}, [], [true]}])
   rescue
     ArgumentError -> 0

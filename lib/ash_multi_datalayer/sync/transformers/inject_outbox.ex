@@ -33,8 +33,35 @@ defmodule AshMultiDatalayer.Sync.Transformers.InjectOutbox do
 
     dsl
     |> add_attributes()
+    |> add_multitenancy()
     |> add_actions()
     |> add_trigger(queue, max_attempts, module)
+  end
+
+  # The outbox is tenant-partitioned via Ash's OWN tenancy machinery — never a
+  # hand-rolled `tenant == ^...` filter. Attribute-strategy multitenancy is
+  # implemented by Ash core as filter/attribute injection (the data-layer
+  # `:multitenancy` capability only gates the `:context` strategy), so it works
+  # on ash_sqlite too. `global? true` is what makes both scoping modes exist:
+  # a call WITH a tenant sees only that tenant's entries; a call WITHOUT one
+  # (nil) is the unscoped scan every-partition case (sweeper, resume_sync,
+  # boot hydration) — and an untenanted host's entries simply store NULL.
+  defp add_multitenancy(dsl) do
+    dsl
+    |> Transformer.set_option([:multitenancy], :strategy, :attribute)
+    |> Transformer.set_option([:multitenancy], :attribute, :tenant)
+    |> Transformer.set_option([:multitenancy], :global?, true)
+    # The column is `:string`; tenants can be integers/atoms/structs. Ash
+    # applies this to the (already `Ash.ToTenant`-converted) tenant before
+    # stamping/filtering, so every representation lands in one stored form —
+    # callers just `set_tenant` the raw value. `String.Chars.to_string/1`
+    # (a real function — `Kernel.to_string/1` is a macro and cannot be
+    # `apply`'d as a parse_attribute MFA).
+    |> Transformer.set_option(
+      [:multitenancy],
+      :parse_attribute,
+      {String.Chars, :to_string, []}
+    )
   end
 
   # --- attributes --------------------------------------------------------
@@ -50,10 +77,11 @@ defmodule AshMultiDatalayer.Sync.Transformers.InjectOutbox do
       public?: true
     )
     |> attr(:attribute, name: :resource, type: :string, allow_nil?: false, public?: true)
-    # `:string`, not `:term`: the SQLite client stack rejects multitenant
-    # resources (ash_sqlite `can?(:multitenancy) == false`), so `tenant` is
-    # normally nil or a simple identifier — keeping it TEXT keeps the outbox
-    # table SQLite-portable.
+    # The attribute-multitenancy column (see `add_multitenancy/1`): Ash stamps
+    # it from the changeset tenant on enqueue and scopes reads through it via
+    # `Ash.Query.set_tenant`. `:string` (normalized by `parse_attribute`)
+    # keeps the outbox table SQLite-portable; NULL for an untenanted host's
+    # writes.
     |> attr(:attribute, name: :tenant, type: :string, public?: true)
     |> attr(:attribute, name: :record_pk, type: :map, allow_nil?: false, public?: true)
     |> attr(:attribute,
@@ -97,10 +125,11 @@ defmodule AshMultiDatalayer.Sync.Transformers.InjectOutbox do
 
   # --- actions -----------------------------------------------------------
 
+  # `:tenant` is NOT an accepted input — it is the multitenancy attribute,
+  # stamped by Ash from the `:enqueue` changeset's tenant.
   @write_fields [
     :write_ref,
     :resource,
-    :tenant,
     :record_pk,
     :op,
     :payload,

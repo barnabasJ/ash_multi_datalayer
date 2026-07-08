@@ -38,7 +38,6 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
   alias AshMultiDatalayer.DataLayer.Query
   alias AshMultiDatalayer.Delegate
   alias AshMultiDatalayer.KillSwitch
-  alias AshMultiDatalayer.TenantKey
   alias AshMultiDatalayer.Telemetry
 
   # Relationship-aggregate kinds we compute over a related resource — by a SQL
@@ -209,18 +208,21 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
     :ok
   end
 
-  # M2/B3: `forget!/3`'s `tenant:` opt is a coverage-PARTITION lookup (feeds
-  # `Invalidation.on_write/4` -> `Coverage.bump_epoch/2`/`Coverage.entries/2`),
-  # not a target-layer tenant — canonicalize through the one shared function
-  # so it agrees with the read-side partition a prior read recorded under,
-  # even when the caller passed a struct/integer tenant.
-  defp notification_tenant(resource, %{changeset: changeset, data: record})
-       when not is_nil(changeset) do
-    resource |> TenantKey.changeset(changeset, record) |> then(&TenantKey.canonical(resource, &1))
+  # The notification's tenant: Ash carries it on the changeset (a realtime
+  # transport's replayed notification builds its synthetic changeset with the
+  # topic tenant set). A changeset-less notification (e.g. a manual
+  # `Ash.Notifier.notify/1`) falls back to what the record itself carries —
+  # read metadata for context strategy, the tenant attribute otherwise.
+  defp notification_tenant(_resource, %{changeset: %Ash.Changeset{} = changeset}) do
+    changeset.to_tenant
   end
 
   defp notification_tenant(resource, %{data: record}) when not is_nil(record) do
-    resource |> TenantKey.record(record) |> then(&TenantKey.canonical(resource, &1))
+    case Ash.Resource.Info.multitenancy_strategy(resource) do
+      :attribute -> Map.get(record, Ash.Resource.Info.multitenancy_attribute(resource))
+      :context -> record.__metadata__[:tenant]
+      _ -> nil
+    end
   end
 
   # --- writes ------------------------------------------------------------
@@ -1017,11 +1019,12 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
   defp coverage_epoch(resource, query),
     do: Coverage.epoch(resource, coverage_tenant(resource, query))
 
-  # B3: the ledger's own partition key — always the canonical string (or the
-  # unscoped sentinel), never the raw target-layer tenant `TenantKey.query/2`
-  # returns.
-  defp coverage_tenant(resource, query),
-    do: resource |> TenantKey.query(query) |> then(&TenantKey.canonical(resource, &1))
+  # The ledger's partition key is the query's own tenant — Ash converts it
+  # (`to_tenant`) before it reaches the data layer, so read and write sides
+  # agree by construction. A tenant-less read on a `global?` resource lands
+  # in the `nil` partition; invalidation's partition sweep keeps that
+  # consistent with tenant-scoped writes.
+  defp coverage_tenant(_resource, query), do: query.tenant
 
   defp emit_read(kind, query, resource, started, extra) do
     Telemetry.read(

@@ -111,7 +111,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
         authorize?: false
       )
       |> Ash.Query.filter(seq < ^entry.seq and state != :synced)
-      |> tenant_filter(entry.tenant)
+      |> Ash.Query.set_tenant(entry.tenant)
       |> Ash.read!(authorize?: false)
 
     cond do
@@ -174,7 +174,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
       authorize?: false
     )
     |> Ash.Query.filter(state == :pending)
-    |> tenant_filter(entry.tenant)
+    |> Ash.Query.set_tenant(entry.tenant)
     |> Ash.Query.sort(seq: :asc)
     |> Ash.Query.limit(1)
     |> Ash.read!(authorize?: false)
@@ -184,11 +184,11 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
     end
   end
 
-  defp tenant_filter(query, nil), do: Ash.Query.filter(query, is_nil(tenant))
-  defp tenant_filter(query, tenant), do: Ash.Query.filter(query, tenant == ^to_string(tenant))
-
   # --- push to the target -----------------------------------------------
 
+  # `entry.tenant` is the entry's REAL tenant — a canonical string, or nil
+  # for a tenant-less write (stored as NULL). It passes to the target layer
+  # verbatim: no sentinel exists that could leak onto the wire.
   @doc false
   def push(host, %{op: :destroy} = entry) do
     with :ok <- check_stale(host, entry) do

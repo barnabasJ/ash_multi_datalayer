@@ -25,7 +25,6 @@ defmodule AshMultiDatalayer.Coverage.Invalidation do
   alias AshMultiDatalayer.Coverage
   alias AshMultiDatalayer.Coverage.Entry
   alias AshMultiDatalayer.DataLayer.Info
-  alias AshMultiDatalayer.TenantKey
   alias AshMultiDatalayer.Telemetry
 
   @doc """
@@ -71,7 +70,8 @@ defmodule AshMultiDatalayer.Coverage.Invalidation do
   a ledger with nothing to drop for Q racing an in-flight miss for Q;
   skipping the bump when nothing matched would reopen it.
 
-  `tenant` is canonicalized via `TenantKey.canonical/2` (B3) before it's
+  `tenant` is normalized via `Ash.ToTenant` (the same conversion `set_tenant`
+  applies, so it agrees with the partition a read recorded under) before it's
   used as a ledger partition key — callers may pass any tenant
   representation. For a `global? true` resource (P4), the write also sweeps
   the complementary partition(s): a tenant-scoped write ALSO touches the
@@ -92,7 +92,7 @@ defmodule AshMultiDatalayer.Coverage.Invalidation do
   def on_write(resource, tenant, row_before, row_after) do
     evict_physical_row(resource, tenant, row_before)
 
-    partition = TenantKey.canonical(resource, tenant)
+    partition = tenant && Ash.ToTenant.to_tenant(tenant, resource)
 
     [partition | sweep_partitions(resource, partition)]
     |> Enum.reduce(0, fn p, total ->
@@ -129,10 +129,10 @@ defmodule AshMultiDatalayer.Coverage.Invalidation do
   # read could ever have used.
   defp sweep_partitions(resource, partition) do
     if Ash.Resource.Info.multitenancy_global?(resource) do
-      if TenantKey.unscoped?(partition) do
-        resource |> Coverage.partitions() |> Enum.reject(&(&1 == partition))
+      if is_nil(partition) do
+        resource |> Coverage.partitions() |> Enum.reject(&is_nil/1)
       else
-        [TenantKey.unscoped()]
+        [nil]
       end
     else
       []
@@ -282,12 +282,12 @@ defmodule AshMultiDatalayer.Coverage.Invalidation do
   state, only clearing the partition is provably safe.
 
   Bumps the invalidation epoch first, unconditionally — same reasoning as
-  `on_write/4`. `tenant` is canonicalized via `TenantKey.canonical/2` (B3),
+  `on_write/4`. `tenant` is normalized via `Ash.ToTenant` (as in `on_write/4`),
   and the same `global?` sweep as `on_write/4` applies (P4).
   """
   @spec drop_all(module(), term()) :: non_neg_integer()
   def drop_all(resource, tenant) do
-    partition = TenantKey.canonical(resource, tenant)
+    partition = tenant && Ash.ToTenant.to_tenant(tenant, resource)
 
     [partition | sweep_partitions(resource, partition)]
     |> Enum.reduce(0, &(&2 + drop_all_for_partition(resource, &1)))

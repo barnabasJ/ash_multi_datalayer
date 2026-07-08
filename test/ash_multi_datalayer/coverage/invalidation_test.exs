@@ -9,7 +9,7 @@ defmodule AshMultiDatalayer.Coverage.InvalidationTest do
 
     %Entry{
       id: make_ref(),
-      tenant: :__global__,
+      tenant: nil,
       filter: filter,
       normalised: filter && Normaliser.normalise(filter, TestPost),
       loaded_fields: MapSet.new([:id, :name, :age]),
@@ -60,7 +60,7 @@ defmodule AshMultiDatalayer.Coverage.InvalidationTest do
     # A filter whose expression the evaluator cannot process at all.
     broken = %Entry{
       id: make_ref(),
-      tenant: :__global__,
+      tenant: nil,
       filter: %Ash.Filter{resource: TestPost, expression: {:garbage, :expression}},
       normalised: nil,
       loaded_fields: MapSet.new([:id]),

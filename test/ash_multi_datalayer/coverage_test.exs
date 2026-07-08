@@ -23,7 +23,7 @@ defmodule AshMultiDatalayer.CoverageTest do
   defp entry(id) do
     %Entry{
       id: id,
-      tenant: :__global__,
+      tenant: nil,
       filter: nil,
       normalised: %AshMultiDatalayer.Coverage.Normaliser.Normalised{disjuncts: [%{}]},
       fingerprint: 0,

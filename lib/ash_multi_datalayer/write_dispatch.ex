@@ -31,7 +31,6 @@ defmodule AshMultiDatalayer.WriteDispatch do
   alias AshMultiDatalayer.Coverage.Invalidation
   alias AshMultiDatalayer.DataLayer.Info
   alias AshMultiDatalayer.KillSwitch
-  alias AshMultiDatalayer.TenantKey
   alias AshMultiDatalayer.Telemetry
 
   @spec create(module(), Ash.Changeset.t()) ::
@@ -88,16 +87,17 @@ defmodule AshMultiDatalayer.WriteDispatch do
     case authoritative_write.(authoritative) do
       # M1: an upsert_condition-skipped upsert wrote nothing — `record` here
       # is a `{:upsert_skipped, query, callback}` tuple, not a record.
-      # `TenantKey.changeset/3` (attribute-multitenant resources extract the
-      # tenant FROM the record's attributes) would `Map.get` on the tuple
-      # and crash AFTER the authoritative write already ran. Surface it
-      # unchanged instead — no invalidation/propagation for a write that
+      # Surface it unchanged — no invalidation/propagation for a write that
       # didn't happen.
       {:ok, {:upsert_skipped, _query, _callback} = skipped} ->
         {:ok, skipped}
 
       {:ok, record} ->
-        tenant = TenantKey.changeset(resource, changeset, record)
+        # Ash carries the action's tenant on the changeset (and enforces it
+        # for non-`global?` multitenant resources); a tenant-less write on a
+        # `global?` resource is genuinely unscoped (nil) — invalidation's
+        # partition sweep handles that conservatively.
+        tenant = changeset.to_tenant
         dropped = invalidate(resource, tenant, changeset, operation, record)
 
         if KillSwitch.enabled?(resource) do

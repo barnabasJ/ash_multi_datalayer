@@ -59,7 +59,7 @@ defmodule AshMultiDatalayer.Test.Tenancy.AttrPost do
     # `{:ok, {:upsert_skipped, query, callback}}` when the row exists but
     # `upsert_condition` is false) through this attribute-multitenant
     # ProvenCoverage resource — WriteDispatch.dispatch/4 crashed calling
-    # TenantKey.changeset/3 (which extracts the tenant FROM the record's
+    # tenant derivation (which extracts the tenant FROM the record's
     # attributes) on that tuple.
     create :upsert_if_newer do
       accept [:org_id, :title]

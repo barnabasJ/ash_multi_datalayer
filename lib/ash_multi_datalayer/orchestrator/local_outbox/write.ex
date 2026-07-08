@@ -25,7 +25,6 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
   alias AshMultiDatalayer.Orchestrator.LocalOutbox
   alias AshMultiDatalayer.Orchestrator.LocalOutbox.{Snapshot, Target}
   alias AshMultiDatalayer.Sync.Enqueue
-  alias AshMultiDatalayer.TenantKey
 
   @doc false
   def run(resource, changeset, op) do
@@ -60,7 +59,9 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
     # drains, and the recreated row is later deleted by the stale flush.
     record_pk = Snapshot.record_pk(resource, drain_pk_source(changeset))
 
-    tenant = TenantKey.changeset(resource, changeset, changeset.data)
+    # Ash carries the action's tenant on the changeset (enforced for
+    # non-`global?` multitenant resources).
+    tenant = changeset.to_tenant
 
     with :ok <- drain_chain_inline(resource, record_pk, tenant),
          {:ok, record, fields} <- materialize(resource, changeset, op),
@@ -95,7 +96,6 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
     write_ref = Ash.UUID.generate()
     payload = payload(op_atom, resource, changeset.data)
     base_image = base_image(op_atom, resource, changeset)
-    tenant_key = TenantKey.canonical(resource, tenant)
 
     for target <- LocalOutbox.targets(resource) do
       outbox
@@ -104,14 +104,17 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
         %{
           write_ref: write_ref,
           resource: Atom.to_string(resource),
-          tenant: tenant_key,
           record_pk: record_pk,
           op: op_atom,
           payload: payload,
           base_image: base_image,
           target: target
         },
-        domain: domain
+        domain: domain,
+        # `:tenant` is the outbox's multitenancy attribute — Ash stamps it
+        # from the changeset tenant (normalized by `parse_attribute`), never
+        # as a plain input field.
+        tenant: tenant
       )
       |> Ash.create!(authorize?: false)
       |> Ash.Changeset.for_update(
@@ -137,12 +140,11 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
   defp drain_chain_inline(resource, record_pk, tenant) do
     outbox = LocalOutbox.outbox_resource(resource)
     key = Atom.to_string(resource)
-    tenant_key = TenantKey.canonical(resource, tenant)
 
     outbox
     |> Ash.Query.for_read(:read, %{}, domain: Ash.Resource.Info.domain(outbox))
     |> Ash.Query.filter(resource == ^key and record_pk == ^record_pk and state != :synced)
-    |> tenant_filter(tenant_key)
+    |> Ash.Query.set_tenant(tenant)
     |> Ash.Query.sort(seq: :asc)
     |> Ash.read!(authorize?: false)
     |> Enum.reduce_while(:ok, fn entry, :ok ->
@@ -166,13 +168,6 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
       end
     end)
   end
-
-  # `tenant_key` is always B3's canonical partition string (never nil —
-  # `TenantKey.canonical/2` maps a tenant-less write to the single unscoped
-  # sentinel, stored/matched like any other partition) — a plain equality
-  # filter, no local to_string/inspect.
-  defp tenant_filter(query, tenant_key),
-    do: Ash.Query.filter(query, tenant == ^to_string(tenant_key))
 
   # Materializes the record write_through pushes to targets — WITHOUT running
   # the local write yet (M-2's reorder: targets first, local last). A destroy
@@ -302,7 +297,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
         case local_write(local, resource, changeset, op) do
           # M1: an upsert_condition-skipped upsert wrote nothing locally —
           # `{:upsert_skipped, query, callback}` isn't a record, so it must
-          # never reach `Snapshot.record_pk`/`TenantKey.changeset`
+          # never reach `Snapshot.record_pk`
           # (enqueue_entries) or `finalize/3`'s `.__metadata__` access.
           # Surface it unchanged, the same posture WriteDispatch already
           # takes for ProvenCoverage.
@@ -388,11 +383,9 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
     payload = payload(op_atom, resource, record)
     base_image = base_image(op_atom, resource, changeset)
 
-    tenant =
-      resource
-      |> TenantKey.changeset(changeset, record)
-      |> then(&TenantKey.canonical(resource, &1))
-      |> to_string()
+    # The host write's real tenant (nil for a tenant-less write) — the outbox's
+    # own multitenancy normalizes it into the stored column form.
+    tenant = changeset.to_tenant
 
     for target <- targets do
       outbox
@@ -401,14 +394,16 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
         %{
           write_ref: write_ref,
           resource: Atom.to_string(resource),
-          tenant: tenant,
           record_pk: record_pk,
           op: op_atom,
           payload: payload,
           base_image: base_image,
           target: target
         },
-        domain: domain
+        domain: domain,
+        # `:tenant` is the outbox's multitenancy attribute — Ash stamps it
+        # from the changeset tenant, never as a plain input field.
+        tenant: tenant
       )
       |> Ash.create!(authorize?: false)
     end

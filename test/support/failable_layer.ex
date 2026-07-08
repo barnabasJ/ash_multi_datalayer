@@ -55,6 +55,8 @@ defmodule AshMultiDatalayer.Test.FailableLayer do
       if function_exported?(wraps, :upsert, 4) do
         quote do
           def upsert(resource, changeset, keys, identity \\ nil) do
+            AshMultiDatalayer.Test.FailableLayer.record_write_tenant(__MODULE__, changeset)
+
             AshMultiDatalayer.Test.FailableLayer.guard_upsert(__MODULE__, fn ->
               unquote(wraps).upsert(resource, changeset, keys, identity)
             end)
@@ -63,6 +65,8 @@ defmodule AshMultiDatalayer.Test.FailableLayer do
       else
         quote do
           def upsert(resource, changeset, keys) do
+            AshMultiDatalayer.Test.FailableLayer.record_write_tenant(__MODULE__, changeset)
+
             AshMultiDatalayer.Test.FailableLayer.guard_upsert(__MODULE__, fn ->
               unquote(wraps).upsert(resource, changeset, keys)
             end)
@@ -76,6 +80,8 @@ defmodule AshMultiDatalayer.Test.FailableLayer do
       unquote(upsert_def)
 
       def destroy(resource, changeset) do
+        AshMultiDatalayer.Test.FailableLayer.record_write_tenant(__MODULE__, changeset)
+
         AshMultiDatalayer.Test.FailableLayer.guard(__MODULE__, fn ->
           unquote(wraps).destroy(resource, changeset)
         end)
@@ -152,6 +158,27 @@ defmodule AshMultiDatalayer.Test.FailableLayer do
 
   @doc "Disarm the layer's read failure — reads delegate normally again."
   def clear_reads(layer), do: :ets.delete(@table, {layer, :reads})
+
+  @doc false
+  # Every upsert/destroy records the tenant its changeset carried, so a test
+  # can assert on what actually crossed the target-layer boundary (e.g. the
+  # LocalOutbox flush must pass a REAL tenant — nil for an untenanted host,
+  # never any internal bookkeeping value).
+  def record_write_tenant(layer, %Ash.Changeset{} = changeset),
+    do: :ets.insert(@table, {{layer, :last_write_tenant}, changeset.tenant})
+
+  def record_write_tenant(_layer, _other), do: :ok
+
+  @doc "The tenant the layer's most recent upsert/destroy changeset carried."
+  def last_write_tenant(layer) do
+    case :ets.lookup(@table, {layer, :last_write_tenant}) do
+      [{_, tenant}] -> {:ok, tenant}
+      [] -> :error
+    end
+  end
+
+  @doc "Forget any recorded write tenant (call in setup for isolation)."
+  def clear_write_tenant(layer), do: :ets.delete(@table, {layer, :last_write_tenant})
 
   @doc false
   def guard_read(layer, delegate) do

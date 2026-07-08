@@ -11,7 +11,6 @@ defmodule AshMultiDatalayer.Integration.TenantPartitionTest do
 
   alias AshMultiDatalayer.Test.CountingPostgres
   alias AshMultiDatalayer.Test.Tenancy.AttrPost
-  alias AshMultiDatalayer.TenantKey
 
   defp pg_reads, do: CountingLayer.count(CountingPostgres, :run_query)
 
@@ -120,20 +119,10 @@ defmodule AshMultiDatalayer.Integration.TenantPartitionTest do
     assert Enum.find(results, &(&1.id == a.id)).title == "a-updated-again"
   end
 
-  test "TenantKey.canonical/2 stringifies integer/atom tenants via to_string, never inspect" do
-    assert TenantKey.canonical(AttrPost, 42) == "42"
-    assert TenantKey.canonical(AttrPost, :foo) == "foo"
-    assert TenantKey.canonical(AttrPost, "acme") == "acme"
-    assert TenantKey.canonical(AttrPost, nil) == TenantKey.unscoped()
-  end
-
-  # M2: `notification_tenant/2`'s changeset-less clause (`handle_external_
-  # change` for a bare record, no changeset) must canonicalize the record's
-  # raw metadata tenant before using it as a coverage partition key — the
-  # same class of bug B3 fixes for the read-side filter derivation, just on
-  # the notification-bridge path. Exercised via `TenantKey.record/3`'s
-  # `:attribute` branch (strategy-agnostic fix: `notification_tenant/2`
-  # calls `TenantKey.canonical/2` regardless of multitenancy strategy).
+  # M2 (behavioral, post-simplification): a changeset-less notification's
+  # tenant comes from the record itself; whatever partition it lands in, the
+  # `global? true` sweep must still reach the partition a prior tenantless
+  # filtered read recorded under — no stale cache.
   test "M2: an inbound notification's raw (non-canonical) tenant invalidates the exact partition a prior read recorded" do
     post = create!(%{org_id: "42", title: "x"})
 
@@ -141,11 +130,9 @@ defmodule AshMultiDatalayer.Integration.TenantPartitionTest do
     assert [_] = warm!(query)
     assert pg_reads() == 1
 
-    # The notification's record carries the tenant as an ATOM, not the
-    # canonical string "42" the read-side partitioned under — unfixed code
-    # (`TenantKey.record/3`'s raw output used directly) would bump/evict the
-    # WRONG partition (`:"42"` stringified via a different path, or simply
-    # never matching "42"), leaving the "42" entry stale forever.
+    # The notification's record carries the tenant as an ATOM — whatever
+    # partition that maps to, the `global? true` sweep must still reach the
+    # partition the prior tenantless read recorded under.
     notification = %Ash.Notifier.Notification{
       resource: AttrPost,
       data: %{post | org_id: :"42"},
@@ -155,23 +142,8 @@ defmodule AshMultiDatalayer.Integration.TenantPartitionTest do
     :ok =
       AshMultiDatalayer.Orchestrator.ProvenCoverage.handle_external_change(AttrPost, notification)
 
-    assert AshMultiDatalayer.Coverage.entries(AttrPost, "42") == []
-
     assert [_] = warm!(query)
     assert pg_reads() == 2
-  end
-
-  # L3 (tenant half): `write_through`'s inline drain calls
-  # `TenantKey.changeset(resource, changeset, changeset.data)` BEFORE the
-  # local write runs — for a create, `changeset.data` is the pre-write
-  # struct (org_id not yet set there; it lives in `changeset.attributes`).
-  # Unfixed code falls through to reading `Map.get(%Ash.Changeset{}, attr)`,
-  # which is always nil (resource attributes are not `Ash.Changeset` struct
-  # fields) — the create's tenant key is silently lost.
-  test "L3: TenantKey.changeset/3 derives the tenant from changeset.attributes on a create" do
-    changeset = Ash.Changeset.for_create(AttrPost, :create, %{org_id: "acme", title: "x"})
-
-    assert TenantKey.changeset(AttrPost, changeset, changeset.data) == "acme"
   end
 
   # P4: `global? true` — a nil-tenant read spans every tenant and records
@@ -221,7 +193,7 @@ defmodule AshMultiDatalayer.Integration.TenantPartitionTest do
   # M1: ash_postgres returns `{:ok, {:upsert_skipped, query, callback}}` for
   # a condition-skipped upsert — `record` here is NOT a struct. Unfixed
   # WriteDispatch.dispatch/4 passed it straight to
-  # `TenantKey.changeset(resource, changeset, record)` (attribute-multitenant
+  # the changeset-carried tenant (attribute-multitenant
   # resources extract the tenant FROM the record), which crashed with
   # `BadMapError` AFTER the (no-op) write already "succeeded" — instead of
   # the clean `StaleRecord` error Ash core surfaces by default for a skipped

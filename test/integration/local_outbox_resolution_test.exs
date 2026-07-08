@@ -690,7 +690,6 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxResolutionTest do
         %{
           write_ref: write_ref,
           resource: Atom.to_string(Widget),
-          tenant: "__global__",
           record_pk: %{"id" => pk},
           op: op,
           payload: payload,

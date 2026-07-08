@@ -231,7 +231,7 @@ defmodule AshMultiDatalayer.Integration.SubsumptionTest do
 
   test "tenantless reads use the global partition consistently" do
     TestPost |> Ash.Query.filter(name == "foo") |> Ash.read!()
-    assert [%{tenant: :__global__}] = AshMultiDatalayer.Coverage.entries(TestPost, nil)
+    assert [%{tenant: nil}] = AshMultiDatalayer.Coverage.entries(TestPost, nil)
   end
 
   test "cached rows carry the same values as the source of truth" do

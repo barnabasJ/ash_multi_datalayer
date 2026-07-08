@@ -317,9 +317,9 @@ end
 defmodule AshMultiDatalayer.Test.LocalOutbox.MtWidget do
   @moduledoc """
   Host under LocalOutbox with attribute-strategy multitenancy (`global?
-  true`) — H5: the outbox tenant model must distinguish "unscoped" from
-  "IS NULL" for a genuinely multitenant host's boot hydration / resume /
-  dirty-chain checks.
+  true`) — H5: a genuinely multitenant host's boot hydration / resume /
+  dirty-chain checks must scan every tenant partition when unscoped, via
+  the outbox's own attribute multitenancy.
   """
   use Ash.Resource,
     domain: AshMultiDatalayer.Test.LocalOutbox.Domain,

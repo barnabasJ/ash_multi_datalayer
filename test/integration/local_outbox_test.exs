@@ -136,6 +136,36 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
       assert LocalOutbox.await(w, timeout: 200) == :synced
     end
 
+    test "flush passes a REAL tenant to the target — an untenanted host's entry stores and pushes nil" do
+      FailableLayer.clear_write_tenant(Remote)
+      create!(name: "tenant-boundary")
+
+      # An untenanted host's entry stores Ash's own "no tenant": a NULL
+      # column, never a sentinel that could masquerade as a real tenant.
+      assert [%{tenant: nil}] = entries()
+
+      drain()
+      assert [%{state: :synced}] = entries()
+
+      # The target layer's Ash calls must see nil too. The historical
+      # regression here was a `"__global__"` partition sentinel leaking onto
+      # the wire for a remote target, making the server broadcast the change
+      # to a tenant-scoped topic no untenanted client ever joins — flush-origin
+      # writes then silently stopped replicating to peers.
+      assert FailableLayer.last_write_tenant(Remote) == {:ok, nil}
+    end
+
+    test "destroy flush also crosses the boundary with a REAL tenant" do
+      w = create!(name: "tenant-boundary-destroy")
+      drain()
+
+      FailableLayer.clear_write_tenant(Remote)
+      w |> Ash.Changeset.for_destroy(:destroy, %{}, domain: Domain) |> Ash.destroy!()
+      drain()
+
+      assert FailableLayer.last_write_tenant(Remote) == {:ok, nil}
+    end
+
     test "status/1 works on a record READ from the local layer (not just a fresh write)" do
       w = create!(name: "st")
       # a record read back from the local layer carries no outbox_ref metadata,
@@ -748,7 +778,6 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
 
   describe "H5: multitenant boot hydration / resume / dirty-chain scans" do
     alias AshMultiDatalayer.Test.LocalOutbox.MtWidget
-    alias AshMultiDatalayer.TenantKey
 
     defp mt_create!(attrs) do
       MtWidget
@@ -759,17 +788,15 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
     test "boot hydration (unscoped scan) does not bypass the dirty-chain rule for a real tenant's pending write" do
       w = mt_create!(org_id: "t1", name: "mine-unflushed")
 
-      # Mirrors what `boot_hydrate/1`'s `:on_start` branch now does — pass
-      # the unscoped scan sentinel explicitly, not the bare `nil` default.
-      # Unfixed code (`nil` -> `is_nil(tenant)`) sees zero pending entries
-      # for a multitenant host (every real entry has a real tenant string,
-      # never a literal null column) -> reports empty -> bypasses the
-      # dirty-chain rule -> the remote-authoritative `:all` reconcile then
-      # DELETES this still-pending local write (remote has nothing yet).
-      # `:all` scope is authoritative-reconcile: a local row absent from the
-      # (empty) remote result is normally DELETED — unless the dirty-chain
-      # check (which is what's under test) protects it.
-      assert %{deleted: 0} = LocalOutbox.refresh(MtWidget, :all, TenantKey.unscoped())
+      # Mirrors `boot_hydrate/1`'s `:on_start` branch — no tenant, i.e. Ash's
+      # unscoped scan (the outbox is attribute-multitenant `global? true`),
+      # which sees every partition's pending entries including this real
+      # tenant's. H5's historical failure mode was a hand-rolled
+      # `nil -> is_nil(tenant)` filter that saw zero pending entries for a
+      # multitenant host -> bypassed the dirty-chain rule -> the
+      # remote-authoritative `:all` reconcile then DELETED this still-pending
+      # local write (remote has nothing yet).
+      assert %{deleted: 0} = LocalOutbox.refresh(MtWidget, :all)
       assert [%{id: id, name: "mine-unflushed"}] = local(MtWidget)
       assert id == w.id
     end
@@ -814,14 +841,16 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
           %{
             write_ref: Ash.UUID.generate(),
             resource: Atom.to_string(MtWidget),
-            tenant: "t1",
             record_pk: %{"id" => pk},
             op: :create,
             payload: %{"id" => pk, "org_id" => "t1", "name" => "mt-lost-kick"},
             base_image: nil,
             target: :remote
           },
-          domain: Domain
+          domain: Domain,
+          # `:tenant` is the outbox's multitenancy attribute — stamped from
+          # the changeset tenant, never plain input.
+          tenant: "t1"
         )
         |> Ash.create!(authorize?: false)
 

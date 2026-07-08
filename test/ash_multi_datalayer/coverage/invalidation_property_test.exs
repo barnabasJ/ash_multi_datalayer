@@ -24,7 +24,7 @@ defmodule AshMultiDatalayer.Coverage.InvalidationPropertyTest do
           ) do
       entry = %Entry{
         id: make_ref(),
-        tenant: :__global__,
+        tenant: nil,
         filter: filter,
         normalised: Normaliser.normalise(filter, TestPost),
         loaded_fields: MapSet.new([:id]),
