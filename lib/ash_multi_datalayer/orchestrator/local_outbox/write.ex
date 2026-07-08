@@ -279,7 +279,13 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
 
   defp normalize(:ok), do: :ok
   defp normalize({:ok, _}), do: :ok
-  defp normalize({:error, :no_rollback, error}), do: {:error, error}
+  # L11: this result propagates through `push_all_targets/5`'s `with :ok <-`
+  # all the way back to `write_through/3`'s return value — which Ash's own
+  # transaction machinery sees directly (`run/3` is the orchestrator's write
+  # entry point). A `{:error, :no_rollback, reason}` here must reach Ash as
+  # the same 3-tuple, or Ash rolls back a transaction the target's layer
+  # explicitly said to preserve.
+  defp normalize({:error, :no_rollback, _reason} = error), do: error
   defp normalize({:error, error}), do: {:error, error}
 
   # --- async (default) write path ---------------------------------------
@@ -309,6 +315,14 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
 
             {:ok, record, entries}
 
+          # L11: `local_write/4`'s `{:upsert, ...}` clause can return a
+          # preserved `{:error, :no_rollback, reason}` 3-tuple — match it
+          # explicitly (a bare `{:error, _}` pattern does not match a
+          # 3-tuple) so it reaches `in_transaction/2`'s own handling, and
+          # ultimately `committed`, unchanged.
+          {:error, :no_rollback, _reason} = error ->
+            error
+
           {:error, _} = error ->
             error
         end
@@ -327,6 +341,15 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
 
       {:skipped, skipped} ->
         {:ok, skipped}
+
+      # L11: `local_write/4`'s `{:upsert, ...}` clause can now return a
+      # preserved `{:error, :no_rollback, reason}` 3-tuple (see
+      # `normalize_upsert/1`) — match it explicitly so it reaches Ash
+      # unchanged instead of falling through to the 2-tuple clause below,
+      # which would raise a CaseClauseError (the exact crash plan A2 item 2
+      # originally fixed by stripping this signal everywhere).
+      {:error, :no_rollback, _reason} = error ->
+        error
 
       {:error, error} ->
         {:error, error}
@@ -406,7 +429,11 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Write do
 
   defp base_image(_op, _resource, _changeset), do: nil
 
-  defp normalize_upsert({:error, :no_rollback, reason}), do: {:error, reason}
+  # L11: this result propagates directly back through `write_through/3`'s
+  # `case local_write(...) do {:error, _reason} = failure -> failure end` to
+  # `run/3`'s return value — Ash's own transaction machinery. Preserve the
+  # 3-tuple for the same reason as `normalize/1` above.
+  defp normalize_upsert({:error, :no_rollback, _reason} = error), do: error
   defp normalize_upsert(other), do: other
 
   # --- co-commit transaction --------------------------------------------

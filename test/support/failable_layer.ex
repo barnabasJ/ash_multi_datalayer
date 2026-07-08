@@ -111,6 +111,10 @@ defmodule AshMultiDatalayer.Test.FailableLayer do
       [{^layer, :transient}] -> {:error, {:transient, "target transiently unavailable"}}
       [{^layer, :forbidden}] -> {:error, %Ash.Error.Forbidden{}}
       [{^layer, :not_found}] -> {:error, %Ash.Error.Query.NotFound{}}
+      # L11: mirrors a layer that fails a write but tells Ash's transaction
+      # machinery not to roll back the surrounding transaction — deterministic
+      # repro fixture, no real data layer in this suite emits this natively.
+      [{^layer, :no_rollback}] -> {:error, :no_rollback, "target failed, do not roll back"}
       _ -> delegate.()
     end
   end

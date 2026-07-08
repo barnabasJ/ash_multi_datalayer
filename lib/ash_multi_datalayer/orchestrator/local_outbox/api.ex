@@ -846,14 +846,26 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
     :ok
   end
 
+  # L11: safe to normalize here — every caller (discard_local/1, rebase/2,
+  # discard/1) is a direct resolution-API call, never routed back through
+  # Ash's own transaction machinery (a caller invokes these functions
+  # directly; Ash never calls them as part of an action).
   defp normalize(:ok), do: :ok
   defp normalize({:ok, _}), do: :ok
+  defp normalize({:error, :no_rollback, reason}), do: {:error, reason}
   defp normalize({:error, error}), do: {:error, error}
 
+  # L11: also safe — every caller is a boot/resume background task
+  # (boot_hydrate, resume_sync) that already turns any failure into a raise
+  # regardless of shape; :no_rollback carries no meaning outside an Ash
+  # transaction Ash itself is running.
   defp normalize_backfill(:ok), do: :ok
   defp normalize_backfill({:ok, _}), do: :ok
 
   defp normalize_backfill({:error, _layer, reason}),
+    do: raise("backfill failed: #{inspect(reason)}")
+
+  defp normalize_backfill({:error, :no_rollback, reason}),
     do: raise("backfill failed: #{inspect(reason)}")
 
   defp normalize_backfill({:error, reason}), do: raise("backfill failed: #{inspect(reason)}")

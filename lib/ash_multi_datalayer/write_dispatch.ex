@@ -78,7 +78,14 @@ defmodule AshMultiDatalayer.WriteDispatch do
     [authoritative | rest] = Info.write_layer_modules(resource)
     started = System.monotonic_time()
 
-    case normalize_result(authoritative_write.(authoritative)) do
+    # L11: the authoritative write's result propagates all the way back to
+    # Ash's own transaction machinery (this function IS the DataLayer
+    # create/update/upsert/destroy callback) — a `{:error, :no_rollback,
+    # reason}` here must reach Ash as the same 3-tuple, or Ash rolls back a
+    # transaction the layer explicitly said to preserve. Only the
+    # `{:ok, ...}`/plain-`{:error, _}` shapes get matched here; the
+    # 3-tuple case falls through unnormalized.
+    case authoritative_write.(authoritative) do
       # M1: an upsert_condition-skipped upsert wrote nothing — `record` here
       # is a `{:upsert_skipped, query, callback}` tuple, not a record.
       # `TenantKey.changeset/3` (attribute-multitenant resources extract the
@@ -109,6 +116,9 @@ defmodule AshMultiDatalayer.WriteDispatch do
         )
 
         {:ok, record}
+
+      {:error, :no_rollback, _reason} = error ->
+        error
 
       {:error, _} = error ->
         error
@@ -143,6 +153,11 @@ defmodule AshMultiDatalayer.WriteDispatch do
           _write -> propagate_upsert(layer, resource, record, opts)
         end
 
+      # L11: safe to normalize — this result is only ever logged/telemetried
+      # (Enum.each discards it, and the caller never binds propagate/6's
+      # return value), never returned to Ash's transaction machinery. The
+      # authoritative write above (never a secondary/cache layer) is the
+      # only result on that path.
       case normalize_result(result) do
         :ok ->
           :ok

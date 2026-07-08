@@ -1004,6 +1004,31 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxResolutionTest do
     end
   end
 
+  describe "L11: {:error, :no_rollback, _} survives the authoritative-upsert boundary" do
+    test "the local layer's :no_rollback signal reaches the DataLayer.upsert/4 caller unstripped" do
+      # FailableLocalWidget's local (authoritative) layer is FailableSqlite —
+      # arm it to return the 3-tuple FailableLayer.guard/2 now supports (L11).
+      # Call Ash.DataLayer.upsert/4 directly (the same entry point Ash's own
+      # transaction-wrapped action dispatch uses) rather than going through
+      # Ash.create!, which would wrap this in an Ash.Error and hide the raw
+      # shape this fix is actually about preserving.
+      FailableLayer.fail(FailableSqlite, :no_rollback)
+
+      changeset =
+        FailableLocalWidget
+        |> Ash.Changeset.for_create(:upsert_by_name, %{name: "l11-upsert"}, domain: Domain)
+
+      # Unfixed: local_write/4's {:upsert, ...} clause called
+      # normalize_upsert/1, which stripped :no_rollback down to {:error,
+      # reason} before async_run/3's in_transaction wrapper ever saw it —
+      # this assertion fails on unfixed code (2-tuple instead of 3-tuple).
+      assert {:error, :no_rollback, _reason} =
+               Ash.DataLayer.upsert(FailableLocalWidget, changeset, [:name], nil)
+    after
+      FailableLayer.clear(FailableSqlite)
+    end
+  end
+
   describe "L5: sweeper {:global, ...} name collision is a clear, deliberate rejection" do
     test "a second start_link for the same resource set fails with {:already_started, _}, not a crash" do
       # `{:global, ...}` names are unique regardless of node count — even on

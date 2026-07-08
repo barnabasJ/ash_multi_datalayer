@@ -192,22 +192,33 @@ defmodule AshMultiDatalayer.Coverage.Invalidation do
             :ok ->
               :ok
 
-            {:error, reason} ->
-              Logger.warning(
-                "ash_multi_datalayer physical eviction on #{inspect(layer)} failed for " <>
-                  "#{inspect(resource)}: #{inspect(reason)} — a surviving ghost row is " <>
-                  "cleaned up by the next covering read's reconcile pass"
-              )
+            # L11: safe to normalize — this Enum.each result is discarded,
+            # never returned to Ash (physical eviction runs synchronously
+            # inside the authoritative write's own flow, but its outcome
+            # never feeds back into that write's own result).
+            {:error, :no_rollback, reason} ->
+              log_eviction_failure(layer, resource, tenant, reason)
 
-              Telemetry.ledger(:evict_failed, resource, tenant, %{}, %{
-                layer: layer,
-                reason: reason
-              })
+            {:error, reason} ->
+              log_eviction_failure(layer, resource, tenant, reason)
           end
         end)
     end
 
     :ok
+  end
+
+  defp log_eviction_failure(layer, resource, tenant, reason) do
+    Logger.warning(
+      "ash_multi_datalayer physical eviction on #{inspect(layer)} failed for " <>
+        "#{inspect(resource)}: #{inspect(reason)} — a surviving ghost row is " <>
+        "cleaned up by the next covering read's reconcile pass"
+    )
+
+    Telemetry.ledger(:evict_failed, resource, tenant, %{}, %{
+      layer: layer,
+      reason: reason
+    })
   end
 
   @doc """

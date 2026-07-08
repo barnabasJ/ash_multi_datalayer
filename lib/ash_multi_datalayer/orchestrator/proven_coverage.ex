@@ -972,17 +972,27 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
       :ok ->
         :ok
 
-      {:error, reason} ->
-        Logger.warning(
-          "ash_multi_datalayer reconcile eviction on #{inspect(layer)} failed for " <>
-            "#{inspect(resource)}: #{inspect(reason)}"
-        )
+      # L11: safe to normalize here — this result is only ever logged, never
+      # returned to Ash (evict_ghost/4's own return value is discarded by
+      # its Enum-based caller).
+      {:error, :no_rollback, reason} ->
+        log_evict_failure(layer, resource, query, reason)
 
-        Telemetry.ledger(:evict_failed, resource, coverage_tenant(resource, query), %{}, %{
-          layer: layer,
-          reason: reason
-        })
+      {:error, reason} ->
+        log_evict_failure(layer, resource, query, reason)
     end
+  end
+
+  defp log_evict_failure(layer, resource, query, reason) do
+    Logger.warning(
+      "ash_multi_datalayer reconcile eviction on #{inspect(layer)} failed for " <>
+        "#{inspect(resource)}: #{inspect(reason)}"
+    )
+
+    Telemetry.ledger(:evict_failed, resource, coverage_tenant(resource, query), %{}, %{
+      layer: layer,
+      reason: reason
+    })
   end
 
   defp coverage_epoch(resource, query),

@@ -51,9 +51,13 @@ defmodule AshMultiDatalayer.Backfill do
       sentinels on a partially-selected record, so an omitted `:fields`
       never writes garbage for an unselected field); the primary key is
       always included
+
+  A genuine error preserves the layer's own `{:error, :no_rollback,
+  reason}` shape when it returned one (L11) — callers that route this
+  back to Ash's transaction machinery must see it.
   """
   @spec upsert_record(module(), module(), Ash.Resource.Record.t(), keyword()) ::
-          {:ok, Ash.Resource.Record.t()} | {:error, term()}
+          {:ok, Ash.Resource.Record.t()} | {:error, term()} | {:error, :no_rollback, term()}
   def upsert_record(layer, resource, record, opts) do
     primary_key = Ash.Resource.Info.primary_key(resource)
     tenant = opts[:tenant]
@@ -86,10 +90,12 @@ defmodule AshMultiDatalayer.Backfill do
 
   @doc """
   Deletes a record (by primary key) from a layer. A row that's already
-  absent is a success.
+  absent is a success. A genuine error preserves the layer's own
+  `{:error, :no_rollback, reason}` shape when it returned one (L11) —
+  callers that route this back to Ash's transaction machinery must see it.
   """
   @spec destroy_record(module(), module(), Ash.Resource.Record.t(), keyword()) ::
-          :ok | {:error, term()}
+          :ok | {:error, term()} | {:error, :no_rollback, term()}
   def destroy_record(layer, resource, record, opts) do
     tenant = opts[:tenant]
 
@@ -108,8 +114,15 @@ defmodule AshMultiDatalayer.Backfill do
     case layer.destroy(resource, changeset) do
       :ok -> :ok
       {:ok, _} -> :ok
-      {:error, :no_rollback, reason} -> destroy_result(reason)
-      {:error, reason} -> destroy_result(reason)
+      # L11: `destroy_result/1`'s own "already absent -> :ok" classification
+      # still applies either way (already-absent is already-absent
+      # regardless of whether the layer also said :no_rollback), but a
+      # genuine error must keep the 3-tuple shape — callers that route it
+      # back to Ash's transaction machinery (LocalOutbox.Target.destroy/4,
+      # via push_all_targets/5) need to see :no_rollback, not have it
+      # silently stripped here before they ever get a chance to preserve it.
+      {:error, :no_rollback, reason} -> destroy_result(reason, :no_rollback)
+      {:error, reason} -> destroy_result(reason, :normal)
     end
   end
 
@@ -120,7 +133,11 @@ defmodule AshMultiDatalayer.Backfill do
   # marking the outbox entry :synced) parks :rejected and blocks the PK
   # chain, demanding an operator discard/1 for a destroy that already took
   # effect.
-  defp destroy_result(reason) do
+  defp destroy_result(reason, :no_rollback) do
+    if already_absent?(reason), do: :ok, else: {:error, :no_rollback, reason}
+  end
+
+  defp destroy_result(reason, :normal) do
     if already_absent?(reason), do: :ok, else: {:error, reason}
   end
 
@@ -147,7 +164,13 @@ defmodule AshMultiDatalayer.Backfill do
     end
   end
 
-  defp normalize_result({:error, :no_rollback, reason}), do: {:error, reason}
+  # L11: preserve the layer's own :no_rollback signal here — this is the
+  # single source-of-truth wrapper every upsert_record/4 caller shares
+  # (Target.upsert/4, WriteDispatch.propagate/6, LocalOutbox.Api's several
+  # backfill sites, reconcile paths). Whether a specific caller may safely
+  # strip it again (because ITS OWN result never reaches Ash) is that
+  # caller's decision to make and record, not this shared function's.
+  defp normalize_result({:error, :no_rollback, _reason} = error), do: error
   defp normalize_result(other), do: other
 
   defp default_fields(resource, record) do
