@@ -234,7 +234,7 @@ is H5/#19 work and uses the real tenant, not the partition key.
 | ID    | Task                                                                                              | Repo       | Status |
 | ----- | ------------------------------------------------------------------------------------------------- | ---------- | ------ |
 | PRE   | [Checkpoint-commit the uncommitted working tree](pre-checkpoint-commit.md) — **do FIRST**         | both       | OPEN   |
-| A0    | [Build the MDL repro/regression harness the plan mandates](a0-mdl-repro-harness.md)               | MDL        | OPEN   |
+| A0    | [Build the MDL repro/regression harness the plan mandates](a0-mdl-repro-harness.md)               | MDL        | DONE   |
 | R0    | [Build the ash_remote repro/regression harness the plan mandates](r0-ash-remote-repro-harness.md) | ash_remote | OPEN   |
 | FINAL | [Plan final gates: demo exercise, docs sweep, closure checks](final-gates.md) — last to close     | both       | OPEN   |
 

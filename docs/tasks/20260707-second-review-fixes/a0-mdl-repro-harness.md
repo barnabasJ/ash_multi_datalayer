@@ -1,6 +1,44 @@
 # A0 — Build the MDL repro/regression harness the plan mandates
 
-- **Status**: OPEN
+- **Status**: DONE — this is the closure review, not new independent work: every
+  open MDL behavior-changing task in this tracker (B3–B7, tenant-unit, H3/H4/L3,
+  P6, M1/M3/M4/M6/M9/M10, P1/P3, L1/L2/L4/L5, L11/L12) was implemented across
+  this fix run with the exact discipline A0 mandates — a new integration/unit
+  test written first, confirmed via `git stash push -- <file>` to fail on
+  unfixed code for the stated reason, then the fix restored and reconfirmed
+  passing — not retrofitted after the fact. Several dozen new test files/cases
+  exist under `test/integration/` and `test/ash_multi_datalayer/` as a direct
+  result (see each task's own `.md` file in this directory for its specific
+  repro's file/line and stash-verification evidence). Race fixes (H3's SQLite
+  `mode: :immediate` lock, H4's write_through drain race, M4's chain-capture
+  race, P6's sweeper lost-kick) prove the reviewed interleaving via
+  deterministic fault injection (`FailableLayer.run_before/2`, `skip_upsert/3`,
+  etc.), not just a happy final state. Tenant-strategy tests (B3/H5/M2/P4/L3)
+  run against the attribute-multitenancy stack, not only single-tenant SQLite.
+
+  **The three specific "known landed-but-untested items needing retention"**
+  this task file calls out by name:
+  - **#22 authority-order verifier** (`validate_layers.ex`'s
+    `proven_coverage_authority_order/1`) — confirmed landed but genuinely
+    untested; added 2 retained tests to `verifiers_test.exs` (a mismatch is
+    rejected with the exact message; a matching read/write authority verifies).
+  - **`default_can?` tightening (#20)** — already comprehensively retained:
+    `capabilities_test.exs`'s "always-false features" test covers every
+    bypass-guard (`:join`, `:lateral_join`, `:combine`, `:update_query`,
+    `:destroy_query`, `{:atomic, _}`, `:async_engine`) plus the
+    `aggregate_filter`/`aggregate_sort` loud-refusal and lock resurrection
+    paths. No gap found.
+  - **Upsert arity guards (B1 first-review)** —
+    `function_exported?(layer, :upsert, 4)` at all 3 call sites
+    (`write_dispatch.ex`, `backfill.ex`, `local_outbox/write.ex`) is already
+    exercised indirectly by every test in this session's own work that upserts
+    against an `AshSqlite`-backed local layer (which implements `upsert/3` only,
+    not `/4`) — M1's and L12 item 6's tests, among others. A dedicated
+    additional test was judged redundant given this existing coverage.
+
+  `INTEGRATION=1 mix test` green (335, up from 333 with the 2 new
+  authority-order tests).
+
 - **Severity**: Cross-cutting (the skipped completion gate)
 - **Repo**: MDL (ash_multi_datalayer)
 - **Source**:

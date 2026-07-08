@@ -170,6 +170,47 @@ defmodule AshMultiDatalayer.VerifiersTest do
       assert error_message(ValidateLayers.verify(module.spark_dsl_config())) =~
                "does not support upserts"
     end
+
+    # A0 retained regression (#22): landed but untested — the authority-order
+    # verifier (proven_coverage_authority_order/1) requires ProvenCoverage's
+    # read source-of-truth (last read_order) to equal its write authority
+    # (hd write_order). A mismatch here would let reads and writes disagree
+    # about which layer is authoritative, silently corrupting the coverage
+    # invariant.
+    test "ProvenCoverage's read source authority must equal the write authority" do
+      module =
+        define(
+          quote do
+            multi_data_layer do
+              layer(:l1, Ash.DataLayer.Ets)
+              layer(:l2, Ash.DataLayer.Ets)
+              layer(:l3, Ash.DataLayer.Ets)
+              read_order([:l1, :l2])
+              write_order([:l3, :l1])
+            end
+          end
+        )
+
+      assert error_message(ValidateLayers.verify(module.spark_dsl_config())) =~
+               "requires the read source authority (last read_order) to equal " <>
+                 "the write authority (hd write_order)"
+    end
+
+    test "a matching read/write authority verifies" do
+      module =
+        define(
+          quote do
+            multi_data_layer do
+              layer(:l1, Ash.DataLayer.Ets)
+              layer(:l2, Ash.DataLayer.Ets)
+              read_order([:l1, :l2])
+              write_order([:l2, :l1])
+            end
+          end
+        )
+
+      assert :ok = ValidateLayers.verify(module.spark_dsl_config())
+    end
   end
 
   describe "ValidateMultitenancy" do
