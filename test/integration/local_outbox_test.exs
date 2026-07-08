@@ -210,6 +210,26 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
       assert Enum.filter(entries(), &(&1.state != :synced)) == []
     end
 
+    test "L12 item 8 (retained): a discarded max-seq entry's row does not poison a later entry's job",
+         %{widget: w, parked: parked} do
+      # Discard frees the SQLite row this entry's outbox row occupied — a
+      # later insert can reuse the same rowid/seq. write_ref (a fresh
+      # Ash.UUID.generate/0 per write, write.ex) is what keeps the later
+      # entry's Oban job args distinct from the discarded one's, so a
+      # stale unique-job match (keyed on args, which previously omitted
+      # write_ref) can't silently swallow it.
+      assert {:ok, %{dropped_chain: true}} = LocalOutbox.discard(parked)
+
+      FailableLayer.clear(Remote)
+      w2 = create!(name: w.name)
+      drain()
+
+      [fresh_entry] = Enum.filter(entries(), &(&1.state == :synced))
+      refute fresh_entry.write_ref == parked.write_ref
+      assert [%{name: name}] = remote()
+      assert name == w2.name
+    end
+
     test "force pushes blind and clears the entry", %{parked: parked} do
       FailableLayer.clear(Remote)
       assert :ok = LocalOutbox.force(parked)
@@ -284,6 +304,36 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
       assert snap["version"] == 5
     end
 
+    test "L12 item 6: an upsert onto a diverged replica LWW-overwrites, even with stale-check enabled (documented, intentional)" do
+      s =
+        StaleWidget
+        |> Ash.Changeset.for_create(:create, %{name: "u", version: 1}, domain: Domain)
+        |> Ash.create!()
+
+      drain()
+      assert [%{name: "u", version: 1}] = remote(StaleWidget)
+
+      # a concurrent server write diverges the replica out from under us —
+      # the same setup that makes the :update test above park as :conflict.
+      Target.upsert(StaleWidget, :remote, %{s | version: 5, name: "u-diverged"})
+
+      # local upsert (no before-image at all — base_image/3 returns nil for
+      # :upsert) — check_stale/2's `{:stale_check, _field} -> :ok` clause
+      # bypasses the check entirely for this op, unlike :update/:destroy.
+      StaleWidget
+      |> Ash.Changeset.for_create(:upsert_by_id, %{name: "u-local", version: 1}, domain: Domain)
+      |> Ash.Changeset.force_change_attribute(:id, s.id)
+      |> Ash.create!()
+
+      drain()
+
+      # Never parked: the local value silently won over the diverged
+      # remote's version 5, exactly the LWW-is-intentional-for-upsert
+      # decision flush.ex's check_stale/2 now documents in detail.
+      assert Enum.all?(entries(), &(&1.state == :synced))
+      assert [%{name: "u-local", version: 1}] = remote(StaleWidget)
+    end
+
     test "a clean flush on a DATETIME stale field does not falsely park (JSON round-trip)" do
       # Regression: base_image round-trips through the outbox `:map`/JSON, so a
       # :utc_datetime_usec comes back a string while the live remote value dumps to
@@ -332,6 +382,33 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxTest do
 
       assert [%{error_class: :conflict}] =
                Enum.filter(entries(), &(&1.state == :parked))
+    end
+
+    test "L12 item 5 (retained): an :update flush onto a peer-deleted remote row conflicts, never resurrects it" do
+      s =
+        StaleWidget
+        |> Ash.Changeset.for_create(:create, %{name: "s", version: 1}, domain: Domain)
+        |> Ash.create!()
+
+      drain()
+      assert [%{name: "s"}] = remote(StaleWidget)
+
+      # a concurrent peer deletes the row remotely — stale_check/3's
+      # `{:ok, nil}` branch (Target.read_pk finds nothing).
+      Target.destroy(StaleWidget, :remote, s)
+      assert remote(StaleWidget) == []
+
+      # local update (has a real base_image — this is NOT an upsert) must
+      # park as a conflict, never silently re-create (resurrect) the row
+      # the peer intentionally deleted.
+      s
+      |> Ash.Changeset.for_update(:update, %{name: "s-local"}, domain: Domain)
+      |> Ash.update!()
+
+      drain()
+
+      assert [%{error_class: :conflict}] = Enum.filter(entries(), &(&1.state == :parked))
+      assert remote(StaleWidget) == []
     end
 
     # B6: `remote_matches_payload?/3` (the fast "already applied" check

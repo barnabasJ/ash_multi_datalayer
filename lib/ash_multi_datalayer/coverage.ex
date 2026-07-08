@@ -74,6 +74,14 @@ defmodule AshMultiDatalayer.Coverage do
     table = TableOwner.table_name(resource)
     true = :ets.insert(table, {{tenant_key(tenant), entry.id}, entry})
     :ok
+  rescue
+    # L12 item 1: a TableOwner restart between a successful read and its
+    # coverage-recording step must not crash the caller — the read already
+    # returned good data; only the cache-warming metadata failed to record.
+    # A future read simply misses and re-records, same as any other cold
+    # start. Every other ETS accessor in this module already tolerates this
+    # (entries/2, partitions/1, drop/3) — insert/3 was the one exception.
+    ArgumentError -> :ok
   end
 
   @doc "Drops a single entry by id. Missing entries are a no-op."
@@ -385,7 +393,17 @@ defmodule AshMultiDatalayer.Coverage do
       fingerprint = dedupe_key(normalised)
       needed = needed_fields(query, resource)
 
-      case Enum.find(entries(resource, tenant), &(&1.fingerprint == fingerprint)) do
+      # L12 item 2: fingerprint is a bare :erlang.phash2/1 hash — a collision
+      # (~30% birthday estimate at a full 10k-entry partition) would
+      # otherwise match this to an UNRELATED entry, widening its
+      # loaded_fields (serving never-backfilled fields as nil). The Entry
+      # already carries the full canonical `normalised` term the fingerprint
+      # was hashed from (needed for subsumption, not added for this fix) —
+      # compare it too, disambiguating any hash collision.
+      case Enum.find(
+             entries(resource, tenant),
+             &(&1.fingerprint == fingerprint and &1.normalised == normalised)
+           ) do
         %Entry{} = existing ->
           widen_loaded_fields(resource, tenant, existing, needed, epoch0)
 

@@ -210,6 +210,33 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
     end
   end
 
+  # L12 item 6, explicit decision recorded (spec review required a real
+  # call here, not just a doc note): `:upsert` intentionally bypasses
+  # stale-check even when `conflict_detection` is `{:stale_check, _}`.
+  #
+  # Stale-check works by comparing a remembered BEFORE-image to the
+  # target's current value — but an upsert's local write never read a
+  # prior value in the first place (that is what distinguishes "upsert"
+  # from "update": the caller does not know, and does not need to know,
+  # whether a row already exists). There is no before-image to compare
+  # against, and `write.ex`'s `base_image/3` correctly returns `nil` for
+  # `:upsert` for exactly this reason.
+  #
+  # A guard that instead treats "the target already has a row" as a
+  # conflict would be actively wrong: that is upsert's ordinary,
+  # expected case (create-if-absent, else-update) — not a divergence.
+  # It would park every upsert-onto-an-existing-row, which is most of
+  # them.
+  #
+  # This means an upsert's local value always wins over a target's
+  # already-diverged row (LWW), even with stale-check enabled elsewhere
+  # for the same host. This is judged acceptable because `:upsert`'s own
+  # contract is inherently "this identity's value should be exactly what
+  # I say" — the same semantic Ash's own `upsert_condition`/identity-based
+  # upsert already expresses at the application level, independent of
+  # replication. A caller that needs conflict-safe semantics for a
+  # specific write should use `:update` (which DOES get stale-check
+  # protection) instead of `:upsert`.
   defp check_stale(host, entry) do
     case LocalOutbox.conflict_detection(host) do
       :off ->

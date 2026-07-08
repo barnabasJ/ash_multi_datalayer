@@ -776,6 +776,45 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxResolutionTest do
     end
   end
 
+  describe "L12 item 7: the sweeper prunes :synced entries past the retention window" do
+    test "a synced entry older than outbox_synced_retention_ms is destroyed" do
+      Widget
+      |> Ash.Changeset.for_create(:create, %{name: "prune-me"}, domain: Domain)
+      |> Ash.create!()
+
+      drain()
+      assert [%{state: :synced, seq: seq}] = entries()
+
+      # Unfixed: :synced entries are never pruned at all — a sweep tick
+      # only scans for :pending chain heads to (re-)kick, leaving this
+      # row forever. Set the retention window to a negative duration —
+      # the cutoff lands in the future, so even an entry synced moments
+      # ago (this test's own timescale) is already "older than" it.
+      Application.put_env(:ash_multi_datalayer, :outbox_synced_retention_ms, -1_000)
+
+      Sweeper.run_once([Widget])
+
+      refute Enum.any?(entries(), &(&1.seq == seq))
+      assert [%{name: "prune-me"}] = local()
+    after
+      Application.delete_env(:ash_multi_datalayer, :outbox_synced_retention_ms)
+    end
+
+    test "a synced entry within the retention window survives a sweep tick" do
+      Widget
+      |> Ash.Changeset.for_create(:create, %{name: "keep-me"}, domain: Domain)
+      |> Ash.create!()
+
+      drain()
+      assert [%{state: :synced}] = entries()
+
+      # Default retention (7 days) — nothing this fresh gets pruned.
+      Sweeper.run_once([Widget])
+
+      assert [%{state: :synced}] = entries()
+    end
+  end
+
   # --- H4 (#15): a local-write failure after a successful write_through push
   # must leave a discoverable trace, never a silent ordinary failure.
 

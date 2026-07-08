@@ -186,6 +186,49 @@ defmodule AshMultiDatalayer.Integration.SubsumptionTest do
     assert pg_reads() == 1
   end
 
+  test "L12 item 2: a fingerprint collision does not widen an unrelated entry" do
+    # `dedupe_key/1` is a bare :erlang.phash2/1 hash with no disjunct
+    # comparison — simulate a real collision (rather than searching for one,
+    # infeasible in a fast test) by hand-crafting an entry that shares a
+    # real query's fingerprint but carries UNRELATED normalised content and
+    # loaded_fields, exactly what a genuine hash collision would look like
+    # from do_record/5's point of view. It is the ONLY entry in the ledger
+    # (the real one is removed before the real query is replayed), so
+    # Enum.find's traversal order can't make the test accidentally pass —
+    # a fingerprint-only match has nothing else to find but this one.
+    TestPost |> Ash.Query.filter(name == "foo") |> Ash.read!()
+    assert [%{fingerprint: fp} = real_entry] = AshMultiDatalayer.Coverage.entries(TestPost, nil)
+    :ok = AshMultiDatalayer.Coverage.drop(TestPost, nil, real_entry.id)
+
+    colliding_entry = %{
+      real_entry
+      | id: make_ref(),
+        fingerprint: fp,
+        normalised: %{real_entry.normalised | disjuncts: [%{}]},
+        loaded_fields: MapSet.new([:id])
+    }
+
+    :ok = AshMultiDatalayer.Coverage.insert(TestPost, nil, colliding_entry)
+
+    # Unfixed: do_record/5 matches by fingerprint alone — the only entry
+    # in the ledger has the right fingerprint (a collision) but the WRONG
+    # normalised content, so it gets incorrectly widened/reused instead of
+    # a fresh entry being recorded for this actually-different query.
+    TestPost |> Ash.Query.filter(name == "foo") |> Ash.read!()
+
+    entries = AshMultiDatalayer.Coverage.entries(TestPost, nil)
+    colliding = Enum.find(entries, &(&1.id == colliding_entry.id))
+
+    # The colliding entry must stay exactly as hand-crafted (never widened
+    # by an unrelated query it doesn't actually cover)...
+    assert colliding.loaded_fields == MapSet.new([:id])
+    # ...and a distinct, correct entry must exist for the real query.
+    assert Enum.any?(
+             entries,
+             &(&1.id != colliding_entry.id and &1.normalised == real_entry.normalised)
+           )
+  end
+
   test "tenantless reads use the global partition consistently" do
     TestPost |> Ash.Query.filter(name == "foo") |> Ash.read!()
     assert [%{tenant: :__global__}] = AshMultiDatalayer.Coverage.entries(TestPost, nil)

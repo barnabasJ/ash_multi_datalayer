@@ -130,6 +130,16 @@ defmodule AshMultiDatalayer.Test.LocalOutbox.StaleWidget do
 
   actions do
     defaults([:read, :destroy, create: :*, update: :*])
+
+    # L12 item 6: exercises the intentional upsert/stale-check bypass
+    # (flush.ex's check_stale/2) — a plain PK-based upsert (no
+    # upsert_identity needed; Ash defaults to the primary key). `:id` isn't
+    # accepted (uuid_primary_key defaults to writable?: false) — the caller
+    # sets it via Ash.Changeset.force_change_attribute/3.
+    create :upsert_by_id do
+      accept([:name, :version])
+      upsert?(true)
+    end
   end
 end
 

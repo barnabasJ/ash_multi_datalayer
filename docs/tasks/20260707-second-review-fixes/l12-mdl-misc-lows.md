@@ -1,6 +1,50 @@
 # L12 — MDL misc LOWs from the second review (fix-in-phase batch)
 
-- **Status**: OPEN
+- **Status**: DONE — all 8 items resolved:
+  1. `Coverage.insert/3` gained the same `rescue ArgumentError -> :ok` every
+     other ETS accessor in the module already had. 1 repro test
+     (`coverage_test.exs`), confirmed via stash to raise on unfixed code.
+  2. `do_record/5`'s dedupe match now compares `&1.normalised == normalised` in
+     addition to `&1.fingerprint == fingerprint` — the `Entry` already carried
+     the full canonical term, just wasn't using it. 1 repro test
+     (`subsumption_test.exs`) hand-crafts a same-fingerprint,
+     different-`normalised` entry (a real `:erlang.phash2/1` collision is
+     infeasible to search for in a fast test) as the only ledger entry, so
+     traversal order can't mask the bug; confirmed via stash.
+  3. `Capability.collect/2`/`simple_expression` — already fixed;
+     `capability_test.exs` already has comprehensive retained coverage
+     (evaluable vs. `:unknown` custom expressions). No further action.
+  4. Supervisor `resources:` filtering — already fixed (`supervisor.ex:62,68`).
+     New `supervisor_test.exs`: a plain non-MDL resource mixed into an explicit
+     `resources:` list is filtered out before reaching `Info.orchestrator/1`,
+     not crashed on; confirmed passing (validates the "fixed" label, per the
+     task's own instruction for already-fixed items).
+  5. Stale-check resurrection (missing remote row) — already fixed (`flush.ex`'s
+     `{:ok, nil}` branch). 1 retained regression test (`local_outbox_test.exs`):
+     a peer-deleted remote row's `:update` flush parks as `:conflict`, never
+     resurrects it.
+  6. **Explicit decision recorded**: `:upsert` intentionally bypasses
+     stale-check even with `conflict_detection: {:stale_check, _}` — an upsert's
+     local write never reads a prior value (no before-image exists to compare
+     against; `write.ex`'s `base_image/3` correctly returns `nil` for
+     `:upsert`), and treating "target already has a row" as a conflict would be
+     actively wrong (that's upsert's ordinary create-if-absent-else-update case,
+     not a divergence). Documented in detail at `flush.ex`'s `check_stale/2`.
+     Callers needing conflict-safe semantics should use `:update` instead. 1
+     retained regression test pins the documented behavior: an upsert onto a
+     diverged remote row LWW-overwrites without parking.
+  7. `:synced` entries are now pruned every sweep tick
+     (`Sweeper.prune_synced/1`), past a configurable
+     `outbox_synced_retention_ms` (default 7 days). 2 tests: an entry past the
+     window is destroyed (confirmed via stash to survive on unfixed code — no
+     pruning existed at all); an entry within the window survives.
+  8. SQLite rowid-reuse / stale Oban uniqueness — already fixed (`write_ref` in
+     job args + generated fresh per write). 1 retained regression test: discard
+     an entry (freeing its row), create a new one, confirm distinct `write_ref`s
+     and a successful (non-swallowed) flush.
+
+  `INTEGRATION=1 mix test` green (333, up from 326).
+
 - **Severity**: Low (batch)
 - **Repo**: MDL (ash_multi_datalayer)
 - **Source**:

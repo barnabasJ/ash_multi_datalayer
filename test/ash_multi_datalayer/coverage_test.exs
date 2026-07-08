@@ -62,4 +62,13 @@ defmodule AshMultiDatalayer.CoverageTest do
   test "touch/3 against a resource with no table degrades instead of crashing" do
     refute Coverage.touch(NoTableResource, nil, entry(make_ref()))
   end
+
+  test "L12 item 1: insert/3 against a resource with no table degrades instead of crashing" do
+    # Unfixed: `insert/3` was the one ETS accessor with no `rescue
+    # ArgumentError` — a TableOwner restart between a successful read and
+    # its coverage-recording step (simulated here by a resource whose
+    # table was never created) crashed the caller instead of degrading,
+    # exactly like `entries/2`, `partitions/1`, and `drop/3` already do.
+    assert Coverage.insert(NoTableResource, nil, entry(make_ref())) == :ok
+  end
 end

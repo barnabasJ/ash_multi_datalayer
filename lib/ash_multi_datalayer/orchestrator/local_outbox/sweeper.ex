@@ -56,9 +56,52 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Sweeper do
   def run_once(resources) do
     resources
     |> Enum.group_by(&LocalOutbox.outbox_resource/1)
-    |> Enum.each(fn {outbox, hosts} -> sweep_outbox(outbox, hosts) end)
+    |> Enum.each(fn {outbox, hosts} ->
+      sweep_outbox(outbox, hosts)
+      prune_synced(outbox)
+    end)
 
     :ok
+  end
+
+  # L12 item 7: `:synced` entries were never pruned — unbounded outbox
+  # growth, and `status/1` scans all of a record's entries per poll (a
+  # cost that only grows). Every sweep tick also destroys `:synced`
+  # entries past the retention window — rows are the truth for `:pending`/
+  # `:parked` work, but a `:synced` row has no further purpose once it's
+  # old enough that no in-flight stale-check/resolution call could still
+  # reference it.
+  defp prune_synced(outbox) do
+    domain = Ash.Resource.Info.domain(outbox)
+    cutoff = DateTime.add(DateTime.utc_now(), -prune_after_ms(), :millisecond)
+
+    outbox
+    |> Ash.Query.for_read(:read, %{}, domain: domain, authorize?: false)
+    |> Ash.Query.filter(state == :synced and updated_at < ^cutoff)
+    |> Ash.read!(authorize?: false)
+    |> Enum.each(fn entry ->
+      try do
+        Ash.destroy!(entry, action: :discard, domain: domain, authorize?: false)
+      rescue
+        # A concurrent resolution action may have already destroyed/changed
+        # this entry between the read above and this destroy — never let a
+        # pruning race abort the rest of this tick's cleanup.
+        error ->
+          Logger.warning(
+            "ash_multi_datalayer: LocalOutbox sweeper failed to prune a synced entry for " <>
+              "#{inspect(outbox)}: #{Exception.message(error)}"
+          )
+      end
+    end)
+  end
+
+  defp prune_after_ms do
+    Application.get_env(
+      :ash_multi_datalayer,
+      :outbox_synced_retention_ms,
+      # 7 days
+      7 * 24 * 60 * 60 * 1000
+    )
   end
 
   @impl true

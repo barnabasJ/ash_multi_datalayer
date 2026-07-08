@@ -862,10 +862,10 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   defp normalize_backfill(:ok), do: :ok
   defp normalize_backfill({:ok, _}), do: :ok
 
-  defp normalize_backfill({:error, _layer, reason}),
-    do: raise("backfill failed: #{inspect(reason)}")
-
-  defp normalize_backfill({:error, :no_rollback, reason}),
+  # Matches both Backfill.upsert_records/4's {:error, layer, reason} batch
+  # shape AND a preserved {:error, :no_rollback, reason} (L11) — both are
+  # 3-tuples starting with :error, and both should raise the same way here.
+  defp normalize_backfill({:error, _layer_or_no_rollback, reason}),
     do: raise("backfill failed: #{inspect(reason)}")
 
   defp normalize_backfill({:error, reason}), do: raise("backfill failed: #{inspect(reason)}")
