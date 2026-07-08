@@ -1,6 +1,53 @@
 # R0 — Build the ash_remote repro/regression harness the plan mandates
 
-- **Status**: OPEN
+- **Status**: DONE — this is the closure review, not new independent work: every
+  open ash_remote behavior-changing task in this tracker (B1/B2, H1/H2,
+  M7/M8/M11, L6, L7, L8, L9, L13) was implemented across this fix run with the
+  exact discipline R0 mandates — a new test written first, confirmed via
+  `git stash` to fail on unfixed code for the stated reason, then the fix
+  restored and reconfirmed. B1's and B2's security repros
+  (`atom_exhaustion_test.exs` and the aggregate-filter injection tests) are
+  retained in the suite and fail closed. **Changeset-less multitenant broadcast
+  coverage (pass-7)**: confirmed present — `server_notifier_test.exs` +
+  `test/support/pubsub/tenant_things.ex` (M8).
+
+  **The six specific "known landed-but-untested items needing retention"** this
+  task file calls out by name:
+  - **#6 open-vocab atom safety** and **#10 atom-minting removal** — already
+    comprehensively retained: `atom_exhaustion_test.exs` +
+    `manifest_atom_safety_test.exs`. No gap found.
+  - **#9 401/403 transport taxonomy** — confirmed genuinely untested; added 4
+    unit tests to `transport_error_surfacing_test.exs` directly against
+    `AshRemote.Error.Transport.normalize/1` (401/403 → typed
+    `Ash.Error.Forbidden.Policy`, distinct from the generic Transport error
+    other HTTP statuses and connection failures get).
+  - **#11 false/unsupported filter short-circuit** — confirmed genuinely
+    untested; added 1 test to `data_layer_test.exs`: an always-false filter
+    (`filter(1 == 2)`) returns `[]` even when pointed at an unreachable backend,
+    proving `run_query/2`'s short-circuit never sends a request at all (an
+    unreachable backend otherwise surfaces a typed `AshRemote.Error.Transport`,
+    per the adjacent test file).
+  - **#26 LifecycleGuard monitor/re-register** — confirmed genuinely untested;
+    added 1 test to `lifecycle_guard_test.exs` driving
+    `handle_info({:DOWN, ...})` directly (a real `Process.exit(registry, :kill)`
+    was tried first and risked cascading through `AshRemote.Realtime`'s own
+    supervision tree in ways unrelated to what the test is actually about — the
+    direct `:DOWN`-message approach matches this file's own existing pattern of
+    driving `handle_info/2` directly rather than via live process crashes).
+    Confirms the guard drops the stale monitor ref and establishes a fresh one
+    for the same name, and that a real event through the still-running registry
+    still reaches it afterward.
+  - **Non-string `schema_version` typed error** — confirmed genuinely untested
+    (only a wrong-but-string version was covered); added 1 test to
+    `manifest_loader_test.exs`: a numeric `schema_version` returns the same
+    typed `{:unsupported_schema_version, _}` error instead of crashing inside
+    `String.split/2` (which raises on a non-binary argument) — the guard clause
+    (`not is_binary(version)`) was already correct in the code, just unverified.
+
+  `mix test` green in `../ash_remote` (293/295 — the 2 remaining failures are
+  the same pre-existing, unrelated `ChangeNotifierTest` issue noted throughout
+  this tracker).
+
 - **Severity**: Cross-cutting (the skipped completion gate)
 - **Repo**: ash_remote
 - **Source**:
