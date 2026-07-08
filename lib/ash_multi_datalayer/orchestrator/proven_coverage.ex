@@ -168,6 +168,25 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
   # ledger drops + physical eviction via `Invalidation.on_write/4`). Conservative
   # for updates (drop-then-refetch rather than in-place refresh), which is the
   # sound reaction under at-most-once notification delivery (RFC open question 7).
+  #
+  # `forget!/3`'s PK-only probe (M3) is a deliberate choice, not an
+  # oversight: an inbound external change has no reliable LOCAL before-image
+  # (this node didn't perform the write), so a covering entry matching the
+  # row's unknown PRIOR state can't be distinguished from one that never
+  # matched it at all without risking a stale-entry survival bug — M3's own
+  # forget_test.exs proves the PK-only probe's conservative "unknown ⇒ drop"
+  # is what correctly drops a covering entry when only the AFTER-image is
+  # known and the row no longer matches that entry's filter (age flips
+  # 5→99, the `age == 5` entry must still be dropped even though the known
+  # after-image doesn't match it either). A more "precise" version using the
+  # real record for both row_before/row_after was tried and reverted: it
+  # regresses exactly that scenario (both sides evaluate the SAME known
+  # record, so a filter neither the before NOR the known-after state
+  # matches survives — the exact bug M3 fixed). See
+  # AshRemote.MultiDatalayer.ChangeNotifierTest's 2 known-failing tests for
+  # the flip side of this trade-off (an unrelated entry can be swept up by
+  # the same conservative drop) — accepted, not fixed here, given the
+  # conflict with M3's own regression coverage.
   @impl AshMultiDatalayer.Orchestrator
   def handle_external_change(resource, notification) do
     case notification.data do
