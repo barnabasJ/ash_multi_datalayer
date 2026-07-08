@@ -5,11 +5,15 @@ defmodule AshMultiDatalayer.Backfill do
   layer's returned record).
 
   Records are always **loaded structs returned by a lower layer**. The
-  written field set comes from the `:fields` option; without it, ALL
-  resource attributes are force-changed — including `%Ash.NotLoaded{}`
-  sentinels on a partially-selected record — so callers upserting records
-  from a narrower select MUST pass `:fields` (the write path does; see
-  `AshMultiDatalayer.Orchestrator.LocalOutbox.Write`). The caller's original
+  written field set comes from the `:fields` option; without it, every
+  *loaded* resource attribute is force-changed — `default_fields/2` filters
+  out `%Ash.NotLoaded{}` sentinels on a partially-selected record, so an
+  omitted `:fields` never writes garbage for an unselected field (it simply
+  skips it, leaving whatever the target already has for that field
+  untouched). Callers upserting a record they know is fully loaded can rely
+  on this default; the write path passes `:fields` explicitly anyway (see
+  `AshMultiDatalayer.Orchestrator.LocalOutbox.Write`) since it needs the
+  narrower, changeset-driven field set regardless. The caller's original
   changeset is never re-run — server/database-computed fields exist only on
   the returned record (FR3.5).
   """
@@ -42,9 +46,10 @@ defmodule AshMultiDatalayer.Backfill do
 
     * `:tenant` — the operation's tenant
     * `:domain` — the resource's domain
-    * `:fields` — the fields to write (defaults to ALL resource attributes,
-      which writes `%Ash.NotLoaded{}` sentinels for unselected fields — pass
-      this explicitly unless the record is fully loaded); the primary key is
+    * `:fields` — the fields to write (defaults to every *loaded* resource
+      attribute — `default_fields/2` filters out `%Ash.NotLoaded{}`
+      sentinels on a partially-selected record, so an omitted `:fields`
+      never writes garbage for an unselected field); the primary key is
       always included
   """
   @spec upsert_record(module(), module(), Ash.Resource.Record.t(), keyword()) ::

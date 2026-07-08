@@ -1,6 +1,19 @@
 # L10 — Doc/code contradictions introduced by this work
 
-- **Status**: OPEN
+- **Status**: DONE
+  1. `write.ex`'s comment at the post-commit kick already correctly mentions the
+     `LocalOutbox.Sweeper` (P6) by name and describes it accurately — this
+     contradiction was already resolved (by the P6/H4 work earlier in this same
+     fix run); the task's cited line numbers were stale.
+  2. `backfill.ex`'s moduledoc and `upsert_record/4` `@doc` claimed an omitted
+     `:fields` option force-writes `%Ash.NotLoaded{}` sentinels for unselected
+     fields — `default_fields/2` actually filters those out
+     (`Enum.filter(&loaded?(Map.get(record, &1)))`), so an omitted `:fields`
+     safely skips unselected fields instead. Both doc sites rewritten to match
+     the actual (safer) behavior.
+  3. Repo-wide sweep for other stale sweeper/default_fields references (`grep`
+     for the same claim patterns) found none. `INTEGRATION=1 mix test` green
+     (323, unchanged — docs-only, no behavior change).
 - **Severity**: Low (docs)
 - **Repo**: MDL (ash_multi_datalayer)
 - **Verification**: VERIFIED
