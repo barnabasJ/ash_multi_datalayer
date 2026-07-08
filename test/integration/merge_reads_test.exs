@@ -333,4 +333,39 @@ defmodule AshMultiDatalayer.Integration.MergeReadsTest do
     # (unchanged) sort clause itself. The full MDL suite (no sort-guard
     # regressions) is the evidence for this item instead.
   end
+
+  # --- L1: composite-PK crash in aggregate fold paths ------------------------
+
+  describe "L1: a composite-PK resource with a relationship aggregate reads without crashing" do
+    alias AshMultiDatalayer.Test.Resources.CompositePkAuthor
+
+    setup do
+      reset_resource!(CompositePkAuthor)
+
+      author =
+        CompositePkAuthor
+        |> Ash.Changeset.for_create(:create, %{tenant: "acme", name: "l1-author"})
+        |> Ash.create!()
+
+      TestPost
+      |> Ash.Changeset.for_create(:create, %{name: "l1-post", age: 30, author_id: author.id})
+      |> Ash.create!()
+
+      %{author: author}
+    end
+
+    test "the fold path (add_aggregates_via_layer/5) does not raise MatchError", %{
+      author: author
+    } do
+      # Unfixed: `[pk] = Ash.Resource.Info.primary_key(resource)` raises
+      # MatchError for this 2-attribute composite PK (`id` + `tenant`).
+      loaded =
+        CompositePkAuthor
+        |> Ash.Query.filter(id == ^author.id)
+        |> Ash.Query.load(:post_count)
+        |> Ash.read_one!()
+
+      assert loaded.post_count == 1
+    end
+  end
 end

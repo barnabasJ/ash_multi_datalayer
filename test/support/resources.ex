@@ -109,6 +109,7 @@ defmodule AshMultiDatalayer.Test.Resources do
       resource AshMultiDatalayer.Test.Resources.RaceTestPost
       resource AshMultiDatalayer.Test.Resources.ReconcileRaceTestPost
       resource AshMultiDatalayer.Test.Resources.TestAuthor
+      resource AshMultiDatalayer.Test.Resources.CompositePkAuthor
       resource AshMultiDatalayer.Test.Resources.TestAuthorSourceOverride
       # Relationship-aggregate data-layer permutation matrix (parent × child):
       resource AshMultiDatalayer.Test.Resources.PgPost
@@ -231,6 +232,60 @@ defmodule AshMultiDatalayer.Test.Resources do
       count :adult_post_count, :posts do
         public? true
         filter expr(age >= 18)
+      end
+    end
+
+    actions do
+      defaults [:read, :destroy, create: :*, update: :*]
+    end
+  end
+
+  defmodule CompositePkAuthor do
+    @moduledoc """
+    L1 fixture: a composite primary key (`id` + `tenant`) with a
+    relationship aggregate — exercises `add_aggregates_via_layer/5`'s
+    full-PK keying (the reachable fold/join path; `read/2`'s
+    `related_aggregates?` branch is NOT single-PK-gated the way
+    `remainder_applicable?`/`pk_merge` is).
+    """
+    use Ash.Resource,
+      domain: Domain,
+      data_layer: AshMultiDatalayer.DataLayer,
+      extensions: [AshPostgres.DataLayer]
+
+    multi_data_layer do
+      layer(:l1, Ash.DataLayer.Ets)
+      layer(:l2, AshMultiDatalayer.Test.CountingPostgres)
+
+      read_order([:l1, :l2])
+      write_order([:l2, :l1])
+      # Same-repo SQL related resource (TestPost) would otherwise let
+      # ash_sql's native aggregate-subquery passthrough compute post_count
+      # inside one SQL statement, never reaching add_aggregates_via_layer/5
+      # at all — force the fold path this fixture needs to exercise.
+      sql_join_aggregate_overrides([:post_count])
+    end
+
+    postgres do
+      table "mdl_composite_pk_authors"
+      repo(AshMultiDatalayer.TestRepo)
+    end
+
+    attributes do
+      uuid_primary_key :id
+      attribute :tenant, :string, primary_key?: true, allow_nil?: false, public?: true
+      attribute :name, :string, public?: true
+    end
+
+    relationships do
+      has_many :posts, AshMultiDatalayer.Test.Resources.TestPost,
+        public?: true,
+        destination_attribute: :author_id
+    end
+
+    aggregates do
+      count :post_count, :posts do
+        public? true
       end
     end
 

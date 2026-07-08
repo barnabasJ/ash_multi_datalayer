@@ -209,7 +209,7 @@ is H5/#19 work and uses the real tenant, not the partition key.
 
 | ID  | Task                                                                                                                               | Repo       | Status |
 | --- | ---------------------------------------------------------------------------------------------------------------------------------- | ---------- | ------ |
-| L1  | [Composite-PK crash in aggregate fold paths](l1-composite-pk-aggregate-paths.md)                                                   | MDL        | OPEN   |
+| L1  | [Composite-PK crash in aggregate fold paths](l1-composite-pk-aggregate-paths.md)                                                   | MDL        | DONE   |
 | L2  | [Aggregate fold leaves `%Ash.NotLoaded{}` (flaky live test)](l2-aggregate-fold-notloaded.md)                                       | MDL        | OPEN   |
 | L3  | [`write_through` inline drain misses creates; nil tenant on attribute-tenancy creates](l3-write-through-drain-create-pk-tenant.md) | MDL        | DONE   |
 | L4  | [String/CiString range subsumption still byte-ordered](l4-string-range-subsumption-collation.md)                                   | MDL        | OPEN   |

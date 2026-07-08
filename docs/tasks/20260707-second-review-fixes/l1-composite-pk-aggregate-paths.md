@@ -1,6 +1,19 @@
 # L1 — Composite-PK crash in aggregate fold paths (A4 partial)
 
-- **Status**: OPEN
+- **Status**: DONE — `add_aggregates_via_layer/5` now keys by
+  `Map.take(row, primary_key)` (full-PK map) instead of
+  `[pk] = primary_key(resource)`, matching a single-attribute PK's behavior
+  while also working for composite PKs. `pk_merge/3` hardened the same way for
+  consistency, even though its only caller (`remainder_applicable?/2`) gates it
+  to single-PK resources already (confirmed still guarded-unreachable for
+  composite PKs; not a live bug there). New `CompositePkAuthor` fixture
+  (2-attribute PK: `id` + `tenant`) with a relationship aggregate over
+  `TestPost`, forced onto the fold path via `sql_join_aggregate_overrides`
+  (same-repo SQL would otherwise let ash_sql's native aggregate-subquery
+  passthrough compute it inside one SQL statement, never reaching
+  `add_aggregates_via_layer/5` at all). 1 repro test: fails with `MatchError` on
+  unfixed code (confirmed via stash), passes with the fix.
+  `INTEGRATION=1 mix test` green (319, up from 318).
 - **Severity**: Low (loud crash on legitimate query)
 - **Repo**: MDL (ash_multi_datalayer)
 - **Verification**: VERIFIED

@@ -420,12 +420,16 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
     agg_query = %{query | aggregates: aggs, calculations: []}
 
     with {:ok, agg_rows} <- Delegate.run_on_layer(agg_query, layer) do
-      [pk] = Ash.Resource.Info.primary_key(resource)
-      by_pk = Map.new(agg_rows, &{Map.fetch!(&1, pk), &1})
+      # L1: `[pk] = primary_key(resource)` crashed with MatchError for a
+      # composite PK — full-PK keying (a map of every PK attribute's value)
+      # works for both single and composite PKs alike, same as the
+      # reconcile/scan paths A4 already fixed.
+      primary_key = Ash.Resource.Info.primary_key(resource)
+      by_pk = Map.new(agg_rows, &{Map.take(&1, primary_key), &1})
 
       merged =
         Enum.map(rows, fn row ->
-          copy_aggregate_values(row, Map.get(by_pk, Map.fetch!(row, pk)), aggs)
+          copy_aggregate_values(row, Map.get(by_pk, Map.take(row, primary_key)), aggs)
         end)
 
       {:ok, merged}
@@ -624,10 +628,14 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
   defp and_filter(base, region), do: Ash.Filter.add_to_filter!(base, region)
 
   # PK-union, preferring the freshly-fetched source rows over cached ones.
+  # L1: only caller (`remainder_applicable?/2`, guarding it to single-PK
+  # resources) makes composite PKs unreachable here in production — full-PK
+  # keying anyway for consistency with the (live) fold-path fix above and
+  # in case a future caller drops that guard.
   defp pk_merge(preferred, others, resource) do
-    [pk] = Ash.Resource.Info.primary_key(resource)
-    seen = MapSet.new(preferred, &Map.fetch!(&1, pk))
-    preferred ++ Enum.reject(others, &MapSet.member?(seen, Map.fetch!(&1, pk)))
+    primary_key = Ash.Resource.Info.primary_key(resource)
+    seen = MapSet.new(preferred, &Map.take(&1, primary_key))
+    preferred ++ Enum.reject(others, &MapSet.member?(seen, Map.take(&1, primary_key)))
   end
 
   # Computed-value merge read: rows from covered cache, calcs computed on the
