@@ -198,7 +198,7 @@ is H5/#19 work and uses the real tenant, not the partition key.
 | M7  | [Query calculations/aggregates decoded uncast](m7-query-calc-aggregate-decode-uncast.md)                                                     | ash_remote | DONE   |
 | M8  | [Changeset-less multitenant broadcast unjoinable](m8-changeset-less-multitenant-broadcast.md)                                                | ash_remote | DONE   |
 | M9  | [`discard`/`drop_chain` not inside co-commit transaction](m9-discard-drop-chain-not-transactional.md)                                        | MDL        | DONE   |
-| M10 | [`hydrate/2` wraps `{:error, _}` refresh in `{:ok, ...}`](m10-hydrate-wraps-error.md)                                                        | MDL        | OPEN   |
+| M10 | [`hydrate/2` wraps `{:error, _}` refresh in `{:ok, ...}`](m10-hydrate-wraps-error.md)                                                        | MDL        | DONE   |
 | M11 | [Client decoder crashes on `nil`/single-object responses](m11-decoder-crashes-nil-single-object.md)                                          | ash_remote | OPEN   |
 | P1  | [Source-computed aggregate guard bypassed on non-merged paths](p1-aggregate-guard-bypass.md)                                                 | MDL        | OPEN   |
 | P2  | [Verifier rejections don't block plain `mix compile`](p2-verifier-compile-posture.md)                                                        | MDL        | OPEN   |

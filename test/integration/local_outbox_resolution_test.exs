@@ -864,6 +864,30 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxResolutionTest do
     end
   end
 
+  # --- M10: hydrate/2 must not wrap a failing refresh in {:ok, ...} ---------
+
+  describe "M10: hydrate/2 propagates a failing refresh(:all) instead of wrapping it" do
+    test "a failing target read surfaces as {:error, _}, not {:ok, {:error, _}}" do
+      _w =
+        FailableLocalWidget
+        |> Ash.Changeset.for_create(:create, %{name: "hydrate-fail"}, domain: Domain)
+        |> Ash.create!()
+
+      drain()
+      assert Enum.all?(entries(), &(&1.state == :synced))
+
+      FailableLayer.fail_reads(FailableSqlite, {:rejected, "local read failed"})
+
+      # Unfixed: `{:ok, refresh(host_resource, :all, tenant)}` — since
+      # refresh/3 can itself return `{:error, reason}` (H3), this wraps it
+      # into the malformed `{:ok, {:error, reason}}` — a caller pattern-
+      # matching on `{:ok, stats}` treats the failure as success.
+      assert {:error, _} = LocalOutbox.hydrate(FailableLocalWidget)
+    after
+      FailableLayer.clear_reads(FailableSqlite)
+    end
+  end
+
   # --- M1: {:upsert_skipped, ...} must not crash the LocalOutbox write path -
 
   describe "M1: a condition-skipped upsert through LocalOutbox does not crash" do

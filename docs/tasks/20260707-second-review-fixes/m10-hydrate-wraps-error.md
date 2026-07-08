@@ -1,6 +1,15 @@
 # M10 — `hydrate/2` wraps a possibly-`{:error, _}` refresh in `{:ok, ...}`
 
-- **Status**: OPEN
+- **Status**: DONE (Cat A — already fixed, uncommitted-at-time-of-tracker, now
+  committed as part of the H3 work earlier in this pass) — `hydrate/2` already
+  `case`-matches `refresh/3`'s result
+  (`{:error, _} = error -> error; stats -> {:ok, stats}`), and its `@spec`
+  already reads `{:ok, map()} | {:error, term()}`. No new fix needed here; added
+  the missing DIRECT test coverage per the done-when (none existed — only
+  indirect coverage via boot-hydration paths). Retained regression (expected to
+  pass on current code, and does): a failing target read during `refresh(:all)`
+  surfaces as `{:error, _}` through `hydrate/2`, not `{:ok, {:error, _}}}`.
+  `INTEGRATION=1 mix test` green (313, up from 312).
 - **Severity**: Medium (malformed return; callers treat failure as success)
 - **Repo**: MDL (ash_multi_datalayer)
 - **Verification**: AGENT
