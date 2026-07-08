@@ -23,7 +23,33 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Sweeper do
 
   def start_link(opts) do
     resources = Keyword.fetch!(opts, :resources)
-    GenServer.start_link(__MODULE__, resources, name: name(resources))
+
+    # L5: `{:global, ...}` is a deliberate single-node-only choice for this
+    # sweeper — a genuine peer node (or, in test, a second boot attempt with
+    # the same resource set already registered) hits an unavoidable
+    # `{:already_started, pid}` collision here. Turn that into a clear,
+    # intentional rejection (this app is single-node-only, see
+    # `AshMultiDatalayer.Verifiers.RejectMultiNode`/ADR
+    # 20260417-single-node-v1) rather than an opaque supervisor-child-start
+    # failure — the second node's supervisor still fails to boot either
+    # way, but now with an explanation instead of a bare OTP tuple.
+    case GenServer.start_link(__MODULE__, resources, name: name(resources)) do
+      {:error, {:already_started, _pid}} = error ->
+        Logger.error(
+          "AshMultiDatalayer.Orchestrator.LocalOutbox.Sweeper failed to start: " <>
+            "a sweeper for this resource set is already registered under " <>
+            "#{inspect(name(resources))}. ash_multi_datalayer v1 is " <>
+            "single-node-only (see ADR 20260417-single-node-v1) — this " <>
+            "usually means a peer node tried to join the same distributed " <>
+            "Erlang cluster, which is not supported. This node's supervisor " <>
+            "will fail to boot as a result."
+        )
+
+        error
+
+      other ->
+        other
+    end
   end
 
   @doc false

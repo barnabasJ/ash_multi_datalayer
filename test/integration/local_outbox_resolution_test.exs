@@ -1004,6 +1004,27 @@ defmodule AshMultiDatalayer.Integration.LocalOutboxResolutionTest do
     end
   end
 
+  describe "L5: sweeper {:global, ...} name collision is a clear, deliberate rejection" do
+    test "a second start_link for the same resource set fails with {:already_started, _}, not a crash" do
+      # `{:global, ...}` names are unique regardless of node count — even on
+      # one node, a second registration attempt for the same key collides
+      # exactly like a genuine peer node would. This proves start_link/1
+      # surfaces that collision as a typed {:error, {:already_started, _}}
+      # (logged with the single-node-only explanation) rather than letting
+      # the raw OTP failure crash unexplained, or worse, silently ignoring
+      # it and leaving this "node" with no supervised sweeper.
+      {:ok, pid} = Sweeper.start_link(resources: [Widget])
+      on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:error, {:already_started, ^pid}} = Sweeper.start_link(resources: [Widget])
+        end)
+
+      assert log =~ "single-node-only"
+    end
+  end
+
   # --- shared helpers ---------------------------------------------------------
 
   # Runs the boot_hydrate task ash_multi_datalayer registers for a resource's

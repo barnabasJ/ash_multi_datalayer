@@ -10,6 +10,17 @@ defmodule AshMultiDatalayer.Verifiers.RejectMultiNode do
 
   silences the warning and serves as the documented acknowledgement. See ADR
   20260417-single-node-v1.
+
+  **This check is compile-time only (L5, A7 item 4)**: Spark DSL verifiers
+  run during `mix compile`, reading `Application.get_env/3` at that moment —
+  the same compile-time config visibility every other MDL verifier has (see
+  the README's `--warnings-as-errors` section). Setting
+  `assume_single_node` **only** in `config/runtime.exs` (or another
+  release-time-only source, e.g. an env var read at boot) is invisible to
+  this verifier; put it in `config/config.exs` (or an environment-specific
+  compile-time config file) for the acknowledgement to actually take
+  effect. A release that sets it exclusively at runtime will see this
+  warning at every build regardless of the runtime value.
   """
   use Spark.Dsl.Verifier
 
