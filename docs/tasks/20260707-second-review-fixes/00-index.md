@@ -212,7 +212,7 @@ is H5/#19 work and uses the real tenant, not the partition key.
 | L1  | [Composite-PK crash in aggregate fold paths](l1-composite-pk-aggregate-paths.md)                                                   | MDL        | DONE   |
 | L2  | [Aggregate fold leaves `%Ash.NotLoaded{}` (flaky live test)](l2-aggregate-fold-notloaded.md)                                       | MDL        | DONE   |
 | L3  | [`write_through` inline drain misses creates; nil tenant on attribute-tenancy creates](l3-write-through-drain-create-pk-tenant.md) | MDL        | DONE   |
-| L4  | [String/CiString range subsumption still byte-ordered](l4-string-range-subsumption-collation.md)                                   | MDL        | OPEN   |
+| L4  | [String/CiString range subsumption still byte-ordered](l4-string-range-subsumption-collation.md)                                   | MDL        | DONE   |
 | L5  | [Sweeper `{:global, ...}` name fails second-node boot; RejectMultiNode config](l5-sweeper-global-name-multinode.md)                | MDL        | OPEN   |
 | L6  | [Codegen LOWs: identifier validation, path traversal, FK fidelity](l6-codegen-lows.md)                                             | ash_remote | OPEN   |
 | L7  | [Data-layer LOWs: header dedupe, write retries, composite PK, sort args](l7-data-layer-lows.md)                                    | ash_remote | OPEN   |

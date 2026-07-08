@@ -162,6 +162,30 @@ defmodule AshMultiDatalayer.Integration.SubsumptionTest do
     assert pg_reads() == 2
   end
 
+  test "L4: string range subsumption never trusts byte order across distinct bounds" do
+    # `Comp.compare/2` on strings is byte-ordered ('B' = 66 < 'b' = 98), but a
+    # SQL source's own collation (typically ICU/locale) may order case
+    # differently — `name > "B"` covering `name > "b"` from cache would be a
+    # silent, collation-dependent correctness bug (rows the source would
+    # actually return, dropped). Warm `name > "B"`, then query `name > "b"` —
+    # unfixed: served from cache (pg_reads stays 1, byte order says "B" < "b"
+    # so it looks like a superset); fixed: refused, falls through to source.
+    TestPost |> Ash.Query.filter(name > "B") |> Ash.read!()
+    assert pg_reads() == 1
+
+    TestPost |> Ash.Query.filter(name > "b") |> Ash.read!()
+    assert pg_reads() == 2
+  end
+
+  test "L4: identical string range bounds still subsume (byte-order-independent)" do
+    TestPost |> Ash.Query.filter(name > "aardvark") |> Ash.read!()
+    assert pg_reads() == 1
+
+    # Same exact bound, re-queried — always safe under any collation.
+    TestPost |> Ash.Query.filter(name > "aardvark") |> Ash.read!()
+    assert pg_reads() == 1
+  end
+
   test "tenantless reads use the global partition consistently" do
     TestPost |> Ash.Query.filter(name == "foo") |> Ash.read!()
     assert [%{tenant: :__global__}] = AshMultiDatalayer.Coverage.entries(TestPost, nil)

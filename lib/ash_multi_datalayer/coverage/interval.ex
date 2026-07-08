@@ -148,6 +148,21 @@ defmodule AshMultiDatalayer.Coverage.Interval do
     Enum.all?(values, &(contains_value?(outer, &1) == true))
   end
 
+  # L4: string/CiString range bounds are byte-ordered here (`Comp.compare/2`),
+  # but the source of truth compares under its own (typically ICU/locale)
+  # collation — `name > "B"` does NOT reliably subsume `name > "b"` there
+  # (case ordering differs from ASCII byte order), so a coverage hit could
+  # silently drop rows the source would actually return. Refuse subsumption
+  # for these types unless both bounds are identical (byte-order-independent:
+  # the same range is always the same range under any collation).
+  def subset?(
+        %__MODULE__{kind: :range, type: type} = inner,
+        %__MODULE__{kind: :range, type: type} = outer
+      )
+      when type in [Ash.Type.String, Ash.Type.CiString] do
+    inner.lower == outer.lower and inner.upper == outer.upper
+  end
+
   def subset?(%__MODULE__{kind: :range} = inner, %__MODULE__{kind: :range} = outer) do
     lower_within?(outer.lower, inner.lower) and upper_within?(outer.upper, inner.upper)
   end

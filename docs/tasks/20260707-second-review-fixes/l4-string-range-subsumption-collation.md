@@ -1,6 +1,18 @@
 # L4 — String/CiString range subsumption still byte-ordered (A3)
 
-- **Status**: OPEN
+- **Status**: DONE — `Interval.subset?/2` gained a clause for `kind: :range`
+  intervals whose `type` is `Ash.Type.String` or `Ash.Type.CiString`:
+  subsumption now requires the two ranges' bounds to be identical
+  (`inner.lower == outer.lower and inner.upper == outer.upper`), refusing the
+  general `lower_within?`/`upper_within?` byte-order comparison for these types.
+  Equality/`in` handling (`:eq`/`:in` route through `contains_value?/2`,
+  unaffected) stays as is, per the task's scope. 2 repro tests in
+  `subsumption_test.exs`: `name > "B"` no longer (falsely) subsumes `name > "b"`
+  — confirmed via stash to serve incorrectly from cache on unfixed code
+  (`pg_reads()` stayed 1 instead of going to 2); a same-bound re-query
+  (`name > "aardvark"` twice) still subsumes correctly (unaffected,
+  byte-order-independent). Interval property tests still pass (no regressions).
+  `INTEGRATION=1 mix test` green (322, up from 320).
 - **Severity**: Low (silently dropped rows under ICU collation)
 - **Repo**: MDL (ash_multi_datalayer)
 - **Verification**: AGENT
