@@ -148,18 +148,17 @@ end
 Generate the outbox resource and its migration with
 `mix ash_multi_datalayer.gen.outbox`. A flush parks on one of three
 `error_class` values: a target row that moved since this client last saw it
-(`conflict_detection`) parks as `:conflict` carrying a three-way snapshot
-(local / base / remote); a semantic rejection the target will never accept
-parks as `:rejected`; an auth/credential failure (`Ash.Error.Forbidden` or
+(`conflict_detection`) parks as `:conflict` carrying a three-way snapshot (local
+/ base / remote); a semantic rejection the target will never accept parks as
+`:rejected`; an auth/credential failure (`Ash.Error.Forbidden` or
 `class: :forbidden`) parks **immediately** as `:auth` — no retry-budget burn,
 since a token doesn't un-expire by retrying. Resolve a park with
 `LocalOutbox.force/1` (mine wins), `discard_local/1` (theirs win), `retry/1`
 (re-flush after fixing the cause — the `:auth` recovery path), or `rebase/2`
 (apply a new resolution changeset; the parked chain is dropped only after the
-new write succeeds, so a failed resolution leaves the original conflict
-intact). Pause/resume the queue with `LocalOutbox.pause_sync/1` /
-`resume_sync/1` (the "go offline" toggle), and poll per-record state with
-`LocalOutbox.status/1`.
+new write succeeds, so a failed resolution leaves the original conflict intact).
+Pause/resume the queue with `LocalOutbox.pause_sync/1` / `resume_sync/1` (the
+"go offline" toggle), and poll per-record state with `LocalOutbox.status/1`.
 
 Individual actions can also bypass the strategy's routing via query/changeset
 context. `context: %{multi_datalayer: %{read_from: :remote}}` routes one read
@@ -167,10 +166,10 @@ raw to the named layer, side-effect-free (no coverage recording, backfill, or
 outbox interaction — useful for compare-reads); it emits `[:read, :forced]`
 telemetry. `context: %{multi_datalayer: %{write_through: true}}` makes one
 LocalOutbox write synchronous and reorders it to match the "durable on the
-server or error" guarantee: every replica target is written **first**, and
-the local layer commits only once every target has durably accepted the
-write — a replica failure fails the whole action with the local layer
-untouched. No outbox entry is created either way.
+server or error" guarantee: every replica target is written **first**, and the
+local layer commits only once every target has durably accepted the write — a
+replica failure fails the whole action with the local layer untouched. No outbox
+entry is created either way.
 
 ### How inbound changes reach a client (realtime)
 
@@ -188,6 +187,43 @@ and each change is routed to the resource's strategy:
 
 One notification stream, two strategy-appropriate reactions. Pair it with an
 app-level notifier that tells your LiveViews to re-render.
+
+### How multitenancy works
+
+Declare `multitenancy` exactly as you would on any other resource:
+
+```elixir
+multitenancy do
+  strategy :attribute
+  attribute :org_id
+  global? true    # see below — only if some rows/reads are genuinely tenantless
+end
+```
+
+Rules that follow from this:
+
+- **Every declared layer must support multitenancy** — a compile-time verifier
+  (`ValidateMultitenancy`) rejects a config where any layer can't isolate
+  tenants; this is intersection, not per-layer opt-out, because a layer that
+  can't isolate tenants would leak data across them.
+- **The coverage ledger partitions per tenant.** Each tenant gets its own
+  ETS-table partition of ledger entries; a read for tenant A can never be served
+  from tenant B's coverage. A `nil` tenant (a genuinely non-multitenant host, or
+  an explicit unscoped read) uses the `:__global__` sentinel partition — a
+  distinct partition from any real tenant value, never conflated with one.
+- **`global? true`** (attribute-strategy only) declares that some rows may
+  legitimately have no tenant (a `nil` tenant attribute) — e.g. shared/public
+  rows alongside tenant-owned ones. This changes invalidation: a write with a
+  real tenant ALSO sweeps the unscoped (`:__global__`) partition (a nil-tenant
+  read may have cached this row across every tenant), and a genuinely unscoped
+  write sweeps every partition currently holding entries (conservative — the row
+  may have been cached under any of them). Without `global? true`, only the
+  write's own partition is touched — cheaper, but wrong if any row can genuinely
+  have no tenant.
+- **Context-strategy tenancy** (`strategy :context`) is supported the same way —
+  the tenant value threading through `Ash.Query.set_tenant/2`/changeset context
+  is what gets canonicalized into a ledger partition key, not the attribute
+  itself.
 
 ### How to disable the cache at runtime without a deploy
 

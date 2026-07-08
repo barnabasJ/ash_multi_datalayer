@@ -163,6 +163,59 @@ or hygiene issues found before any release:
   physically absent even though it existed before and exists again immediately
   after (an absence anomaly, not staleness).
 
+Second-review fix run (2026-07-07), a follow-up pass over the whole-repo
+review's own fixes plus new findings from re-reviewing them — grouped by
+severity as the tracker did:
+
+- **Blockers**: `TenantKey.canonical/2` now the single source of truth for
+  tenant partition keys (`nil` → the `:__global__` sentinel, non-nil →
+  `Ash.ToTenant` + `to_string/1`, never `inspect/1`) — closes a family of
+  cross-tenant coverage-ledger collisions; `ExternalChange.notify/1` and the
+  Notifier now catch `:exit`/`:throw` from a reaction as well as raises;
+  `ProvenCoverage.reconcile/2`'s ghost-eviction now joins the invalidation epoch
+  protocol the way ordinary writes already did; `validate_aggregate_overrides`'s
+  compile-time check no longer confuses a calculation for an aggregate of the
+  same name; the JSON-round-tripped stale-check payload compare now normalizes
+  both sides before comparing (was silently parking every clean flush on
+  DATETIME/decimal conflict fields); a resolution-verb guard inverted for
+  `:synced` entries no longer lets `retry`/`force` re-push an already-applied
+  write.
+- **Highs**: `LocalOutbox.Api.refresh/3`'s dirty-check-to-backfill race closed
+  with a real SQLite `mode: :immediate` cross-process write lock
+  (`Ash.DataLayer.transaction` is a documented no-op on `AshSqlite.DataLayer` —
+  this is a genuine lock, not cosmetic); `write_through`'s drain race and
+  divergence recording now co-commit correctly; the LocalOutbox sweeper's
+  lost-kick recovery proven with a real fault-injection repro, not just a
+  happy-path test.
+- **Mediums**: `{:upsert_skipped, ...}` no longer crashes `BadMapError` when it
+  reaches `TenantKey`/write-dispatch code; `forget_probe/2` no longer passes the
+  after-image as the before-image to invalidation; `discard_local/1` captures
+  its outbox chain before applying (not after, closing a chain-mutation race)
+  and reuses the same co-commit-transaction destroy helper `rebase/2` already
+  had; a destroy-flush of an already-gone row now maps to `:ok`, not a false
+  `:rejected` park; a source-computed relationship aggregate's loud-failure
+  guard (never silently return `%Ash.NotLoaded{}`) now covers every read path,
+  not just the merged-read branch.
+- **Lows (batch)**: composite-PK resources no longer crash `MatchError` in the
+  aggregate fold path; an aggregate fold's silent `%Ash.NotLoaded{}` on a
+  cold-cache miss now falls through to the source instead; string/`CiString`
+  range subsumption no longer trusts byte order across distinct bounds
+  (collation-dependent correctness); the LocalOutbox sweeper's `{:global, ...}`
+  name collision (a second node/boot attempt) is now a clear, logged rejection
+  instead of an opaque OTP crash; `Coverage.insert/3` degrades instead of
+  crashing on a `TableOwner` restart, matching every other ETS accessor in that
+  module; a coverage-ledger fingerprint collision no longer risks widening an
+  unrelated entry's `loaded_fields`; `:upsert`'s intentional stale-check bypass
+  is now explicitly documented with its rationale; `:synced` outbox entries are
+  now pruned on a configurable retention window (`outbox_synced_retention_ms`,
+  default 7 days) instead of growing unbounded; `{:error, :no_rollback, _}` is
+  now preserved wherever it reaches Ash's own transaction machinery, instead of
+  being normalized away everywhere and silently triggering an unwanted rollback.
+- **Packaging**: `mix hex.build`/`mix docs` now succeed — the `crux` dependency
+  no longer uses `override: true` (Hex rejects that in a publishable package);
+  `description`/`package`/`docs` metadata, a root `LICENSE`, and an explicit
+  `files:` allowlist (excluding test-only fixtures) were added.
+
 ### Not in this release (planned for v2+)
 
 - Multi-node cache coherence.

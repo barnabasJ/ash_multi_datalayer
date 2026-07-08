@@ -212,23 +212,65 @@ LocalOutbox.refresh(MyApp.Todo, :all)
 LocalOutbox.hydrate(MyApp.Todo)
 ```
 
-**Park classes** (`entry.error_class`) — check this before choosing a
-resolution verb:
+**Resolution verbs are idempotent no-ops on an already-`:synced` entry.** Every
+verb above first checks the entry's current state; calling `retry/1`, `force/1`,
+`discard/1`, or `discard_local/1` on an entry that's already `:synced` (e.g. a
+stale reference in an operator script, or a race where the entry flushed between
+listing `parked/1` and acting on it) does nothing and returns `:ok` — it never
+re-pushes an already-applied write, destroys a live chain out from under a later
+write, or otherwise mutates a resolved entry. Safe to retry a resolution script
+without first re-checking each entry's state.
 
-| `error_class`         | Meaning                                                     | Typical resolution                                                          |
-| ---------------------- | ------------------------------------------------------------ | ---------------------------------------------------------------------------- |
-| `:conflict`            | Target row moved since this client's `base_image`             | Inspect `entry.remote_snapshot`, then `force/1`, `discard_local/1`, or `rebase/2` |
-| `:rejected`            | The target permanently rejected the write (validation, etc.) | Fix the underlying data/action, then `retry/1`, or `discard/1` to give up    |
-| `:auth`                | Forbidden/credential failure — parked **immediately**, no retries burned | Fix credentials, then `retry/1` (the entry re-flushes)              |
-| `:transient_exhausted` | Transient failures (network, timeouts) exhausted their retry budget | `retry/1` once the target is reachable again                        |
+**Park classes** (`entry.error_class`) — check this before choosing a resolution
+verb:
+
+| `error_class`          | Meaning                                                                  | Typical resolution                                                                |
+| ---------------------- | ------------------------------------------------------------------------ | --------------------------------------------------------------------------------- |
+| `:conflict`            | Target row moved since this client's `base_image`                        | Inspect `entry.remote_snapshot`, then `force/1`, `discard_local/1`, or `rebase/2` |
+| `:rejected`            | The target permanently rejected the write (validation, etc.)             | Fix the underlying data/action, then `retry/1`, or `discard/1` to give up         |
+| `:auth`                | Forbidden/credential failure — parked **immediately**, no retries burned | Fix credentials, then `retry/1` (the entry re-flushes)                            |
+| `:transient_exhausted` | Transient failures (network, timeouts) exhausted their retry budget      | `retry/1` once the target is reachable again                                      |
 
 An `:auth` park is the one class that never burns retries getting there — a
 target returning `Forbidden` parks on the FIRST flush attempt, since a token
-does not un-expire by retrying (masking it as `:transient_exhausted` would
-delay diagnosis of what's usually a production credential/expiry issue).
+does not un-expire by retrying (masking it as `:transient_exhausted` would delay
+diagnosis of what's usually a production credential/expiry issue).
 
 Also watch the Oban `:flush` queue health — a stalled queue means writes
 accumulate locally as `:pending` and nothing replicates.
+
+### LocalOutbox: the sweeper (lost-kick recovery + pruning)
+
+`AshMultiDatalayer.Orchestrator.LocalOutbox.Sweeper` is a periodic GenServer
+(default: 60s tick, `config :ash_multi_datalayer, :outbox_sweep_interval_ms`)
+started via `LocalOutbox.child_specs/1` for every configured host resource. It
+does two things on every tick:
+
+1. **Lost-kick recovery** — re-enqueues any `:pending` chain-head entry with no
+   live Oban job. Rows are the source of truth for sync state; jobs are
+   ephemeral pointers. A process dying between a co-committed write and its
+   post-commit `Enqueue.flush` call (or `Oban.insert` itself returning
+   `{:error, _}`) leaves a `:pending` row with nothing enqueued for it — the
+   sweeper is the backstop that eventually notices and re-kicks it. Idempotent:
+   an entry that already has a live job just gets a harmless extra one
+   (`ash_oban`'s unique-job args dedupe it).
+2. **`:synced` entry pruning** — destroys `:synced` outbox rows older than
+   `config :ash_multi_datalayer, :outbox_synced_retention_ms` (default: 7 days).
+   A `:synced` row has no further operational purpose once old enough that no
+   in-flight stale-check/resolution call could still reference it; without this,
+   outbox tables grow unbounded and `status/1` (which scans all of a record's
+   entries) gets slower over time. Lower the retention window if disk/table size
+   is a concern in a high-write-volume deployment; raise it if you rely on
+   `LocalOutbox.status/1` history for auditing longer than 7 days.
+
+**`{:global, ...}` naming is a deliberate single-node-only choice** (this
+library is single-node-only in v1 — see the README's `--warnings-as-errors`
+section and ADR 20260417-single-node-v1). A second node (or, locally, a second
+boot attempt for the same resource set) hits an unavoidable
+`{:already_started, pid}` collision on `Sweeper.start_link/1` — its supervisor
+fails to boot, with a logged explanation naming the cause. This is not a bug to
+work around; it is the intended failure mode for attempting multi-node
+deployment against this library's current architecture.
 
 ## Troubleshooting
 
