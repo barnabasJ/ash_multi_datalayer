@@ -126,8 +126,10 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Sweeper do
     |> Ash.Query.filter(state == :pending)
     |> Ash.Query.sort(seq: :asc)
     |> Ash.read!(authorize?: false)
-    |> Enum.filter(&MapSet.member?(resources, &1.resource))
-    |> Enum.filter(&(Flush.chain_position(outbox, domain, &1) == :head))
+    |> Enum.filter(fn entry ->
+      MapSet.member?(resources, entry.resource) and
+        Flush.chain_position(outbox, domain, entry) == :head
+    end)
     |> Enum.each(&kick(outbox, &1))
   end
 

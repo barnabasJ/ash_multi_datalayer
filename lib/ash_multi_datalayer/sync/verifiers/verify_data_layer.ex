@@ -14,7 +14,7 @@ defmodule AshMultiDatalayer.Sync.Verifiers.VerifyDataLayer do
 
   @impl true
   def verify(dsl) do
-    data_layer = Ash.Resource.Info.data_layer(dsl)
+    data_layer = Verifier.get_persisted(dsl, :data_layer)
     module = Verifier.get_persisted(dsl, :module)
 
     cond do

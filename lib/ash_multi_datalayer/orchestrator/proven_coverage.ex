@@ -821,26 +821,15 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
           :ok ->
             case reconcile(query, resource, earlier_layers, source_rows, opts[:complement]) do
               :ok ->
-                case Coverage.record(
-                       resource,
-                       coverage_tenant(resource, query),
-                       query,
-                       epoch0,
-                       probe
-                     ) do
-                  :ok ->
-                    emit_read(:backfill, query, resource, started, %{records: length(source_rows)})
-
-                  :skipped ->
-                    :ok
-
-                  :epoch_moved ->
-                    evict_backfilled_rows(earlier_layers, resource, source_rows, query)
-
-                    Telemetry.read(:backfill_aborted, resource, query, %{}, %{
-                      reason: :epoch_moved_at_record
-                    })
-                end
+                record_backfill(
+                  query,
+                  resource,
+                  earlier_layers,
+                  source_rows,
+                  epoch0,
+                  probe,
+                  started
+                )
 
               {:error, :reconcile_scan_failed} ->
                 :ok
@@ -858,6 +847,23 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
     end
 
     :ok
+  end
+
+  defp record_backfill(query, resource, earlier_layers, source_rows, epoch0, probe, started) do
+    case Coverage.record(resource, coverage_tenant(resource, query), query, epoch0, probe) do
+      :ok ->
+        emit_read(:backfill, query, resource, started, %{records: length(source_rows)})
+
+      :skipped ->
+        :ok
+
+      :epoch_moved ->
+        evict_backfilled_rows(earlier_layers, resource, source_rows, query)
+
+        Telemetry.read(:backfill_aborted, resource, query, %{}, %{
+          reason: :epoch_moved_at_record
+        })
+    end
   end
 
   # Reconcile-on-record (C4, defense in depth): deletes cached rows matching
