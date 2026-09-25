@@ -180,4 +180,68 @@ defmodule AshMultiDatalayer.OrchestratorTest do
 
   defp error_message({:error, %Spark.Error.DslError{message: message}}), do: message
   defp error_message(other), do: flunk("expected {:error, %DslError{}}, got: #{inspect(other)}")
+
+  describe "validate_opts/2 (coverage_store:)" do
+    test "nil (unconfigured) is valid" do
+      assert :ok = ProvenCoverage.validate_opts(DefaultPost, [])
+    end
+
+    test "a module without the StoreEntry extension is rejected" do
+      assert {:error, message} =
+               ProvenCoverage.validate_opts(DefaultPost,
+                 coverage_store: AshMultiDatalayer.Test.Resources.CappedPost
+               )
+
+      assert message =~ "does not carry the AshMultiDatalayer.Coverage.StoreEntry extension"
+    end
+
+    test "an uncompilable module is rejected" do
+      assert {:error, message} =
+               ProvenCoverage.validate_opts(DefaultPost, coverage_store: NoSuchModuleAtAll)
+
+      assert message =~ "could not be compiled/loaded"
+    end
+
+    test "a real StoreEntry-extended resource is accepted" do
+      assert :ok =
+               ProvenCoverage.validate_opts(DefaultPost,
+                 coverage_store: AshMultiDatalayer.Test.Coverage.TestStoreEntry
+               )
+    end
+
+    test "the ValidateOrchestrator verifier surfaces a rejected coverage_store" do
+      module =
+        define(
+          quote do
+            multi_data_layer do
+              orchestrator(
+                {AshMultiDatalayer.Orchestrator.ProvenCoverage,
+                 coverage_store: AshMultiDatalayer.Test.Resources.CappedPost}
+              )
+
+              layer(:only, Ash.DataLayer.Ets)
+              read_order([:only])
+              write_order([:only])
+            end
+          end
+        )
+
+      assert error_message(
+               AshMultiDatalayer.Verifiers.ValidateOrchestrator.verify(module.spark_dsl_config())
+             ) =~ "does not carry the AshMultiDatalayer.Coverage.StoreEntry extension"
+    end
+  end
+
+  describe "child_specs/1 with coverage_store:" do
+    # Pure Spark-config/list assertions only — no ETS/process mutation, safe
+    # under this module's `async: true`. The behavioral test (actually
+    # starting the spec and observing a restore) lives in
+    # `AshMultiDatalayer.Coverage.StoreTest` (`async: false`), which already
+    # owns the shared-table teardown this needs.
+    test "only resources with coverage_store: configured get a restore child spec" do
+      configured = AshMultiDatalayer.Test.Coverage.CoverageStoreResource
+      assert [spec] = ProvenCoverage.child_specs([DefaultPost, configured])
+      assert %{id: {ProvenCoverage, :restore, ^configured}} = Supervisor.child_spec(spec, [])
+    end
+  end
 end

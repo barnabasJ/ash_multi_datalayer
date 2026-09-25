@@ -104,6 +104,19 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 - `AshMultiDatalayer.forget!/3` (per-row purge) and `not_found?/1`.
 - Telemetry additions: `[:read, :partial]`, `[:read, :forced]` (the `read_from`
   escape hatch), and the `:calc_sort_source_only` miss reason.
+- **Persisted coverage store** (`AshMultiDatalayer.Coverage.Store`) — an
+  optional `coverage_store:` orchestrator option on `ProvenCoverage` that
+  mirrors every ledger write into an app-owned Ash resource and restores from
+  it at boot, so the coverage ledger survives a BEAM restart instead of
+  starting cold every time. Async, best-effort write-through — never on the
+  read/write critical path, and never a correctness requirement (losing or
+  restoring a stale row costs a cache hit, never a wrong read). No data-layer
+  requirement, unlike `LocalOutbox`'s `outbox_resource:` — any `Ash.DataLayer`
+  works. `AshMultiDatalayer.Coverage.StoreEntry` Spark extension + `mix
+  ash_multi_datalayer.gen.coverage_store` generator scaffold the app-owned
+  store resource. `Coverage.Entry.loaded_at` switched from
+  `System.monotonic_time/0` to wall-clock `DateTime.utc_now/0` so LRU ordering
+  is meaningful across a restore.
 
 ### Fixed
 
@@ -215,6 +228,55 @@ severity as the tracker did:
   no longer uses `override: true` (Hex rejects that in a publishable package);
   `description`/`package`/`docs` metadata, a root `LICENSE`, and an explicit
   `files:` allowlist (excluding test-only fixtures) were added.
+
+First real-SQLite-project integration (2026-07-17/18), found stood up a genuine
+offline-first LocalOutbox resource on `AshSqlite.DataLayer` for the first time
+(prior usage/tests were Postgres-only for the migration-shadowing path):
+
+- `mix ash_multi_datalayer.generate_migrations`'s `run/1` no longer requires
+  the optional `:ash_postgres` dependency to resolve `--domains` — it only
+  raises when a configured domain actually has a postgres-layered resource,
+  deferred until `generate/2`'s own filter determines that. A pure-SQLite
+  project can now run `mix ash.codegen` at all.
+- **SQLite parity for the migration-shadowing mechanism.** `AshMultiDatalayer.Migration`
+  was hardcoded to Postgres only, so a sqlite-layered multi-datalayer
+  resource's local table was invisible to every codegen path — no migration,
+  no error. Genericized to a `target_data_layer` param
+  (`layered_as?/2`, `shadow_resource/2`, `shadow_domain/2`,
+  `rewrite_relationship/2`) and added a parallel
+  `mix ash_multi_datalayer.generate_sqlite_migrations` task, wired into
+  `AshMultiDatalayer.DataLayer.codegen/1` alongside the existing Postgres one.
+- `codegen/1` disambiguates the migration name it hands each generator
+  (`_multi_datalayer_postgres`/`_multi_datalayer_sqlite` suffix) — `mix
+  ash.codegen` invokes every registered extension's `codegen/1` with the same
+  `--name`, and a project sharing one repo between a plain-`AshSqlite.DataLayer`
+  resource and a sqlite-layered multi-datalayer resource previously hit
+  `Ecto.MigrationError: migration name ... is duplicated` (the same latent
+  risk has always existed on the Postgres side too, just never triggered).
+
+First real ProvenCoverage cache resource against a live backend (2026-07-18),
+standing up `Arcc.Scheduling.Session` (ProvenCoverage, `AshSqlite.DataLayer`
+cache + `AshRemote.DataLayer` remote) — prior ProvenCoverage usage/tests
+composed non-SQL "remote" stand-ins (`Ash.DataLayer.Ets`) that happen not to
+exercise this path:
+
+- **`DataLayer.source/1` only ever asked the orchestrator's `authority/1`
+  layer for a table name.** For `LocalOutbox`, authority is the local
+  (SQL) layer, so this happened to work by accident; for `ProvenCoverage`,
+  authority is the *read source of truth* — for `Session` that's
+  `AshRemote.DataLayer`, which has no `source/1` (it isn't SQL-backed) and so
+  returned `""`. Every ProvenCoverage backfill write then hit Ecto with an
+  empty table name (`"" table name` SQL error) — a resource-shape bug, not
+  specific to any one field/action/relationship (confirmed by bisecting
+  `Session`'s full DSL down to a minimal repro, one section at a time, before
+  finding the true trigger was the orchestrator *type* itself). Fixed by
+  scanning every declared layer for a `source/1` a data layer actually
+  implements, trying the authority layer first (preserves the existing
+  fast path/behavior for `LocalOutbox`) and falling back to the first other
+  layer that resolves one (the SQL cache layer, for `ProvenCoverage`).
+  Regression-guarded by `test/ash_multi_datalayer/schema_source_test.exs`
+  (a `SchemaSource.Widget` fixture: ProvenCoverage, SQL cache + ETS remote,
+  matching `AshRemote.DataLayer`'s no-`source/1` shape exactly).
 
 ### Not in this release (planned for v2+)
 

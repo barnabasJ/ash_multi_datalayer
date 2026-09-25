@@ -11,6 +11,15 @@ defmodule AshMultiDatalayer.Test.BlockingPostgres do
   use AshMultiDatalayer.Test.BlockingLayer, wraps: AshMultiDatalayer.Test.CountingPostgres
 end
 
+defmodule AshMultiDatalayer.Test.FailableCountingPostgres do
+  @moduledoc """
+  Counted Postgres source layer that can be armed to fail its next read —
+  for proving `ProvenCoverage`'s source-unreachable read fallback (see
+  `AshMultiDatalayer.Test.FailableLayer.fail_reads/2`).
+  """
+  use AshMultiDatalayer.Test.FailableLayer, wraps: AshMultiDatalayer.Test.CountingPostgres
+end
+
 defmodule AshMultiDatalayer.Test.BlockingEts do
   @moduledoc """
   Ets cache layer that can park `run_query` — for deterministic
@@ -103,6 +112,7 @@ defmodule AshMultiDatalayer.Test.Resources do
       resource AshMultiDatalayer.Test.Resources.MirrorPost
       resource AshMultiDatalayer.Test.Resources.MirrorAuthor
       resource AshMultiDatalayer.Test.Resources.FailingPost
+      resource AshMultiDatalayer.Test.Resources.SourceFailablePost
       resource AshMultiDatalayer.Test.Resources.CappedPost
       resource AshMultiDatalayer.Test.Resources.SampledPost
       resource AshMultiDatalayer.Test.Resources.LocalEvalOffPost
@@ -615,6 +625,45 @@ defmodule AshMultiDatalayer.Test.Resources do
     multi_data_layer do
       layer(:l1, AshMultiDatalayer.Test.FailingEts)
       layer(:l2, AshMultiDatalayer.Test.CountingPostgres)
+
+      read_order([:l1, :l2])
+      write_order([:l2, :l1])
+    end
+
+    postgres do
+      table "mdl_posts"
+      repo(AshMultiDatalayer.TestRepo)
+    end
+
+    attributes do
+      uuid_primary_key :id
+      attribute :name, :string, public?: true
+      attribute :age, :integer, public?: true
+      attribute :score, :decimal, public?: true
+      attribute :published_at, :date, public?: true
+    end
+
+    actions do
+      defaults [:read, :destroy, create: :*, update: :*]
+    end
+  end
+
+  defmodule SourceFailablePost do
+    @moduledoc """
+    Shares `mdl_posts` with `TestPost`/`MirrorPost`; its source layer
+    (`FailableCountingPostgres`) can be armed to fail its next read — for
+    proving a coverage-miss that then finds the source unreachable degrades
+    to a best-effort cache read instead of propagating a hard error (see
+    `ProvenCoverage.source_unreachable_fallback/6`).
+    """
+    use Ash.Resource,
+      domain: Domain,
+      data_layer: AshMultiDatalayer.DataLayer,
+      extensions: [AshPostgres.DataLayer]
+
+    multi_data_layer do
+      layer(:l1, Ash.DataLayer.Ets)
+      layer(:l2, AshMultiDatalayer.Test.FailableCountingPostgres)
 
       read_order([:l1, :l2])
       write_order([:l2, :l1])

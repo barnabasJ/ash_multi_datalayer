@@ -34,10 +34,12 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
   alias AshMultiDatalayer.Capability
   alias AshMultiDatalayer.Coverage
   alias AshMultiDatalayer.Coverage.Invalidation
+  alias AshMultiDatalayer.Coverage.Store
   alias AshMultiDatalayer.DataLayer.Info
   alias AshMultiDatalayer.DataLayer.Query
   alias AshMultiDatalayer.Delegate
   alias AshMultiDatalayer.KillSwitch
+  alias AshMultiDatalayer.Orchestrator.LocalOutbox.Flush
   alias AshMultiDatalayer.Telemetry
 
   # Relationship-aggregate kinds we compute over a related resource — by a SQL
@@ -154,11 +156,62 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
   defp layers_can?([], _resource, _feature), do: false
   defp layers_can?(layers, resource, feature), do: Enum.all?(layers, & &1.can?(resource, feature))
 
-  # ProvenCoverage keeps today's lazy start — table owners spawn on first use,
-  # supervised by `AshMultiDatalayer.TableSupervisor` (already in the base
-  # supervisor tree), so it needs no boot-time children (review D1/R6).
+  @doc false
+  # Validates `coverage_store:` when configured — invoked by
+  # `AshMultiDatalayer.Verifiers.ValidateOrchestrator`. Catches a
+  # misconfigured store at compile time rather than at the first silently
+  # swallowed async persist failure (`Store.persist_async/3` logs and moves
+  # on; a compile-time signal is the only loud one this feature gets).
   @impl AshMultiDatalayer.Orchestrator
-  def child_specs(_resources), do: []
+  def validate_opts(_dsl_or_resource, opts) do
+    case opts[:coverage_store] do
+      nil ->
+        :ok
+
+      store ->
+        validate_store(store)
+    end
+  end
+
+  defp validate_store(store) do
+    case Code.ensure_compiled(store) do
+      {:module, ^store} ->
+        if AshMultiDatalayer.Coverage.StoreEntry in Spark.extensions(store) do
+          :ok
+        else
+          {:error,
+           "ProvenCoverage's `coverage_store:` (#{inspect(store)}) does not carry the " <>
+             "AshMultiDatalayer.Coverage.StoreEntry extension. Generate one with " <>
+             "`mix ash_multi_datalayer.gen.coverage_store`, or add " <>
+             "`extensions: [AshMultiDatalayer.Coverage.StoreEntry]` to it directly."}
+        end
+
+      {:error, reason} ->
+        {:error,
+         "ProvenCoverage's `coverage_store:` (#{inspect(store)}) could not be compiled/loaded " <>
+           "(#{inspect(reason)})."}
+    end
+  end
+
+  # Boot-time restore, only for resources that configured `coverage_store:` —
+  # ProvenCoverage otherwise keeps its lazy start (table owners spawn on first
+  # use, supervised by the always-present `AshMultiDatalayer.TableSupervisor`;
+  # review D1/R6). Each resource restores in its own one-shot `Task` — one
+  # slow/unavailable store never blocks another resource's restore, and a
+  # crash is contained (`restart: :temporary`) rather than taking down the
+  # supervisor.
+  @impl AshMultiDatalayer.Orchestrator
+  def child_specs(resources) do
+    resources
+    |> Enum.filter(&Store.configured?/1)
+    |> Enum.map(fn resource ->
+      Supervisor.child_spec(
+        {Task, fn -> Store.restore(resource) end},
+        id: {__MODULE__, :restore, resource},
+        restart: :temporary
+      )
+    end)
+  end
 
   # --- inbound changes (notification bridge) ----------------------------
 
@@ -755,15 +808,59 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
     earlier_layers = Enum.drop(read_layers, -1)
     fetch_query = widen_select_for_backfill(query, resource, earlier_layers)
 
-    with {:ok, records} <- Delegate.run_on_layer(fetch_query, read_source_layer(resource)) do
-      # P1: covers every source_read/5 caller — cold-cache miss,
-      # not-cacheable (lock/non-mergeable), calc-sort-source-only, AND
-      # merged_read's own :stale_cache/:miss fallbacks (they call
-      # source_read/5 too) — one insertion point for all of them.
-      ensure_source_aggregates_resolved!(fetch_query, records)
-      emit_read(:miss, query, resource, started, %{reason: miss_reason})
-      maybe_backfill(query, resource, read_layers, records, epoch0)
-      {:ok, records}
+    case Delegate.run_on_layer(fetch_query, read_source_layer(resource)) do
+      {:ok, records} ->
+        # P1: covers every source_read/5 caller — cold-cache miss,
+        # not-cacheable (lock/non-mergeable), calc-sort-source-only, AND
+        # merged_read's own :stale_cache/:miss fallbacks (they call
+        # source_read/5 too) — one insertion point for all of them.
+        ensure_source_aggregates_resolved!(fetch_query, records)
+        emit_read(:miss, query, resource, started, %{reason: miss_reason})
+        maybe_backfill(query, resource, read_layers, records, epoch0)
+        {:ok, records}
+
+      {:error, error} ->
+        source_unreachable_fallback(query, resource, read_layers, started, miss_reason, error)
+    end
+  end
+
+  # A coverage miss that then finds the source unreachable (offline, backend
+  # down) used to propagate the raw error straight to the caller — even when
+  # the cache layer already physically holds an adequate answer (e.g. a
+  # coverage ledger dropped by `LifecycleGuard`'s "unknown degrades to a
+  # full-but-safe reconcile" after a realtime reconnect gap, while the cache
+  # itself was never touched). That turned a network hiccup into a hard
+  # failure for data already sitting on disk. `Flush.classify/1` is reused
+  # rather than a fresh check here specifically to stay source-layer-agnostic
+  # (no `AshRemote`-specific pattern match) and to match this library's own
+  # established default — unknown degrades to transient/recoverable, not
+  # rejected. Only `:transient` degrades to a best-effort cache read; a real
+  # `:rejected`/`:auth` answer means the source was reached and gave a
+  # meaningful response, so it must not be masked by stale local data.
+  #
+  # Every returned record is tagged `__metadata__[:amd_degraded_read]` —
+  # `{:ok, records}` alone can't tell a caller "this is a confirmed answer"
+  # from "this is a best-effort answer, the source was unreachable" (an
+  # empty degraded read and a genuine confirmed-empty read are otherwise
+  # indistinguishable), and callers that track sync/freshness status (e.g.
+  # a "last synced" label) need that distinction to avoid recording a
+  # network round trip that never actually happened.
+  defp source_unreachable_fallback(query, resource, read_layers, started, miss_reason, error) do
+    if Flush.classify(error) == :transient do
+      case Delegate.run_on_layer(query, hd(read_layers)) do
+        {:ok, records} ->
+          emit_read(:degraded, query, resource, started, %{
+            reason: miss_reason,
+            source_error: inspect(error)
+          })
+
+          {:ok, Enum.map(records, &Ash.Resource.put_metadata(&1, :amd_degraded_read, true))}
+
+        {:error, _cache_error} ->
+          {:error, error}
+      end
+    else
+      {:error, error}
     end
   end
 

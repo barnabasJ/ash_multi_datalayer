@@ -792,7 +792,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Api do
   defp last_target(host_resource),
     do: List.last(AshMultiDatalayer.DataLayer.Info.write_order(host_resource))
 
-  defp backfill_opts(host_resource, tenant \\ nil) do
+  defp backfill_opts(host_resource, tenant) do
     [tenant: tenant, domain: Ash.Resource.Info.domain(host_resource)]
   end
 

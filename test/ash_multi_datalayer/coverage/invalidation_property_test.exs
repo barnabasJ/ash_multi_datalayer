@@ -28,7 +28,7 @@ defmodule AshMultiDatalayer.Coverage.InvalidationPropertyTest do
         filter: filter,
         normalised: Normaliser.normalise(filter, TestPost),
         loaded_fields: MapSet.new([:id]),
-        loaded_at: 0
+        loaded_at: DateTime.utc_now()
       }
 
       expected = matches_or_unknown?(filter, row_before) or matches_or_unknown?(filter, row_after)

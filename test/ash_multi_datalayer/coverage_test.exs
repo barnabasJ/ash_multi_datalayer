@@ -28,7 +28,7 @@ defmodule AshMultiDatalayer.CoverageTest do
       normalised: %AshMultiDatalayer.Coverage.Normaliser.Normalised{disjuncts: [%{}]},
       fingerprint: 0,
       loaded_fields: MapSet.new([:id]),
-      loaded_at: System.monotonic_time()
+      loaded_at: DateTime.utc_now()
     }
   end
 
@@ -51,12 +51,13 @@ defmodule AshMultiDatalayer.CoverageTest do
 
   test "touch/3 refreshes loaded_at for a live entry" do
     :ok = Coverage.ensure_table(FakeResource)
-    entry = %{entry(make_ref()) | loaded_at: 0}
+    stale = ~U[2020-01-01 00:00:00.000000Z]
+    entry = %{entry(make_ref()) | loaded_at: stale}
     :ok = Coverage.insert(FakeResource, nil, entry)
 
     assert AshMultiDatalayer.TestSupport.touch_entry!(FakeResource, nil, entry)
     assert [%Entry{loaded_at: loaded_at}] = Coverage.entries(FakeResource, nil)
-    refute loaded_at == 0
+    refute loaded_at == stale
   end
 
   test "touch/3 against a resource with no table degrades instead of crashing" do

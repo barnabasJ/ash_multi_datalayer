@@ -15,17 +15,10 @@ defmodule Mix.Tasks.AshMultiDatalayer.GenerateMigrations do
   """
   use Mix.Task
 
-  @compile {:no_warn_undefined, [AshPostgres.MigrationGenerator, AshPostgres.Mix.Helpers]}
+  @compile {:no_warn_undefined, AshPostgres.MigrationGenerator}
 
   @shortdoc "Generates Postgres migrations for multi-datalayer resources"
   def run(args) do
-    unless Code.ensure_loaded?(AshPostgres.MigrationGenerator) do
-      Mix.raise(
-        "mix ash_multi_datalayer.generate_migrations requires the optional " <>
-          ":ash_postgres dependency. Add {:ash_postgres, \"~> 2.0\"} to your deps."
-      )
-    end
-
     {name, args} =
       case args do
         ["-" <> _ | _] -> {nil, args}
@@ -53,7 +46,7 @@ defmodule Mix.Tasks.AshMultiDatalayer.GenerateMigrations do
         ]
       )
 
-    domains = AshPostgres.Mix.Helpers.domains!(opts, args)
+    domains = AshMultiDatalayer.MixHelpers.domains!(opts, args)
 
     opts =
       opts
@@ -67,18 +60,30 @@ defmodule Mix.Tasks.AshMultiDatalayer.GenerateMigrations do
   @doc false
   # Shared with AshMultiDatalayer.DataLayer.codegen/1. Shadows each domain and
   # runs the generator over the shadows; domains without any postgres-layered
-  # multi-datalayer resource are skipped entirely.
+  # multi-datalayer resource are skipped entirely — and so is the
+  # `:ash_postgres` dependency check, since a sqlite-only (or ets-only)
+  # project should never need to add it.
   def generate(domains, opts) do
     domains
     |> Enum.filter(fn domain ->
       domain
       |> Ash.Domain.Info.resources()
-      |> Enum.any?(&AshMultiDatalayer.Migration.postgres_layered?/1)
+      |> Enum.any?(&AshMultiDatalayer.Migration.layered_as?(&1, AshPostgres.DataLayer))
     end)
-    |> Enum.map(&AshMultiDatalayer.Migration.shadow_domain/1)
+    |> Enum.map(&AshMultiDatalayer.Migration.shadow_domain(&1, AshPostgres.DataLayer))
     |> case do
-      [] -> :ok
-      shadow_domains -> AshPostgres.MigrationGenerator.generate(shadow_domains, opts)
+      [] ->
+        :ok
+
+      shadow_domains ->
+        unless Code.ensure_loaded?(AshPostgres.MigrationGenerator) do
+          Mix.raise(
+            "mix ash_multi_datalayer.generate_migrations requires the optional " <>
+              ":ash_postgres dependency. Add {:ash_postgres, \"~> 2.0\"} to your deps."
+          )
+        end
+
+        AshPostgres.MigrationGenerator.generate(shadow_domains, opts)
     end
   end
 end

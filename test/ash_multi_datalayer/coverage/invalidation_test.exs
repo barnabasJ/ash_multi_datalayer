@@ -13,7 +13,7 @@ defmodule AshMultiDatalayer.Coverage.InvalidationTest do
       filter: filter,
       normalised: filter && Normaliser.normalise(filter, TestPost),
       loaded_fields: MapSet.new([:id, :name, :age]),
-      loaded_at: System.monotonic_time()
+      loaded_at: DateTime.utc_now()
     }
   end
 
@@ -64,7 +64,7 @@ defmodule AshMultiDatalayer.Coverage.InvalidationTest do
       filter: %Ash.Filter{resource: TestPost, expression: {:garbage, :expression}},
       normalised: nil,
       loaded_fields: MapSet.new([:id]),
-      loaded_at: 0
+      loaded_at: DateTime.utc_now()
     }
 
     assert Invalidation.should_drop?(broken, nil, row(name: "foo"))

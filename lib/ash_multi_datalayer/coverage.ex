@@ -12,7 +12,7 @@ defmodule AshMultiDatalayer.Coverage do
 
   require Logger
 
-  alias AshMultiDatalayer.Coverage.{Complement, Entry, Implication, Normaliser, TableOwner}
+  alias AshMultiDatalayer.Coverage.{Complement, Entry, Implication, Normaliser, Store, TableOwner}
   alias AshMultiDatalayer.DataLayer.Info
   alias AshMultiDatalayer.DataLayer.Query
   alias AshMultiDatalayer.Telemetry
@@ -62,11 +62,31 @@ defmodule AshMultiDatalayer.Coverage do
     ArgumentError -> []
   end
 
-  @doc "Inserts a ledger entry (keyed by `entry.id`) for a resource+tenant."
+  @doc """
+  Inserts a ledger entry (keyed by `entry.id`) for a resource+tenant.
+
+  When a `coverage_store:` is configured (see
+  `AshMultiDatalayer.Coverage.Store`), also fires an async, best-effort
+  write-through so the entry survives a BEAM restart — never on the caller's
+  critical path (a persistence failure is logged and swallowed, never raised;
+  see `Store.persist_async/3`).
+  """
   @spec insert(module(), term(), %{:id => term(), optional(any()) => any()}) :: :ok
   def insert(resource, tenant, entry) do
     table = TableOwner.table_name(resource)
     true = :ets.insert(table, {{tenant, entry.id}, entry})
+
+    # `Store.persist_async/3` needs a real `Entry` (fingerprint/normalised/
+    # filter/loaded_fields/loaded_at) to build a persistable row — this
+    # function's own `@spec` is deliberately looser (any `%{:id => term(),
+    # ...}`, matching TableOwnerTest's direct ETS-mechanics probes with
+    # synthetic non-Entry maps), so only attempt persistence for the real
+    # shape.
+    case entry do
+      %Entry{} -> Store.persist_async(resource, tenant, entry)
+      _ -> :ok
+    end
+
     :ok
   rescue
     # L12 item 1: a TableOwner restart between a successful read and its
@@ -78,21 +98,60 @@ defmodule AshMultiDatalayer.Coverage do
     ArgumentError -> :ok
   end
 
-  @doc "Drops a single entry by id. Missing entries are a no-op."
+  @doc """
+  Raw ETS insert, bypassing the coverage-store write-through hook.
+
+  Used only by `AshMultiDatalayer.Coverage.Store.restore/1`, to repopulate the
+  ledger from an already-persisted row without immediately re-persisting the
+  very row it just read. Ensures the table exists first — restore runs at
+  boot, before any ordinary read/write would have warmed it via `record/5`.
+  """
+  @spec restore_insert(module(), term(), %{:id => term(), optional(any()) => any()}) :: :ok
+  def restore_insert(resource, tenant, entry) do
+    case ensure_table(resource) do
+      :ok ->
+        table = TableOwner.table_name(resource)
+        true = :ets.insert(table, {{tenant, entry.id}, entry})
+        :ok
+
+      {:error, :unavailable} ->
+        :ok
+    end
+  rescue
+    ArgumentError -> :ok
+  end
+
+  @doc """
+  Drops a single entry by id. Missing entries are a no-op.
+
+  Looks the entry up (for its persisted-store key) BEFORE deleting — the
+  lookup only ever runs when a `coverage_store:` is configured (see
+  `Store.configured?/1`), so this stays a single `:ets.delete` in the
+  overwhelmingly common unconfigured case.
+  """
   @spec drop(module(), term(), term()) :: :ok
   def drop(resource, tenant, entry_id) do
     table = TableOwner.table_name(resource)
+
+    if Store.configured?(resource) do
+      case :ets.lookup(table, {tenant, entry_id}) do
+        [{_key, %Entry{} = entry}] -> Store.delete_async(resource, tenant, entry)
+        _ -> :ok
+      end
+    end
+
     true = :ets.delete(table, {tenant, entry_id})
     :ok
   rescue
     ArgumentError -> :ok
   end
 
-  @doc "Clears the resource's entire ledger (all tenants)."
+  @doc "Clears the resource's entire ledger (all tenants), local and persisted."
   @spec reset(module()) :: :ok
   def reset(resource) do
     table = TableOwner.table_name(resource)
     true = :ets.delete_all_objects(table)
+    Store.clear_resource_async(resource)
     :ok
   rescue
     ArgumentError -> :ok
@@ -418,7 +477,7 @@ defmodule AshMultiDatalayer.Coverage do
         normalised: normalised,
         fingerprint: fingerprint,
         loaded_fields: needed,
-        loaded_at: System.monotonic_time()
+        loaded_at: DateTime.utc_now()
       }
 
       insert(resource, tenant, entry)
@@ -438,12 +497,10 @@ defmodule AshMultiDatalayer.Coverage do
     else
       table = TableOwner.table_name(resource)
       widened = MapSet.union(loaded, needed)
+      widened_entry = %Entry{existing | loaded_fields: widened}
 
-      :ets.update_element(
-        table,
-        {tenant, existing.id},
-        {2, %Entry{existing | loaded_fields: widened}}
-      )
+      :ets.update_element(table, {tenant, existing.id}, {2, widened_entry})
+      Store.persist_async(resource, tenant, widened_entry)
 
       verify_or_drop(resource, tenant, existing.id, epoch0)
     end
@@ -467,7 +524,10 @@ defmodule AshMultiDatalayer.Coverage do
     cap = Info.ledger_max_entries(resource)
 
     if size(resource, tenant) >= cap do
-      case resource |> entries(tenant) |> Enum.min_by(& &1.loaded_at, fn -> nil end) do
+      # `DateTime` as the explicit sorter (Elixir 1.14+): the default term-order
+      # `<=` compares `%DateTime{}` structs field-by-field alphabetically
+      # (`day` before `month`/`year`), which is NOT chronological order.
+      case resource |> entries(tenant) |> Enum.min_by(& &1.loaded_at, DateTime, fn -> nil end) do
         nil ->
           Telemetry.ledger(:full, resource, tenant, %{ledger_size: size(resource, tenant)})
           :full
@@ -622,14 +682,21 @@ defmodule AshMultiDatalayer.Coverage do
   # defeating the invalidation-before-propagation ordering from the inside.
   # `@doc false` and public only so `AshMultiDatalayer.TestSupport.touch_entry!/3`
   # has a deterministic seam to test this race's fix without a scheduler.
+  #
+  # Deliberately does NOT call `Store.persist_async/3`: this runs on every
+  # coverage HIT (the hot read path), not just on new/widened entries — a
+  # write-through here would turn every cached read into a write. The
+  # persisted `loaded_at` therefore reflects an entry's creation/widen time,
+  # not its most recent touch; a restored entry's LRU position is close
+  # enough (not exact) for eviction purposes, which is the only consumer.
   @spec touch(module(), term(), Entry.t()) :: boolean()
-  def touch(resource, tenant, entry) do
+  def touch(resource, tenant, %Entry{} = entry) do
     table = TableOwner.table_name(resource)
 
     :ets.update_element(
       table,
       {tenant, entry.id},
-      {2, %Entry{entry | loaded_at: System.monotonic_time()}}
+      {2, %Entry{entry | loaded_at: DateTime.utc_now()}}
     )
   rescue
     ArgumentError -> false

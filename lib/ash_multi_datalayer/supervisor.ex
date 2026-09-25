@@ -9,11 +9,14 @@ defmodule AshMultiDatalayer.Supervisor do
         {AshMultiDatalayer.Supervisor, otp_app: :my_app}
       ]
 
-  The base child is the coverage-ledger table supervisor
-  (`AshMultiDatalayer.TableSupervisor`); ProvenCoverage table owners are started
-  lazily, on a resource's first read or write, so with only ProvenCoverage
-  configured no boot-time work is needed and passing `otp_app:`/`resources:` is
-  optional.
+  The base children are the coverage-ledger table supervisor
+  (`AshMultiDatalayer.TableSupervisor`) and a `Task.Supervisor`
+  (`AshMultiDatalayer.Coverage.Store.TaskSupervisor`) backing the optional
+  coverage-store's async write-through (see `AshMultiDatalayer.Coverage.Store`)
+  — always started, costing nothing when no resource configures a
+  `coverage_store:`. ProvenCoverage table owners are started lazily, on a
+  resource's first read or write, so with only ProvenCoverage configured no
+  boot-time work is needed and passing `otp_app:`/`resources:` is optional.
 
   Strategies that require boot-time work (e.g. LocalOutbox hydration) contribute
   child specs through their `child_specs/1` callback. To discover them, pass:
@@ -34,7 +37,8 @@ defmodule AshMultiDatalayer.Supervisor do
   @impl true
   def init(opts) do
     base = [
-      {DynamicSupervisor, name: AshMultiDatalayer.TableSupervisor, strategy: :one_for_one}
+      {DynamicSupervisor, name: AshMultiDatalayer.TableSupervisor, strategy: :one_for_one},
+      {Task.Supervisor, name: AshMultiDatalayer.Coverage.Store.TaskSupervisor}
     ]
 
     Supervisor.init(base ++ strategy_children(opts), strategy: :one_for_one)

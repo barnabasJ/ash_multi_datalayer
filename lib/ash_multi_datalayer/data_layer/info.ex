@@ -163,4 +163,16 @@ defmodule AshMultiDatalayer.DataLayer.Info do
   def sql_join_aggregate_overrides(resource) do
     proven_coverage_opt(resource, :sql_join_aggregate_overrides, [])
   end
+
+  @doc """
+  The app-owned Ash resource backing persisted coverage-ledger storage (see
+  `AshMultiDatalayer.Coverage.Store`), or `nil` when unconfigured (the
+  default: ETS-only, wiped on every restart). Unlike the other ProvenCoverage
+  options above, this one has no section-level alias — declare it directly on
+  the orchestrator: `orchestrator {ProvenCoverage, coverage_store: MyApp.Coverage.Entry}`.
+  """
+  @spec coverage_store(Ash.Resource.t() | Spark.Dsl.t()) :: module() | nil
+  def coverage_store(resource) do
+    proven_coverage_opt(resource, :coverage_store, nil)
+  end
 end

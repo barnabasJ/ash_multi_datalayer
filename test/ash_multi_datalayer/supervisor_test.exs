@@ -53,6 +53,12 @@ defmodule AshMultiDatalayer.SupervisorTest do
     assert {:ok, {_flags, child_specs}} =
              AshMultiDatalayer.Supervisor.init(resources: [PlainEtsResource])
 
-    assert [%{id: AshMultiDatalayer.TableSupervisor}] = child_specs
+    # Base children only: TableSupervisor plus the coverage-store
+    # Task.Supervisor (always started, costs nothing when unconfigured — see
+    # AshMultiDatalayer.Coverage.Store) — no orchestrator-contributed children.
+    assert [
+             %{id: AshMultiDatalayer.TableSupervisor},
+             %{id: AshMultiDatalayer.Coverage.Store.TaskSupervisor}
+           ] = child_specs
   end
 end

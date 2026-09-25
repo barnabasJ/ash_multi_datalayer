@@ -119,4 +119,154 @@ defmodule AshMultiDatalayer.Test.MigrationResources do
       belongs_to(:author, MirrorAuthor, public?: true)
     end
   end
+
+  defmodule SqliteMdlDomain do
+    @moduledoc false
+    use Ash.Domain, validate_config_inclusion?: false
+
+    resources do
+      resource(AshMultiDatalayer.Test.MigrationResources.SqliteMdlAuthor)
+      resource(AshMultiDatalayer.Test.MigrationResources.SqliteMdlPost)
+    end
+  end
+
+  defmodule SqliteMdlAuthor do
+    @moduledoc false
+    use Ash.Resource,
+      domain: SqliteMdlDomain,
+      data_layer: AshMultiDatalayer.DataLayer,
+      extensions: [AshSqlite.DataLayer]
+
+    multi_data_layer do
+      layer(:l1, Ash.DataLayer.Ets)
+      layer(:l2, AshSqlite.DataLayer)
+      read_order([:l1, :l2])
+      write_order([:l2, :l1])
+    end
+
+    sqlite do
+      table("migration_test_sqlite_authors")
+      repo(AshMultiDatalayer.Test.ObanSqlite.SkeletonRepo)
+    end
+
+    attributes do
+      uuid_primary_key(:id)
+      attribute(:name, :string, public?: true)
+    end
+  end
+
+  defmodule SqliteMdlPost do
+    @moduledoc false
+    use Ash.Resource,
+      domain: SqliteMdlDomain,
+      data_layer: AshMultiDatalayer.DataLayer,
+      extensions: [AshSqlite.DataLayer]
+
+    multi_data_layer do
+      layer(:l1, Ash.DataLayer.Ets)
+      layer(:l2, AshSqlite.DataLayer)
+      read_order([:l1, :l2])
+      write_order([:l2, :l1])
+    end
+
+    sqlite do
+      table("migration_test_sqlite_posts")
+      repo(AshMultiDatalayer.Test.ObanSqlite.SkeletonRepo)
+    end
+
+    attributes do
+      uuid_primary_key(:id)
+      attribute(:name, :string, public?: true)
+      attribute(:age, :integer, public?: true)
+    end
+
+    relationships do
+      belongs_to(:author, SqliteMdlAuthor, public?: true)
+    end
+  end
+
+  defmodule SqliteMirrorDomain do
+    @moduledoc false
+    use Ash.Domain, validate_config_inclusion?: false
+
+    resources do
+      resource(AshMultiDatalayer.Test.MigrationResources.SqliteMirrorAuthor)
+      resource(AshMultiDatalayer.Test.MigrationResources.SqliteMirrorPost)
+    end
+  end
+
+  defmodule SqliteMirrorAuthor do
+    @moduledoc false
+    use Ash.Resource,
+      domain: SqliteMirrorDomain,
+      data_layer: AshSqlite.DataLayer
+
+    sqlite do
+      table("migration_test_sqlite_authors")
+      repo(AshMultiDatalayer.Test.ObanSqlite.SkeletonRepo)
+    end
+
+    attributes do
+      uuid_primary_key(:id)
+      attribute(:name, :string, public?: true)
+    end
+  end
+
+  defmodule SqliteMirrorPost do
+    @moduledoc false
+    use Ash.Resource,
+      domain: SqliteMirrorDomain,
+      data_layer: AshSqlite.DataLayer
+
+    sqlite do
+      table("migration_test_sqlite_posts")
+      repo(AshMultiDatalayer.Test.ObanSqlite.SkeletonRepo)
+    end
+
+    attributes do
+      uuid_primary_key(:id)
+      attribute(:name, :string, public?: true)
+      attribute(:age, :integer, public?: true)
+    end
+
+    relationships do
+      belongs_to(:author, SqliteMirrorAuthor, public?: true)
+    end
+  end
+
+  defmodule NoPostgresDomain do
+    @moduledoc """
+    Has no postgres-layered resource anywhere — proves that generating
+    migrations for a domain like this never needs `:ash_postgres` at all.
+    """
+    use Ash.Domain, validate_config_inclusion?: false
+
+    resources do
+      resource(AshMultiDatalayer.Test.MigrationResources.EtsOnlyResource)
+    end
+  end
+
+  defmodule EtsOnlyResource do
+    @moduledoc false
+    use Ash.Resource,
+      domain: NoPostgresDomain,
+      data_layer: AshMultiDatalayer.DataLayer,
+      extensions: [Ash.DataLayer.Ets]
+
+    multi_data_layer do
+      layer(:l1, Ash.DataLayer.Ets)
+      layer(:l2, Ash.DataLayer.Ets)
+      read_order([:l1])
+      write_order([:l1, :l2])
+    end
+
+    ets do
+      table(:migration_test_ets_only)
+    end
+
+    attributes do
+      uuid_primary_key(:id)
+      attribute(:name, :string, public?: true)
+    end
+  end
 end

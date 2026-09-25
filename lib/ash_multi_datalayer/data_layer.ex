@@ -406,22 +406,47 @@ defmodule AshMultiDatalayer.DataLayer do
     %Query{resource: resource, domain: domain}
   end
 
-  # The resource's Ecto schema source (e.g. the Postgres table for inserts)
-  # comes from the orchestrator's authority layer. Called during resource
+  # The resource's Ecto schema source (e.g. the Postgres/SQLite table for
+  # inserts) is tried from the orchestrator's authority layer first — for
+  # LocalOutbox that IS the SQL local/cache layer, so this preserves the
+  # original behavior exactly. But `authority/1` answers a different
+  # question ("which layer is authoritative for reads/writes") than "which
+  # layer needs a real Ecto/SQL schema `source`": for ProvenCoverage,
+  # `authority/1` is the *read* source of truth, which is commonly a
+  # non-SQL layer (e.g. `AshRemote.DataLayer`, backing a resource whose
+  # local layer is only a SQL *cache*) — that layer either doesn't
+  # implement `source/1` or, if it does, has nothing meaningful to answer,
+  # so the SQL cache layer configured alongside it would otherwise never
+  # get a real Ecto schema source at all, breaking anything that needs one
+  # (e.g. a Queryable-based upsert — `Ecto.Query.from(row in resource,
+  # ...)` resolves to an empty table name and every such query fails).
+  # Fall back to scanning every declared layer, in order, for the first one
+  # that answers with a real (non-empty) source. Called during resource
   # compilation, BEFORE verifiers — so it must tolerate invalid layer
   # configuration (the verifier reports it properly afterwards).
   @impl true
   def source(resource) do
     {orchestrator, _opts} = Info.orchestrator(resource)
-    layer = orchestrator.authority(resource)
+    authority = orchestrator.authority(resource)
 
-    if layer && Code.ensure_loaded?(layer) && function_exported?(layer, :source, 1) do
-      layer.source(resource)
-    else
-      ""
-    end
+    resource
+    |> Info.layer_modules()
+    |> List.delete(authority)
+    |> List.insert_at(0, authority)
+    |> Enum.find_value("", &layer_source(&1, resource))
   rescue
     _ -> ""
+  end
+
+  defp layer_source(nil, _resource), do: nil
+
+  defp layer_source(layer, resource) do
+    if Code.ensure_loaded?(layer) && function_exported?(layer, :source, 1) do
+      case layer.source(resource) do
+        "" -> nil
+        source -> source
+      end
+    end
   end
 
   # --- query building: accumulate into the Query struct -----------------
@@ -615,8 +640,33 @@ defmodule AshMultiDatalayer.DataLayer do
 
   @doc false
   # Invoked by `mix ash.codegen` for resources using this extension: generate
-  # Postgres migrations for any postgres-layered multi-datalayer resources.
+  # migrations for any postgres- or sqlite-layered multi-datalayer resources.
+  # Each generator independently no-ops (without requiring its optional
+  # dependency) when the project has no resource layered with it.
   def codegen(args) do
-    Mix.Task.rerun("ash_multi_datalayer.generate_migrations", args)
+    Mix.Task.rerun("ash_multi_datalayer.generate_migrations", disambiguate_name(args, "postgres"))
+
+    Mix.Task.rerun(
+      "ash_multi_datalayer.generate_sqlite_migrations",
+      disambiguate_name(args, "sqlite")
+    )
+  end
+
+  @doc false
+  # `mix ash.codegen` invokes every registered extension's `codegen/1` with
+  # the SAME `--name`. A multi-datalayer resource's local layer commonly
+  # shares a repo with plain AshSqlite/AshPostgres resources (a single-file
+  # SQLite offline store is exactly this) — `AshSqlite.DataLayer`/
+  # `AshPostgres.DataLayer` register their own `codegen/1` too, so without
+  # disambiguating, this and that hook would each generate a migration in the
+  # same repo under the same name, and Ecto's migrator raises "migration name
+  # ... is duplicated". Suffixing only here (not in the mix tasks' own
+  # `run/1`) keeps direct/manual invocations unaffected — this fires only on
+  # the `mix ash.codegen` dispatch path, where the collision risk exists.
+  def disambiguate_name(args, suffix) do
+    case Enum.find_index(args, &(&1 == "--name")) do
+      nil -> args
+      idx -> List.update_at(args, idx + 1, &"#{&1}_multi_datalayer_#{suffix}")
+    end
   end
 end

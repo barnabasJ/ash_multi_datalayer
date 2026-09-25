@@ -1,12 +1,18 @@
-defmodule AshMultiDatalayer.Integration.GenerateMigrationsTest do
+defmodule AshMultiDatalayer.Integration.GenerateSqliteMigrationsTest do
   use ExUnit.Case, async: false
 
   @moduletag :integration
 
-  alias AshMultiDatalayer.Test.MigrationResources.{MdlDomain, MirrorDomain, NoPostgresDomain}
+  alias AshMultiDatalayer.Test.MigrationResources.{
+    MdlDomain,
+    SqliteMdlDomain,
+    SqliteMirrorDomain
+  }
 
   setup do
-    base = Path.join(System.tmp_dir!(), "amdl_migrations_#{System.unique_integer([:positive])}")
+    base =
+      Path.join(System.tmp_dir!(), "amdl_sqlite_migrations_#{System.unique_integer([:positive])}")
+
     on_exit(fn -> File.rm_rf!(base) end)
     {:ok, base: base}
   end
@@ -21,7 +27,7 @@ defmodule AshMultiDatalayer.Integration.GenerateMigrationsTest do
       dev: false
     ]
 
-    AshPostgres.MigrationGenerator.generate(domains, opts)
+    AshSqlite.MigrationGenerator.generate(domains, opts)
     opts
   end
 
@@ -32,21 +38,21 @@ defmodule AshMultiDatalayer.Integration.GenerateMigrationsTest do
     end
   end
 
-  test "stock generator silently skips multi-datalayer resources", %{base: base} do
-    opts = generate([MdlDomain], base, "stock")
+  test "stock sqlite generator silently skips multi-datalayer resources", %{base: base} do
+    opts = generate([SqliteMdlDomain], base, "stock")
     assert migration_contents(opts) == nil
   end
 
-  test "shadowed generation produces output identical to a plain-postgres twin",
+  test "shadowed generation produces output identical to a plain-sqlite twin",
        %{base: base} do
     shadow_opts =
       generate(
-        [AshMultiDatalayer.Migration.shadow_domain(MdlDomain, AshPostgres.DataLayer)],
+        [AshMultiDatalayer.Migration.shadow_domain(SqliteMdlDomain, AshSqlite.DataLayer)],
         base,
         "shadow"
       )
 
-    mirror_opts = generate([MirrorDomain], base, "mirror")
+    mirror_opts = generate([SqliteMirrorDomain], base, "mirror")
 
     shadow = migration_contents(shadow_opts)
     mirror = migration_contents(mirror_opts)
@@ -58,10 +64,10 @@ defmodule AshMultiDatalayer.Integration.GenerateMigrationsTest do
     assert shadow == mirror
 
     # The FK between the two multi-datalayer resources survived shadowing.
-    assert shadow =~ ~r/references\(:migration_test_authors/
+    assert shadow =~ ~r/references\(:migration_test_sqlite_authors/
   end
 
-  test "the mix task generates for multi-datalayer resources only", %{base: base} do
+  test "the mix task generates for sqlite-layered multi-datalayer resources only", %{base: base} do
     opts = [
       snapshot_path: Path.join(base, "task/snapshots"),
       migration_path: Path.join(base, "task/migrations"),
@@ -70,24 +76,29 @@ defmodule AshMultiDatalayer.Integration.GenerateMigrationsTest do
       format: false
     ]
 
-    Mix.Tasks.AshMultiDatalayer.GenerateMigrations.generate([MdlDomain, MirrorDomain], opts)
+    Mix.Tasks.AshMultiDatalayer.GenerateSqliteMigrations.generate(
+      [SqliteMdlDomain, SqliteMirrorDomain],
+      opts
+    )
 
-    # MirrorDomain has no multi-datalayer resources -> filtered out; but the
-    # MdlDomain shadows produce the same tables, so exactly one migration.
+    # SqliteMirrorDomain has no multi-datalayer resources -> filtered out; but
+    # the SqliteMdlDomain shadows produce the same tables, so exactly one
+    # migration.
     assert migration_contents(opts)
   end
 
-  test "a domain with no postgres-layered resources is skipped without requiring ash_postgres",
+  test "a domain with no sqlite-layered resources is skipped without requiring ash_sqlite",
        %{base: base} do
     opts = [
-      snapshot_path: Path.join(base, "no_pg/snapshots"),
-      migration_path: Path.join(base, "no_pg/migrations"),
+      snapshot_path: Path.join(base, "no_sqlite/snapshots"),
+      migration_path: Path.join(base, "no_sqlite/migrations"),
       name: "test_migration",
       quiet: true,
       format: false
     ]
 
-    assert Mix.Tasks.AshMultiDatalayer.GenerateMigrations.generate([NoPostgresDomain], opts) ==
+    # MdlDomain's resources are postgres-layered, not sqlite-layered.
+    assert Mix.Tasks.AshMultiDatalayer.GenerateSqliteMigrations.generate([MdlDomain], opts) ==
              :ok
 
     refute migration_contents(opts)
@@ -97,7 +108,7 @@ defmodule AshMultiDatalayer.Integration.GenerateMigrationsTest do
        %{base: base} do
     argv = [
       "--domains",
-      "AshMultiDatalayer.Test.MigrationResources.NoPostgresDomain",
+      inspect(SqliteMdlDomain),
       "--name",
       "add_something",
       "--snapshot-path",
@@ -107,6 +118,6 @@ defmodule AshMultiDatalayer.Integration.GenerateMigrationsTest do
       "--quiet"
     ]
 
-    assert Mix.Tasks.AshMultiDatalayer.GenerateMigrations.run(argv) == :ok
+    assert Mix.Tasks.AshMultiDatalayer.GenerateSqliteMigrations.run(argv) == :ok
   end
 end
