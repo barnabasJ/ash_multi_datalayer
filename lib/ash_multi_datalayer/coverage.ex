@@ -88,6 +88,46 @@ defmodule AshMultiDatalayer.Coverage do
     ArgumentError -> :ok
   end
 
+  @doc """
+  Narrows an existing coverage entry around one primary-key value. The entry
+  keeps its identity and original filter so a later completed remainder read
+  can restore that same entry instead of adding a second one.
+
+  Returns `:ok` when the narrowed filter remains provable, otherwise
+  `:unsupported` so the caller can drop the entry conservatively.
+  """
+  @spec exclude_id(module(), term(), Entry.t(), atom(), term()) :: :ok | :unsupported
+  def exclude_id(resource, tenant, %Entry{} = entry, pk_attr, id) do
+    base_filter = entry.base_filter || entry.filter
+    base_normalised = entry.base_normalised || entry.normalised
+    ids = Enum.uniq([id | entry.excluded_ids])
+
+    narrowed_filter =
+      Enum.reduce(ids, base_filter, fn excluded, filter ->
+        exclusion = Ash.Filter.parse!(resource, %{pk_attr => [not_eq: excluded]})
+        if filter, do: Ash.Filter.add_to_filter!(filter, exclusion), else: exclusion
+      end)
+
+    narrowed = Normaliser.normalise(narrowed_filter, resource)
+
+    if narrowed.opaque? do
+      :unsupported
+    else
+      insert(resource, tenant, %Entry{
+        entry
+        | filter: narrowed_filter,
+          normalised: narrowed,
+          base_filter: base_filter,
+          base_normalised: base_normalised,
+          excluded_ids: ids
+      })
+
+      :ok
+    end
+  rescue
+    _ -> :unsupported
+  end
+
   @doc "Clears the resource's entire ledger (all tenants)."
   @spec reset(module()) :: :ok
   def reset(resource) do
@@ -396,10 +436,18 @@ defmodule AshMultiDatalayer.Coverage do
       # compare it too, disambiguating any hash collision.
       case Enum.find(
              entries(resource, tenant),
-             &(&1.fingerprint == fingerprint and &1.normalised == normalised)
+             &(&1.fingerprint == fingerprint and
+                 (&1.normalised == normalised or &1.base_normalised == normalised))
            ) do
         %Entry{} = existing ->
-          widen_loaded_fields(resource, tenant, existing, needed, epoch0)
+          widen_loaded_fields(
+            resource,
+            tenant,
+            existing,
+            needed,
+            epoch0,
+            existing.base_normalised == normalised
+          )
 
         nil ->
           insert_new_entry(resource, tenant, query, normalised, fingerprint, needed, epoch0)
@@ -431,18 +479,34 @@ defmodule AshMultiDatalayer.Coverage do
          tenant,
          %Entry{loaded_fields: loaded} = existing,
          needed,
-         epoch0
+         epoch0,
+         restore?
        ) do
-    if MapSet.subset?(needed, loaded) do
+    if MapSet.subset?(needed, loaded) and not restore? do
       :ok
     else
       table = TableOwner.table_name(resource)
       widened = MapSet.union(loaded, needed)
 
+      restored =
+        if not restore? do
+          %Entry{existing | loaded_fields: widened}
+        else
+          %Entry{
+            existing
+            | filter: existing.base_filter,
+              normalised: existing.base_normalised,
+              base_filter: nil,
+              base_normalised: nil,
+              excluded_ids: [],
+              loaded_fields: widened
+          }
+        end
+
       :ets.update_element(
         table,
         {tenant, existing.id},
-        {2, %Entry{existing | loaded_fields: widened}}
+        {2, restored}
       )
 
       verify_or_drop(resource, tenant, existing.id, epoch0)
@@ -623,7 +687,7 @@ defmodule AshMultiDatalayer.Coverage do
   # `@doc false` and public only so `AshMultiDatalayer.TestSupport.touch_entry!/3`
   # has a deterministic seam to test this race's fix without a scheduler.
   @spec touch(module(), term(), Entry.t()) :: boolean()
-  def touch(resource, tenant, entry) do
+  def touch(resource, tenant, %Entry{} = entry) do
     table = TableOwner.table_name(resource)
 
     :ets.update_element(

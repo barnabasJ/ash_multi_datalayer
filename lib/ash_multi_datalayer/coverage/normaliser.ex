@@ -347,16 +347,24 @@ defmodule AshMultiDatalayer.Coverage.Normaliser do
     end
   end
 
-  # not_eq combined with ranges/other not_eq has no single-interval
-  # representation (except the trivial equal case); stay narrow.
+  # Several exclusions on one attribute remain one nil-rejecting interval.
+  # This lets a coverage entry retain one region while several row IDs are
+  # temporarily missing from the local cache.
   def merge_intervals(
-        %Interval{kind: :not_eq, values: [v1]} = interval,
-        %Interval{kind: :not_eq, values: [v2]}
-      ) do
-    case Interval.compare(v1, v2) do
-      :eq -> interval
-      :error -> :opaque
-      _ -> :opaque
+        %Interval{kind: left_kind, values: left_values, type: type},
+        %Interval{kind: right_kind, values: right_values}
+      )
+      when left_kind in [:not_eq, :not_in] and right_kind in [:not_eq, :not_in] do
+    values = Enum.uniq(left_values ++ right_values)
+
+    if Enum.any?(values, fn a -> Enum.any?(values, &(Interval.compare(a, &1) == :error)) end) do
+      :opaque
+    else
+      %Interval{
+        kind: if(length(values) == 1, do: :not_eq, else: :not_in),
+        type: type,
+        values: values
+      }
     end
   end
 

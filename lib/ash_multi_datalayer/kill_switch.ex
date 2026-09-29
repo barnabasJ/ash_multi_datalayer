@@ -5,8 +5,9 @@ defmodule AshMultiDatalayer.KillSwitch do
   When a resource is disabled, reads route only to the last layer in
   `read_order` and writes only to the first layer in `write_order` — both the
   source of truth — skipping the cache layers and coverage lookups entirely.
-  Ledger invalidation still runs on writes while disabled, so re-enabling
-  cannot serve coverage that predates the disabled window.
+  Disabling clears the coverage ledger. Writes made while the cache is bypassed
+  cannot be safely reflected in its old rows, so re-enabling starts with a
+  source read and records fresh coverage.
 
   The check is a single `:persistent_term.get/2` — lock-free, safe on every
   operation. `enable!/1` erases the key rather than storing `:enabled`, so
@@ -21,6 +22,8 @@ defmodule AshMultiDatalayer.KillSwitch do
   @spec disable!(module()) :: :ok
   def disable!(resource) do
     :persistent_term.put(key(resource), :disabled)
+    AshMultiDatalayer.Coverage.reset(resource)
+    :ok
   end
 
   @spec enable!(module()) :: :ok

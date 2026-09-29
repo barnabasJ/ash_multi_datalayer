@@ -86,6 +86,10 @@ defmodule AshMultiDatalayer.Coverage.Complement do
 
   defp interval_stmt(attr, %Interval{kind: :eq, values: [v]}), do: %{attr => [eq: v]}
   defp interval_stmt(attr, %Interval{kind: :not_eq, values: [v]}), do: %{attr => [not_eq: v]}
+
+  defp interval_stmt(attr, %Interval{kind: :not_in, values: values}),
+    do: and_stmt(Enum.map(values, &%{attr => [not_eq: &1]}))
+
   defp interval_stmt(attr, %Interval{kind: :in, values: vs}), do: %{attr => [in: vs]}
   defp interval_stmt(attr, %Interval{kind: :is_nil}), do: %{attr => [is_nil: true]}
   defp interval_stmt(attr, %Interval{kind: :not_nil}), do: %{attr => [is_nil: false]}
@@ -118,6 +122,9 @@ defmodule AshMultiDatalayer.Coverage.Complement do
 
   defp complement_interval_stmt(attr, %Interval{kind: :not_eq, values: [v]}),
     do: or_nil(attr, %{attr => [eq: v]})
+
+  defp complement_interval_stmt(attr, %Interval{kind: :not_in, values: values}),
+    do: or_nil(attr, %{attr => [in: values]})
 
   defp complement_interval_stmt(attr, %Interval{kind: :in, values: vs}),
     do: or_nil(attr, and_stmt(Enum.map(vs, &%{attr => [not_eq: &1]})))

@@ -14,9 +14,12 @@ defmodule AshMultiDatalayer.Coverage.Entry do
     :tenant,
     :filter,
     :normalised,
+    :base_filter,
+    :base_normalised,
     :fingerprint,
     :loaded_fields,
-    :loaded_at
+    :loaded_at,
+    excluded_ids: []
   ]
 
   @type t :: %__MODULE__{
@@ -24,6 +27,9 @@ defmodule AshMultiDatalayer.Coverage.Entry do
           tenant: term(),
           filter: Ash.Filter.t() | nil,
           normalised: AshMultiDatalayer.Coverage.Normaliser.Normalised.t(),
+          base_filter: Ash.Filter.t() | nil,
+          base_normalised: AshMultiDatalayer.Coverage.Normaliser.Normalised.t() | nil,
+          excluded_ids: [term()],
           fingerprint: term(),
           loaded_fields: MapSet.t(atom()),
           loaded_at: integer()

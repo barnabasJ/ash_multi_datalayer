@@ -3,8 +3,9 @@ defmodule AshMultiDatalayer.Coverage.Invalidation do
   Row-aware coverage invalidation.
 
   After a successful authoritative write, every ledger entry whose filter
-  matches the changed row — in its before **or** after state — is dropped;
-  unrelated entries survive, preserving cache hit rate under write load.
+  may match the changed row — in its before **or** after state — excludes
+  that row's primary key. Unrelated entries survive unchanged. A subsequent
+  remainder read fetches the excluded row and restores the same entry.
   Matching uses `Ash.Filter.Runtime.do_match/6`, the same evaluator data
   layers use at read time, with `unknown_on_unknown_refs?: true` so any
   unresolvable reference drops the entry conservatively.
@@ -13,7 +14,7 @@ defmodule AshMultiDatalayer.Coverage.Invalidation do
   (FR3.6): if that propagation then fails, the covering entries are already
   gone, so the failure degrades to a coverage miss — never a stale read.
 
-  `on_write/4` also upholds MDL's physical invariant itself (C4): dropping
+  `on_write/4` also upholds MDL's physical invariant itself (C4): narrowing
   ledger entries alone leaves the destroyed/pre-update physical row sitting
   in earlier layers, and a later re-covering read would resurrect it as
   live. See `evict_physical_row/3` below.
@@ -28,7 +29,7 @@ defmodule AshMultiDatalayer.Coverage.Invalidation do
   alias AshMultiDatalayer.Telemetry
 
   @doc """
-  Whether a ledger entry must be dropped for a row change.
+  Whether a ledger entry may be affected by a row change.
 
   `row_before`/`row_after` are records (or `nil`: creates have no before,
   destroys no after). Conservative: an `:unknown` evaluation on either side
@@ -61,9 +62,9 @@ defmodule AshMultiDatalayer.Coverage.Invalidation do
   end
 
   @doc """
-  Drops every ledger entry (for the resource+tenant) matching the changed
-  row, emitting `[:ash_multi_datalayer, :ledger, :invalidated]` with the
-  dropped count. Returns the count.
+  Excludes the changed primary key from every potentially affected ledger
+  entry, emitting `[:ash_multi_datalayer, :ledger, :invalidated]` with the
+  affected count. A filter that cannot be narrowed soundly is dropped.
 
   Bumps the invalidation epoch first, **unconditionally, including
   zero-drop writes** — the C3 race this closes is precisely a write against
@@ -101,25 +102,46 @@ defmodule AshMultiDatalayer.Coverage.Invalidation do
   end
 
   defp drop_for_partition(resource, tenant, row_before, row_after) do
-    Coverage.bump_epoch(resource, tenant)
+    :global.trans({{__MODULE__, resource, tenant}, self()}, fn ->
+      Coverage.bump_epoch(resource, tenant)
 
-    dropped =
-      resource
-      |> Coverage.entries(tenant)
-      |> Enum.filter(&should_drop?(&1, row_before, row_after))
+      affected =
+        resource
+        |> Coverage.entries(tenant)
+        |> Enum.filter(&should_drop?(&1, row_before, row_after))
 
-    Enum.each(dropped, &Coverage.drop(resource, tenant, &1.id))
+      pk = Ash.Resource.Info.primary_key(resource)
+      row = row_before || row_after
 
-    count = length(dropped)
+      Enum.each(affected, fn entry ->
+        case {pk, row} do
+          {[attr], row} when is_map(row) ->
+            case Map.get(row, attr) do
+              nil ->
+                Coverage.drop(resource, tenant, entry.id)
 
-    if count > 0 do
-      Telemetry.ledger(:invalidated, resource, tenant, %{
-        count: count,
-        ledger_size: Coverage.size(resource, tenant)
-      })
-    end
+              id ->
+                if Coverage.exclude_id(resource, tenant, entry, attr, id) != :ok do
+                  Coverage.drop(resource, tenant, entry.id)
+                end
+            end
 
-    count
+          _ ->
+            Coverage.drop(resource, tenant, entry.id)
+        end
+      end)
+
+      count = length(affected)
+
+      if count > 0 do
+        Telemetry.ledger(:invalidated, resource, tenant, %{
+          count: count,
+          ledger_size: Coverage.size(resource, tenant)
+        })
+      end
+
+      count
+    end)
   end
 
   # P4: 1:many sweep orchestration (B3's canonical function derives each

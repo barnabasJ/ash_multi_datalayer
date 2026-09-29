@@ -2,7 +2,7 @@ defmodule AshMultiDatalayer.Integration.ExternalInvalidationTest do
   @moduledoc """
   C4: `Coverage.Invalidation.on_write/4` (the API external invalidation
   sources — e.g. an `ash_remote` realtime-notification bridge — are told to
-  call) drops ledger entries but, pre-fix, never the physical row. A later
+  call) changes ledger coverage but, pre-fix, never the physical row. A later
   re-covering read then resurrects the destroyed/pre-update row as if it
   were live (fix-plan Phase 0.4 / the C4 addendum).
 
@@ -41,9 +41,10 @@ defmodule AshMultiDatalayer.Integration.ExternalInvalidationTest do
       # The external invalidation source does the documented thing.
       Invalidation.on_write(TestPost, nil, row_before, nil)
 
-      # The dropped entry means the ledger is now empty for this filter, so
-      # the re-covering read is a full miss/backfill/record cycle.
-      assert Coverage.entries(TestPost, nil) == []
+      # The entry remains, but its changed ID is uncovered until the source
+      # confirms that the row has been destroyed.
+      assert [%{excluded_ids: [id]}] = Coverage.entries(TestPost, nil)
+      assert id == ghost.id
       assert [] = TestPost |> Ash.Query.filter(name == "ghost") |> Ash.read!()
 
       # The critical assertion: the NEXT hit must not serve the ghost row
@@ -72,11 +73,9 @@ defmodule AshMultiDatalayer.Integration.ExternalInvalidationTest do
       Ash.destroy!(ghost)
       Invalidation.on_write(TestPost, nil, row_before, nil)
 
-      # Only the "kept" entry survives (unrelated to the destroyed row) — its
-      # existence routes the re-covering read for "ghost" through
-      # remainder_read instead of a plain source_read.
-      assert [%{filter: kept_filter}] = Coverage.entries(TestPost, nil)
-      refute is_nil(kept_filter)
+      # The ghost filter has one hole; the kept filter is unchanged.
+      assert Enum.sort(Enum.map(Coverage.entries(TestPost, nil), & &1.excluded_ids)) ==
+               [[], [ghost.id]]
 
       assert [] = TestPost |> Ash.Query.filter(name == "ghost") |> Ash.read!()
 
@@ -102,10 +101,11 @@ defmodule AshMultiDatalayer.Integration.ExternalInvalidationTest do
     row_before = as_test_post(ghost)
     Ash.destroy!(ghost)
     Invalidation.on_write(TestPost, nil, row_before, nil)
-    assert Coverage.entries(TestPost, nil) == []
+    assert [%{excluded_ids: [id]}] = Coverage.entries(TestPost, nil)
+    assert id == ghost.id
 
-    # A fresh, unrelated-in-identity read of the SAME region, now correct
-    # (ghost gone from the source): records a brand new entry for `age > 5`.
+    # A fresh read of the same region confirms the ghost is gone and restores
+    # the existing entry's coverage.
     assert [%{name: "kept"}] = TestPost |> Ash.Query.filter(age > 5) |> Ash.read!()
 
     # The exposing read is a DIFFERENT, broader query than the one that just
@@ -141,7 +141,8 @@ defmodule AshMultiDatalayer.Integration.ExternalInvalidationTest do
       row_after = as_test_post(updated)
 
       Invalidation.on_write(TestPost, nil, row_before, row_after)
-      assert Coverage.entries(TestPost, nil) == []
+      assert [%{excluded_ids: [id]}] = Coverage.entries(TestPost, nil)
+      assert id == mover.id
 
       # Re-covering read of the vacated region: the source of truth
       # correctly excludes the row now.

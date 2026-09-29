@@ -8,7 +8,7 @@ defmodule AshMultiDatalayer.Coverage.Interval do
     * `:in` — one of several values (`values: [...]`, non-empty)
     * `:range` — ordered interval with `lower`/`upper` bounds, each
       `{:incl, v} | {:excl, v} | :unbounded`
-    * `:not_eq` — anything but one value (`values: [v]`, non-nil rows only)
+    * `:not_eq` / `:not_in` — anything but one/several values (non-nil rows only)
     * `:is_nil` — the attribute is nil
     * `:not_nil` — the attribute is non-nil
 
@@ -23,7 +23,7 @@ defmodule AshMultiDatalayer.Coverage.Interval do
 
   @type bound :: {:incl, term()} | {:excl, term()} | :unbounded
   @type t :: %__MODULE__{
-          kind: :eq | :in | :range | :not_eq | :is_nil | :not_nil,
+          kind: :eq | :in | :range | :not_eq | :not_in | :is_nil | :not_nil,
           type: term(),
           lower: bound() | nil,
           upper: bound() | nil,
@@ -66,6 +66,16 @@ defmodule AshMultiDatalayer.Coverage.Interval do
       :error -> :error
       _ -> true
     end
+  end
+
+  def contains_value?(%__MODULE__{kind: :not_in, values: values}, value) do
+    Enum.reduce_while(values, true, fn excluded, _acc ->
+      case compare(value, excluded) do
+        :eq -> {:halt, false}
+        :error -> {:halt, :error}
+        _ -> {:cont, true}
+      end
+    end)
   end
 
   def contains_value?(%__MODULE__{kind: :in, values: values}, value) do
@@ -135,7 +145,7 @@ defmodule AshMultiDatalayer.Coverage.Interval do
 
   # Everything a comparison interval matches is non-nil.
   def subset?(%__MODULE__{kind: kind}, %__MODULE__{kind: :not_nil})
-      when kind in [:eq, :in, :range, :not_eq, :not_nil],
+      when kind in [:eq, :in, :range, :not_eq, :not_in, :not_nil],
       do: true
 
   def subset?(%__MODULE__{kind: :is_nil}, %__MODULE__{kind: :is_nil}), do: true
@@ -169,6 +179,11 @@ defmodule AshMultiDatalayer.Coverage.Interval do
 
   def subset?(%__MODULE__{kind: :not_eq, values: [v1]}, %__MODULE__{kind: :not_eq, values: [v2]}) do
     equal?(v1, v2)
+  end
+
+  def subset?(%__MODULE__{kind: kind1, values: inner}, %__MODULE__{kind: kind2, values: outer})
+      when kind1 in [:not_eq, :not_in] and kind2 in [:not_eq, :not_in] do
+    Enum.all?(outer, fn value -> Enum.any?(inner, &equal?(&1, value)) end)
   end
 
   def subset?(%__MODULE__{}, %__MODULE__{}), do: false

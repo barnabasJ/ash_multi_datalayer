@@ -48,6 +48,58 @@ defmodule AshMultiDatalayer.Integration.RowAwareInvalidationTest do
     assert pg_reads() == 3
   end
 
+  test "one changed row stays a hole in one ledger entry and only that row is fetched", %{
+    foo: foo
+  } do
+    handler = "row-hole-#{System.unique_integer([:positive])}"
+    parent = self()
+
+    :telemetry.attach(
+      handler,
+      [:ash_multi_datalayer, :read, :partial],
+      fn event, _, metadata, _ ->
+        send(parent, {event, metadata})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+
+    assert length(Ash.read!(TestPost)) == 2
+    assert pg_reads() == 1
+    assert length(AshMultiDatalayer.Coverage.entries(TestPost, nil)) == 1
+
+    foo
+    |> Ash.Changeset.for_update(:update, %{age: 21})
+    |> Ash.update!()
+
+    [entry] = AshMultiDatalayer.Coverage.entries(TestPost, nil)
+    assert entry.excluded_ids == [foo.id]
+
+    assert Ash.read!(TestPost) |> Enum.map(& &1.age) |> Enum.sort() == [21, 40]
+    assert_receive {[:ash_multi_datalayer, :read, :partial], %{cached: 1, fetched: 1}}
+    assert pg_reads() == 2
+
+    [healed] = AshMultiDatalayer.Coverage.entries(TestPost, nil)
+    assert healed.excluded_ids == []
+    assert length(Ash.read!(TestPost)) == 2
+    assert pg_reads() == 2
+  end
+
+  test "two changed rows remain exclusions in the same ledger entry", %{foo: foo, bar: bar} do
+    Ash.read!(TestPost)
+
+    foo |> Ash.Changeset.for_update(:update, %{age: 21}) |> Ash.update!()
+    bar |> Ash.Changeset.for_update(:update, %{age: 41}) |> Ash.update!()
+
+    [entry] = AshMultiDatalayer.Coverage.entries(TestPost, nil)
+    assert MapSet.new(entry.excluded_ids) == MapSet.new([foo.id, bar.id])
+
+    assert TestPost |> Ash.read!() |> Enum.map(& &1.age) |> Enum.sort() == [21, 41]
+    assert pg_reads() == 2
+    assert [%{excluded_ids: []}] = AshMultiDatalayer.Coverage.entries(TestPost, nil)
+  end
+
   test "a row moving INTO a cached filter drops that filter's coverage", %{foo: foo} do
     warm!(Ash.Query.filter(TestPost, age > 30))
     assert pg_reads() == 1
