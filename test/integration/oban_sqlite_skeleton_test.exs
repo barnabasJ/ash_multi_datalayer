@@ -322,7 +322,7 @@ defmodule AshMultiDatalayer.Integration.ObanSqliteSkeletonTest do
   # --- item 5: snooze = zero budget burn ---------------------------------
 
   describe "item 5 — SnoozeJob reschedules with zero retry-budget burn" do
-    test "snooze increments max_attempts (attempt not consumed)" do
+    test "snooze preserves the retry budget" do
       entry = enqueue!(name: "snooze", behavior: :snooze)
       %{id: job_id} = mdl_insert(@default_oban, entry)
 
@@ -330,7 +330,9 @@ defmodule AshMultiDatalayer.Integration.ObanSqliteSkeletonTest do
       assert %{snoozed: 1} = drain(@default_oban, with_scheduled: false)
       after_snooze = job_row(SkeletonRepo, job_id)
 
-      assert after_snooze["max_attempts"] > before["max_attempts"]
+      assert after_snooze["max_attempts"] == before["max_attempts"]
+      assert after_snooze["attempt"] == before["attempt"]
+      assert Jason.decode!(after_snooze["meta"])["snoozed"] == 1
       assert after_snooze["state"] in ["scheduled", "available"]
     end
   end

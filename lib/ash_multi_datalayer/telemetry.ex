@@ -34,7 +34,8 @@ defmodule AshMultiDatalayer.Telemetry do
 
   Filter fingerprints are structural hashes with literal values replaced by
   type tags — PII-safe by construction. Raw filters never appear in
-  telemetry.
+  telemetry. An application may opt into row labels with
+  `:telemetry_row_labeler`; this sends its returned labels in read events.
   """
 
   alias Ash.Query.{BooleanExpression, Not, Ref}
@@ -87,6 +88,22 @@ defmodule AshMultiDatalayer.Telemetry do
   defp type_tag(%struct{}), do: {:struct, struct}
   defp type_tag(value) when is_map(value), do: :map
   defp type_tag(_), do: :other
+
+  @doc "Optional, bounded row labels for local diagnostic UIs. Disabled by default."
+  def row_labels(records) do
+    case Application.get_env(:ash_multi_datalayer, :telemetry_row_labeler) do
+      {module, function, args} when is_atom(module) and is_atom(function) and is_list(args) ->
+        records
+        |> Enum.take(50)
+        |> Enum.map(&apply(module, function, [&1 | args]))
+        |> Enum.reject(&is_nil/1)
+
+      _ ->
+        nil
+    end
+  rescue
+    _ -> nil
+  end
 
   @doc "Emits a read event with standard metadata."
   def read(kind, resource, query, measurements, extra_metadata \\ %{}) do

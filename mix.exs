@@ -74,20 +74,15 @@ defmodule AshMultiDatalayer.MixProject do
       {:ash_postgres, "~> 2.0", optional: true},
       {:ecto_sql, "~> 3.10", optional: true},
       {:postgrex, ">= 0.0.0", optional: true},
-      # LocalOutbox strategy stack — optional, required only by
-      # `AshMultiDatalayer.Orchestrator.LocalOutbox` and its tests. Exact-pinned
-      # like `crux`. NB: `ecto_sqlite3` is pinned to 0.24.1, NOT the plan's
-      # original ≤0.22.0 offline-cache figure: 0.22.0 caps `decimal` at `< 3.0`
-      # (the CVE-affected range), which cannot coexist with ash 3.29 → ecto 3.14
-      # → `decimal ~> 3.0`. 0.24.1 requires `decimal ~> 3.0` and resolves
-      # cleanly. See the plan's Phase 2 Addendum.
-      {:oban, "2.23.0", optional: true},
-      {:ash_oban, "0.8.10", optional: true},
-      {:ash_sqlite, "0.2.17", optional: true},
-      {:ecto_sqlite3, "0.24.1", optional: true},
+      # LocalOutbox strategy stack, required only by
+      # `AshMultiDatalayer.Orchestrator.LocalOutbox` and its tests.
+      {:oban, "2.24.1", optional: true},
+      {:ash_oban, "0.8.14", optional: true},
+      {:ash_sqlite, "0.2.19", optional: true},
+      {:ecto_sqlite3, "0.25.0", optional: true},
       # Powers the Phase 3 install/gen.outbox generators. Optional — only the
       # mix tasks need it; runtime code never does.
-      {:igniter, "0.8.2", optional: true},
+      {:igniter, "0.8.4", optional: true},
       # P5: was `"0.1.3", override: true` — `override: true` makes the
       # package unbuildable via `mix hex.build` (Hex rejects an override
       # dependency in a publishable package), and the exact pin

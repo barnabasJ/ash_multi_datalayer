@@ -34,6 +34,7 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
   alias AshMultiDatalayer.Capability
   alias AshMultiDatalayer.Coverage
   alias AshMultiDatalayer.Coverage.Invalidation
+  alias AshMultiDatalayer.Coverage.Normaliser
   alias AshMultiDatalayer.DataLayer.Info
   alias AshMultiDatalayer.DataLayer.Query
   alias AshMultiDatalayer.Delegate
@@ -581,7 +582,10 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
     case Coverage.covers?(resource, tenant, query) do
       {:ok, _entry} ->
         with {:ok, records} <- Delegate.run_on_layer(query, hd(read_layers)) do
-          emit_read(:hit, query, resource, started, %{})
+          emit_read(:hit, query, resource, started, %{
+            cached_labels: Telemetry.row_labels(records)
+          })
+
           AshMultiDatalayer.Divergence.maybe_sample(query, resource, records)
           {:ok, records}
         end
@@ -614,11 +618,28 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
       needed = Coverage.needed_fields(query, resource)
 
       case Coverage.coverage_split(resource, coverage_tenant(resource, query), needed) do
-        :none -> :none
-        {coverage, complement} -> {:ok, coverage, complement}
+        :none ->
+          :none
+
+        {coverage, complement} ->
+          if coverage_overlaps?(query, resource, coverage),
+            do: {:ok, coverage, complement},
+            else: :none
       end
     else
       :none
+    end
+  end
+
+  # A ledger entry for an unrelated filter is not a useful split. Only skip
+  # when normalisation proves Q ∧ C empty; uncertainty keeps the safe split.
+  defp coverage_overlaps?(_query, _resource, :universe), do: true
+  defp coverage_overlaps?(_query, _resource, :empty), do: false
+
+  defp coverage_overlaps?(query, resource, {:ok, region}) do
+    case Normaliser.normalise(and_filter(query.filter, region), resource) do
+      %{opaque?: false, disjuncts: []} -> false
+      _ -> true
     end
   end
 
@@ -648,7 +669,9 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
 
       emit_read(:partial, query, resource, started, %{
         cached: length(cache_rows),
-        fetched: length(source_rows)
+        fetched: length(source_rows),
+        cached_labels: Telemetry.row_labels(cache_rows),
+        fetched_labels: Telemetry.row_labels(source_rows)
       })
 
       # Backfill/reconcile/record consume the SOURCE-HALF rows only, never
@@ -761,7 +784,12 @@ defmodule AshMultiDatalayer.Orchestrator.ProvenCoverage do
       # merged_read's own :stale_cache/:miss fallbacks (they call
       # source_read/5 too) — one insertion point for all of them.
       ensure_source_aggregates_resolved!(fetch_query, records)
-      emit_read(:miss, query, resource, started, %{reason: miss_reason})
+
+      emit_read(:miss, query, resource, started, %{
+        reason: miss_reason,
+        fetched_labels: Telemetry.row_labels(records)
+      })
+
       maybe_backfill(query, resource, read_layers, records, epoch0)
       {:ok, records}
     end

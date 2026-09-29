@@ -20,8 +20,9 @@ defmodule AshMultiDatalayer.Delegate do
           {:ok, [Ash.Resource.record()]} | {:error, term()}
   def run_on_layer(%Query{} = query, layer) do
     with {:ok, layer_query} <- to_layer_query(query, layer),
-         {:ok, layer_query} <- return_query(layer, layer_query, query.resource) do
-      Ash.DataLayer.run_query(layer, layer_query, query.resource)
+         {:ok, layer_query} <- return_query(layer, layer_query, query.resource),
+         {:ok, rows} <- Ash.DataLayer.run_query(layer, layer_query, query.resource) do
+      {:ok, Enum.map(rows, &Ash.Resource.put_metadata(&1, :served_from_layer, layer))}
     end
   end
 

@@ -17,6 +17,10 @@ defmodule AshMultiDatalayer.OrchestratorTest do
     end
   end
 
+  defmodule IncompleteOrchestrator do
+    def can?(_resource, _feature), do: false
+  end
+
   defmodule DefaultPost do
     use Ash.Resource, domain: Domain, data_layer: AshMultiDatalayer.DataLayer
 
@@ -128,12 +132,13 @@ defmodule AshMultiDatalayer.OrchestratorTest do
     # raises (see VerifiersTest), so exercise the verifier directly on the DSL
     # config — the same idiom the sibling verifier tests use.
     test "rejects a module that does not implement the behaviour" do
-      # Enum is a real, loadable module but implements none of the callbacks.
+      # Ash checks can?/2 before this verifier runs, so provide that callback
+      # while leaving the rest of the orchestrator behaviour unimplemented.
       module =
         define(
           quote do
             multi_data_layer do
-              orchestrator(Enum)
+              orchestrator(AshMultiDatalayer.OrchestratorTest.IncompleteOrchestrator)
               layer(:only, Ash.DataLayer.Ets)
               read_order([:only])
               write_order([:only])

@@ -139,7 +139,32 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
     park(changeset, :conflict, %{}, remote)
   end
 
+  defp apply_result(changeset, outbox, domain, host, entry, {:error, error})
+       when entry.op in [:update, :destroy] do
+    if server_check?(host) and stale_write?(error) do
+      case Target.read_pk(host, entry.target, entry.record_pk, tenant: entry.tenant) do
+        {:ok, remote} ->
+          if (entry.op == :destroy and is_nil(remote)) or
+               (not is_nil(remote) and remote_matches_written_payload?(host, entry, remote)) do
+            apply_result(changeset, outbox, domain, host, entry, :ok)
+          else
+            snapshot = if remote, do: Snapshot.dump(host, remote), else: nil
+            park(changeset, :conflict, %{}, snapshot)
+          end
+
+        {:error, read_error} ->
+          raise "LocalOutbox conflict snapshot read failed: #{inspect(read_error)}"
+      end
+    else
+      apply_push_error(changeset, entry, error)
+    end
+  end
+
   defp apply_result(changeset, _outbox, _domain, _host, entry, {:error, error}) do
+    apply_push_error(changeset, entry, error)
+  end
+
+  defp apply_push_error(changeset, entry, error) do
     case classify(error) do
       :rejected ->
         park(changeset, :rejected, error_map(error), nil)
@@ -191,12 +216,49 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
   # verbatim: no sentinel exists that could leak onto the wire.
   @doc false
   def push(host, %{op: :destroy} = entry) do
-    with :ok <- check_stale(host, entry) do
-      normalize(
-        Target.destroy(host, entry.target, Target.record_from_entry(host, entry),
-          tenant: entry.tenant
-        )
-      )
+    case LocalOutbox.conflict_detection(host) do
+      {:server_check, field} ->
+        with {:ok, arguments} <- expected_arguments(entry, field) do
+          normalize(
+            Target.destroy(host, entry.target, Target.record_from_entry(host, entry),
+              tenant: entry.tenant,
+              arguments: arguments,
+              preserve_stale?: true
+            )
+          )
+        end
+
+      _ ->
+        with :ok <- check_stale(host, entry) do
+          normalize(
+            Target.destroy(host, entry.target, Target.record_from_entry(host, entry),
+              tenant: entry.tenant
+            )
+          )
+        end
+    end
+  end
+
+  def push(host, %{op: :update} = entry) do
+    case LocalOutbox.conflict_detection(host) do
+      {:server_check, field} ->
+        with {:ok, arguments} <- expected_arguments(entry, field) do
+          normalize(
+            Target.update(host, entry.target, Target.record_from_entry(host, entry),
+              tenant: entry.tenant,
+              arguments: arguments
+            )
+          )
+        end
+
+      _ ->
+        with :ok <- check_stale(host, entry) do
+          normalize(
+            Target.upsert(host, entry.target, Target.record_from_entry(host, entry),
+              tenant: entry.tenant
+            )
+          )
+        end
     end
   end
 
@@ -207,6 +269,23 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
           tenant: entry.tenant
         )
       )
+    end
+  end
+
+  defp server_check?(host), do: match?({:server_check, _}, LocalOutbox.conflict_detection(host))
+
+  defp stale_write?(%Ash.Error.Changes.StaleRecord{}), do: true
+  defp stale_write?(%Ash.Error.Query.NotFound{}), do: true
+
+  defp stale_write?(%{errors: errors}) when is_list(errors),
+    do: Enum.any?(errors, &stale_write?/1)
+
+  defp stale_write?(_error), do: false
+
+  defp expected_arguments(entry, field) do
+    case entry.base_image && entry.base_image[to_string(field)] do
+      nil -> {:error, {:rejected, "missing base #{field} for server conflict check"}}
+      value -> {:ok, %{String.to_atom("expected_#{field}") => value}}
     end
   end
 
@@ -246,6 +325,9 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
         stale_check(host, entry, field)
 
       {:stale_check, _field} ->
+        :ok
+
+      {:server_check, _field} ->
         :ok
     end
   end
@@ -297,6 +379,23 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Flush do
   # `push/2`.
   defp remote_matches_payload?(host, entry, remote) do
     json_scalar(Snapshot.dump(host, remote)) == json_scalar(entry.payload)
+  end
+
+  # A successful server write may have been followed by an outbox crash. Its
+  # retry receives StaleRecord because the version already advanced. Compare
+  # only writable payload fields: server-managed timestamps legitimately differ.
+  defp remote_matches_written_payload?(_host, %{payload: nil}, _remote), do: false
+
+  defp remote_matches_written_payload?(host, entry, remote) do
+    keys =
+      host
+      |> Ash.Resource.Info.attributes()
+      |> Enum.filter(& &1.writable?)
+      |> Enum.map(&to_string(&1.name))
+
+    payload = Map.take(json_scalar(entry.payload), keys)
+    current = host |> Snapshot.dump(remote) |> json_scalar() |> Map.take(Map.keys(payload))
+    payload == current
   end
 
   # Reduce a value to the JSON scalar the outbox `:map` round-trip would yield,

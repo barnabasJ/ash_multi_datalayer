@@ -16,6 +16,12 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox.Target do
     Backfill.upsert_record(layer, resource, record, opts)
   end
 
+  @doc "Update a known target row without a preliminary identity read."
+  def update(resource, target, record, opts \\ []) do
+    layer = LocalOutbox.target_layer(resource, target)
+    Backfill.update_record(layer, resource, record, opts)
+  end
+
   @doc "PK-destroy `record` from `target`."
   def destroy(resource, target, record, opts \\ []) do
     layer = LocalOutbox.target_layer(resource, target)

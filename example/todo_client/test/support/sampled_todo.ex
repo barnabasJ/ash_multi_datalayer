@@ -17,7 +17,7 @@ defmodule TodoClient.Test.SampledTodo do
   use Ash.Resource,
     domain: TodoClient.Test.Domain,
     data_layer: AshMultiDatalayer.DataLayer,
-    extensions: [AshRemote.Resource]
+    extensions: [AshRemote.DataLayer]
 
   multi_data_layer do
     layer(:cache, Ash.DataLayer.Ets)

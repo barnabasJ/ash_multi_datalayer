@@ -11,7 +11,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox do
       multi_data_layer do
         orchestrator {AshMultiDatalayer.Orchestrator.LocalOutbox,
           outbox_resource: TodoClient.Sync.OutboxEntry,
-          conflict_detection: :off,          # :off | {:stale_check, :updated_at}
+          conflict_detection: :off,          # :off | {:stale_check, field} | {:server_check, field}
           hydrate: :if_empty}                # :if_empty | :on_start | :manual
 
         layer :local, AshSqlite.DataLayer
@@ -59,7 +59,8 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox do
   def outbox_resource(resource), do: Keyword.fetch!(opts(resource), :outbox_resource)
 
   @doc "Conflict detection mode: `:off` (default) or `{:stale_check, field}`."
-  @spec conflict_detection(Ash.Resource.t()) :: :off | {:stale_check, atom()}
+  @spec conflict_detection(Ash.Resource.t()) ::
+          :off | {:stale_check, atom()} | {:server_check, atom()}
   def conflict_detection(resource), do: Keyword.get(opts(resource), :conflict_detection, :off)
 
   @doc "Hydration mode: `:if_empty` (default) | `:on_start` | `:manual`."
@@ -150,7 +151,8 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox do
         {:error, "LocalOutbox `hydrate:` must be :if_empty, :on_start, or :manual."}
 
       not valid_conflict_detection?(Keyword.get(opts, :conflict_detection, :off)) ->
-        {:error, "LocalOutbox `conflict_detection:` must be :off or {:stale_check, field}."}
+        {:error,
+         "LocalOutbox `conflict_detection:` must be :off, {:stale_check, field}, or {:server_check, field}."}
 
       not oban_loaded?() ->
         {:error, "LocalOutbox requires oban + ash_oban (optional deps) to be available."}
@@ -162,6 +164,7 @@ defmodule AshMultiDatalayer.Orchestrator.LocalOutbox do
 
   defp valid_conflict_detection?(:off), do: true
   defp valid_conflict_detection?({:stale_check, field}) when is_atom(field), do: true
+  defp valid_conflict_detection?({:server_check, field}) when is_atom(field), do: true
   defp valid_conflict_detection?(_), do: false
 
   defp oban_loaded?, do: Code.ensure_loaded?(Oban) and Code.ensure_loaded?(AshOban)

@@ -88,6 +88,30 @@ defmodule AshMultiDatalayer.Backfill do
     |> normalize_result()
   end
 
+  @doc "Update a known target row directly, passing action arguments such as an expected version."
+  def update_record(layer, resource, record, opts) do
+    fields = opts[:fields] || default_fields(resource, record)
+
+    changeset =
+      resource
+      |> Ash.Changeset.new()
+      |> Ash.Changeset.force_change_attributes(Map.take(record, fields))
+      |> maybe_set_tenant(opts[:tenant])
+      |> Map.put(:data, record)
+      |> Map.put(:action, Ash.Resource.Info.primary_action!(resource, :update))
+      |> Map.put(:action_type, :update)
+      |> Map.put(:arguments, opts[:arguments] || %{})
+      |> Map.put(:domain, opts[:domain])
+      |> Ash.Changeset.set_context(
+        AshMultiDatalayer.RemoteContext.merge(%{
+          private: %{ash_remote_replicated_write?: true, tenant: opts[:tenant]}
+        })
+      )
+
+    layer.update(resource, changeset)
+    |> normalize_result()
+  end
+
   @doc """
   Deletes a record (by primary key) from a layer. A row that's already
   absent is a success. A genuine error preserves the layer's own
@@ -105,15 +129,20 @@ defmodule AshMultiDatalayer.Backfill do
       |> maybe_set_tenant(tenant)
       |> Map.merge(%{
         data: record,
-        domain: opts[:domain]
+        domain: opts[:domain],
+        arguments: opts[:arguments] || %{}
       })
       |> Ash.Changeset.set_context(
         AshMultiDatalayer.RemoteContext.merge(%{private: %{tenant: tenant}})
       )
 
     case layer.destroy(resource, changeset) do
-      :ok -> :ok
-      {:ok, _} -> :ok
+      :ok ->
+        :ok
+
+      {:ok, _} ->
+        :ok
+
       # L11: `destroy_result/1`'s own "already absent -> :ok" classification
       # still applies either way (already-absent is already-absent
       # regardless of whether the layer also said :no_rollback), but a
@@ -121,8 +150,15 @@ defmodule AshMultiDatalayer.Backfill do
       # back to Ash's transaction machinery (LocalOutbox.Target.destroy/4,
       # via push_all_targets/5) need to see :no_rollback, not have it
       # silently stripped here before they ever get a chance to preserve it.
-      {:error, :no_rollback, reason} -> destroy_result(reason, :no_rollback)
-      {:error, reason} -> destroy_result(reason, :normal)
+      {:error, :no_rollback, reason} ->
+        if opts[:preserve_stale?] == true and stale_record?(reason),
+          do: {:error, :no_rollback, reason},
+          else: destroy_result(reason, :no_rollback)
+
+      {:error, reason} ->
+        if opts[:preserve_stale?] == true and stale_record?(reason),
+          do: {:error, reason},
+          else: destroy_result(reason, :normal)
     end
   end
 
@@ -149,6 +185,13 @@ defmodule AshMultiDatalayer.Backfill do
 
   defp already_absent?(errors) when is_list(errors), do: Enum.any?(errors, &already_absent?/1)
   defp already_absent?(_other), do: false
+
+  defp stale_record?(%Ash.Error.Changes.StaleRecord{}), do: true
+
+  defp stale_record?(%{errors: errors}) when is_list(errors),
+    do: Enum.any?(errors, &stale_record?/1)
+
+  defp stale_record?(_other), do: false
 
   defp maybe_set_tenant(changeset, nil), do: changeset
   defp maybe_set_tenant(changeset, tenant), do: Ash.Changeset.set_tenant(changeset, tenant)
